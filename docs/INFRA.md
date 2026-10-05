@@ -9,17 +9,19 @@ your PATH.
 
 ## The live target
 
-At startup rusty probes, in parallel and with a four-second limit:
+At startup rusty reads local config only (no network, no slow CLIs), so it
+starts as fast as before:
 
 | what | how |
 |---|---|
 | kube context and namespace | `kubectl config view --minify` |
-| AWS profile, account, region | `AWS_PROFILE` or `~/.aws`, one `sts get-caller-identity` call |
-| gcloud project | `CLOUDSDK_CORE_PROJECT` or `gcloud config get-value project` |
+| AWS profile and region | `AWS_PROFILE`, `AWS_REGION` or `~/.aws/config` |
+| gcloud project | `CLOUDSDK_CORE_PROJECT` or gcloud's config files |
 | terraform workspace and backend | `.terraform/environment` and `.terraform/terraform.tfstate`, no CLI |
 | git branch | `git rev-parse --abbrev-ref HEAD` |
 
-The result is a `target` row in the banner, `/target` (re-probes), a row in
+The result is a `target` row in the banner, `/target` (probes again, and
+looks up the AWS account with one `sts get-caller-identity` call), a row in
 `/settings`, and one short block in the system prompt so the model names the
 target before it changes anything. `RUSTY_INFRA=off` disables the probes and
 everything below.
