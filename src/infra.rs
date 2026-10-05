@@ -221,9 +221,305 @@ fn run(bin: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+// ------------------------------------------------------------- redaction
+
+/// A key whose value is a secret when it ends with one of these.
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "access-key",
+    "secret_key",
+    "secret-key",
+    "private_key",
+    "private-key",
+    "credential",
+    "credentials",
+    "key-data",
+];
+
+/// Tokens that are secrets by their shape alone.
+const SECRET_PREFIXES: &[&str] = &[
+    "AKIA",
+    "ASIA",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "xoxs-",
+    "xapp-",
+    "sk-",
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+    "rk_test_",
+    "AIza",
+    "nvapi-",
+    "hvs.",
+    "hvb.",
+    "npm_",
+    "pypi-",
+    "dop_v1_",
+    "ya29.",
+    "shpat_",
+    "shpss_",
+    "sq0atp-",
+    "SG.",
+    "eyJ",
+];
+
+const REDACTED: &str = "[redacted]";
+
+/// Replaces secrets in tool output with `[redacted]` and counts them.
+/// Handles key=value and key: value pairs with secret-looking keys, tokens
+/// with well-known prefixes, bearer and basic auth headers, URL passwords,
+/// PEM private keys and the data of Kubernetes Secrets.
+pub fn redact(text: &str) -> (String, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut count = 0;
+    let mut in_pem = false;
+    let mut in_secret_data = false;
+    let is_secret_object = text.contains("kind: Secret") || text.contains("\"kind\": \"Secret\"");
+    for line in text.lines() {
+        if in_pem {
+            in_pem = !line.contains("-----END");
+            continue;
+        }
+        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
+            in_pem = true;
+            count += 1;
+            lines.push("[redacted private key]".into());
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if is_secret_object {
+            // Values under `data:` / `stringData:` until the block dedents.
+            let indent = line.len() - trimmed.len();
+            if matches!(trimmed.trim_end_matches(" {"), "data:" | "stringData:" | "\"data\":" | "\"stringData\":") {
+                in_secret_data = true;
+                lines.push(line.into());
+                continue;
+            }
+            if in_secret_data && (indent == 0 || trimmed.starts_with('}')) {
+                in_secret_data = false;
+            }
+            if in_secret_data {
+                if let Some((k, _)) = split_kv(trimmed) {
+                    count += 1;
+                    lines.push(format!("{}{k} {REDACTED}", &line[..indent]));
+                    continue;
+                }
+            }
+        }
+        let (redacted, n) = redact_line(line);
+        count += n;
+        lines.push(redacted);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    (out, count)
+}
+
+/// `key: value` or `"key": "value",` → (key part including the separator, value).
+fn split_kv(s: &str) -> Option<(&str, &str)> {
+    let i = s.find(':')?;
+    let value = s[i + 1..].trim();
+    (!value.is_empty()).then_some((&s[..=i], value))
+}
+
+/// What the next token is, once a key or header word has been seen.
+enum Expect {
+    /// `Bearer x`: the next word, whatever separates them.
+    Header,
+    /// `key=x`, `key: x`, `"key": "x"`: needs an assignment between them.
+    Key,
+    /// `--password x`: a flag may take its value after a plain space.
+    Flag,
+}
+
+fn redact_line(line: &str) -> (String, usize) {
+    let (line, mut count) = redact_urls(line);
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line.as_str();
+    let mut expect: Option<Expect> = None;
+    while !rest.is_empty() {
+        let start = rest.find(is_token_char).unwrap_or(rest.len());
+        let (sep, after) = rest.split_at(start);
+        let end = after.find(|c| !is_token_char(c)).unwrap_or(after.len());
+        let (token, after) = after.split_at(end);
+        rest = after;
+        out.push_str(sep);
+        if token.is_empty() {
+            break;
+        }
+        let wanted = match expect.take() {
+            Some(Expect::Header) => true,
+            Some(Expect::Key) => is_assignment(sep),
+            Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
+            None => false,
+        };
+        if (wanted && secret_value(token)) || secret_shape(token) {
+            out.push_str(REDACTED);
+            count += 1;
+            rest = rest.trim_start_matches('='); // base64 padding
+            continue;
+        }
+        out.push_str(token);
+        expect = if matches!(token.to_ascii_lowercase().as_str(), "bearer" | "basic") {
+            Some(Expect::Header)
+        } else if secret_key(token) {
+            Some(if token.starts_with("--") { Expect::Flag } else { Expect::Key })
+        } else {
+            None
+        };
+    }
+    (out, count)
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '@' | '~' | '%')
+}
+
+/// `=`, `: `, `": "` and the like, ignoring quotes and spaces.
+fn is_assignment(sep: &str) -> bool {
+    let core: String = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
+    core == "=" || core == ":"
+}
+
+fn secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|s| k.ends_with(s))
+}
+
+/// Short values and placeholders are not secrets. `${VAR}` and `<value>`
+/// never reach here: `$` and `<` are not token characters, so the
+/// assignment check fails on them.
+fn secret_value(v: &str) -> bool {
+    v.len() >= 4 && !matches!(v.to_ascii_lowercase().as_str(), "null" | "none" | "true" | "false" | "changeme")
+}
+
+fn secret_shape(token: &str) -> bool {
+    if token.starts_with("eyJ") {
+        // A JWT: three base64url parts.
+        return token.split('.').count() == 3 && token.len() > 30;
+    }
+    SECRET_PREFIXES.iter().any(|p| token.starts_with(p) && token.len() >= p.len() + 12)
+}
+
+/// `scheme://user:pass@host` anywhere in the line → `scheme://user:[redacted]@host`.
+fn redact_urls(line: &str) -> (String, usize) {
+    let mut out = String::with_capacity(line.len());
+    let mut count = 0;
+    let mut rest = line;
+    while let Some(i) = rest.find("://") {
+        let scheme_start = rest[..i].rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+').map_or(0, |j| j + 1);
+        let url_end = rest[i..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .map_or(rest.len(), |e| i + e);
+        let url = &rest[scheme_start..url_end];
+        out.push_str(&rest[..scheme_start]);
+        match redact_url(url) {
+            Some(redone) => {
+                out.push_str(&redone);
+                count += 1;
+            }
+            None => out.push_str(url),
+        }
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+fn redact_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (userinfo, host) = rest.split_once('@')?;
+    let (user, pass) = userinfo.split_once(':')?;
+    (!pass.is_empty() && !host.is_empty() && !userinfo.contains('/'))
+        .then(|| format!("{scheme}://{user}:{REDACTED}@{host}"))
+}
+
+/// The line appended to a tool result that had secrets in it.
+pub fn redaction_note(n: usize) -> String {
+    format!(
+        "\n[rusty redacted {n} secret value{} from this output before you saw it. Never try to print or copy a \
+         secret. To change one, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
+        if n == 1 { "" } else { "s" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_keys_tokens_and_blocks() {
+        let cases = [
+            ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "AWS_SECRET_ACCESS_KEY=[redacted]"),
+            ("export DB_PASSWORD='s3cret-pass'", "export DB_PASSWORD='[redacted]'"),
+            ("mysql -u root --password hunter22 app", "mysql -u root --password [redacted] app"),
+            (
+                "curl -H 'Authorization: Basic YWRtaW46aHVudGVy' https://x",
+                "curl -H 'Authorization: Basic [redacted]' https://x",
+            ),
+            ("password: hunter22", "password: [redacted]"),
+            ("  \"client_secret\": \"abcd1234\",", "  \"client_secret\": \"[redacted]\","),
+            ("Authorization: Bearer abcdefghijklmnop", "Authorization: Bearer [redacted]"),
+            ("aws_access_key_id = AKIAIOSFODNN7EXAMPLE", "aws_access_key_id = [redacted]"),
+            ("token ghp_abcdefghijklmnopqrstuvwxyz012345", "token [redacted]"),
+            ("NVIDIA_API_KEY=nvapi-abcdefghijklmnopqrstuvwxyz", "NVIDIA_API_KEY=[redacted]"),
+            ("postgres://app:pa55w0rd@db.internal:5432/app", "postgres://app:[redacted]@db.internal:5432/app"),
+            ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijklmnop", "jwt [redacted]"),
+            ("client-key-data: LS0tLS1CRUdJTi==", "client-key-data: [redacted]"),
+        ];
+        for (input, want) in cases {
+            let (got, n) = redact(input);
+            assert_eq!(got, want);
+            assert_eq!(n, 1, "{input}");
+        }
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nABC\n-----END RSA PRIVATE KEY-----\nafter";
+        assert_eq!(redact(pem), ("[redacted private key]\nafter".into(), 1));
+        let secret = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n  username: YWRtaW4=\n  pw: aHVudGVy\ntype: Opaque\n";
+        let (got, n) = redact(secret);
+        assert_eq!(n, 2, "{got}");
+        assert!(got.contains("  username: [redacted]\n  pw: [redacted]\ntype: Opaque\n"), "{got}");
+    }
+
+    #[test]
+    fn leaves_ordinary_text_alone() {
+        for text in [
+            "max_tokens: 5",
+            "password: ${DB_PASSWORD}",
+            "secretName: db-creds",
+            "  key: password",
+            "secretKeyRef:\n  name: db\n  key: password",
+            "token: null",
+            "image: registry/app:1.2.3",
+            "https://example.com/path",
+            "sha256:abcdef0123456789abcdef0123456789",
+            "the user said: sk-ip the test",
+            "- name: GITHUB_TOKEN\n  valueFrom:",
+        ] {
+            let (got, n) = redact(text);
+            assert_eq!(n, 0, "{text} -> {got}");
+            assert_eq!(got, text);
+        }
+    }
 
     #[test]
     fn production_names() {

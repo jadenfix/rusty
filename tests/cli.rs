@@ -285,6 +285,52 @@ fn aws_identity_comes_from_one_sts_call() {
     assert!(out.contains("none detected"), "{out}");
 }
 
+#[test]
+fn secrets_in_tool_output_never_reach_the_model_or_the_session_file() {
+    let s = Sandbox::new("redact");
+    std::fs::write(
+        s.project.join(".env"),
+        "DB_HOST=db.internal\nDB_PASSWORD=hunter22-real\nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+    )
+    .unwrap();
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_endpoint(vec![tool_reply("bash", serde_json::json!({"command": "cat .env"})), answer]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "show me the env file"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let seen = requests[1]["messages"].to_string();
+    assert!(!seen.contains("hunter22-real") && !seen.contains("AKIAIOSFODNN7EXAMPLE"), "{seen}");
+    assert!(seen.contains("DB_HOST=db.internal") && seen.contains("DB_PASSWORD=[redacted]"), "{seen}");
+    assert!(seen.contains("redacted 2 secret values"), "{seen}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("2 secrets redacted"));
+    let mut sessions = Vec::new();
+    find_files(&s.home, "json", &mut sessions);
+    assert!(!sessions.is_empty());
+    for p in sessions {
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("hunter22-real"), "{} leaks the secret", p.display());
+    }
+}
+
+fn find_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            find_files(&p, ext, out);
+        } else if p.extension().is_some_and(|x| x == ext) {
+            out.push(p);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ live
 
 fn live(name: &str) -> Option<Sandbox> {

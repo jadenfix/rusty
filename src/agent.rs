@@ -607,7 +607,18 @@ impl Agent {
             Ok(t) => (t, true),
             Err(e) => (format!("error: {e:#}"), false),
         };
+        // Secrets never reach the model, the screen or the session file.
+        let (mut text, redacted) = infra::redact(&text);
+        if redacted > 0 {
+            text.push_str(&infra::redaction_note(redacted));
+        }
         d.tool_result(&call.name, &args, &text, ok);
+        if redacted > 0 {
+            d.line(&format!(
+                "    {}",
+                ui::dim(&format!("⊘ {redacted} secret{} redacted", if redacted == 1 { "" } else { "s" }))
+            ));
+        }
         text
     }
 
