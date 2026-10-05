@@ -1,0 +1,5 @@
+Create inventory.py with a class Inventory supporting add(name, qty) and count(name) (unknown items count 0). Add tests in test_inventory.py with plain asserts, runnable as python3 test_inventory.py.
+Add remove(name, qty). It must never let a count drop below zero; raise ValueError in that case. Cover it in the tests.
+Change of plan: removing more than is available should clamp the count to zero instead of raising. Update the code and the tests to match.
+Add to_json() returning a JSON string, and a from_json(text) classmethod that rebuilds an Inventory. Round-trip it in the tests.
+Run the tests one last time and tell me the result in one line.

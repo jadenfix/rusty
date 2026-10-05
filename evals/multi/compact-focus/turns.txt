@@ -1,0 +1,4 @@
+Read config.py and list the three settings with their values.
+Run python3 app.py and tell me which exception it raises and its message.
+/compact focus on the config values and the exception from app.py
+Without opening any files or running anything, write one line to ANSWER.txt in exactly this form: db=<DB_TIMEOUT value> ttl=<CACHE_TTL value> error=<exception class name>. Use the write_file tool.

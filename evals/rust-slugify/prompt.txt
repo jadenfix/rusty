@@ -1,0 +1,1 @@
+Implement slugify in src/lib.rs so that cargo test passes. Keep the tests as they are.

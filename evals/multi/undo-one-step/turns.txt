@@ -1,0 +1,3 @@
+In app.py, rename the variable tmp in compute() to something descriptive.
+Now add type hints to compute()'s parameters and return value.
+Undo the type hints you just added, but keep the rename.

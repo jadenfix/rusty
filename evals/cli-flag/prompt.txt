@@ -1,0 +1,1 @@
+Add a --reverse flag to sort_lines.py that sorts in descending order. Without the flag, behaviour must not change. Show that both modes work.

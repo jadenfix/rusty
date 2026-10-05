@@ -1,0 +1,4 @@
+## session
+Work out how this project's tests are meant to be run, get them passing, and remember the exact steps for future sessions.
+## session
+Add median(xs) to stats.py (raise ValueError on an empty list) with a unit test in tests/, then run the whole suite the way this project expects.

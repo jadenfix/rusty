@@ -1,0 +1,2 @@
+## goal
+Build todo.py, a command-line todo list stored in todo.json in the current directory. Commands: `python3 todo.py add "text"` prints the new item's id; `python3 todo.py list` prints one line per item as "<id> [ ] text" or "<id> [x] text"; `python3 todo.py done <id>` marks it done; `python3 todo.py rm <id>` deletes it. Ids start at 1 and are never reused. Write tests in test_todo.py and make sure they pass.

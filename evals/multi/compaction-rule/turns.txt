@@ -1,0 +1,5 @@
+## env RUSTY_CONTEXT_TOKENS=26000
+House rule for this whole session: every new function you write must have a docstring that starts with "RUSTY:". Just acknowledge it in one line.
+Read all of big_a.py and tell me how many functions it defines.
+Read all of big_b.py and tell me the name of the last function in it.
+Add a function shout(s) to util.py that returns s uppercased.
