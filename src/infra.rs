@@ -482,6 +482,10 @@ pub struct Action {
     pub signature: String,
     /// Local files the dry run depends on; editing one makes it stale.
     pub files: Vec<String>,
+    /// (file name, read-only command) pairs captured before the change runs.
+    pub snapshots: Vec<(String, String)>,
+    /// How to undo the change from the snapshot, for the model and the record.
+    pub rollback: String,
 }
 
 /// Tools whose commands are worth an audit line even when rusty does not
@@ -697,7 +701,49 @@ fn kubectl_action(bin: &str, args: &[&str]) -> Action {
     let verb = if sub.is_empty() { verb } else { format!("{verb} {sub}") };
     // rollout status/history and set with no subject are reads.
     let mutating = mutating && !matches!(verb.as_str(), "rollout status" | "rollout history");
-    Action { tool: bin.into(), verb, mutating, dry_run, signature, files }
+    let flags = kube_flags(&p);
+    let mut snapshots = Vec::new();
+    let mut rollback = String::new();
+    if mutating && !matches!(verb.as_str(), "exec" | "cp" | "run" | "expose" | "autoscale") {
+        let subject = kube_subject(&p, if sub.is_empty() { 1 } else { 2 });
+        if !subject.is_empty() {
+            snapshots.push(("before.yaml".into(), format!("{bin} get {subject} -o yaml --ignore-not-found{flags}")));
+            rollback = format!("{bin} apply -f SNAPSHOT/rollback.yaml{flags}");
+        }
+    }
+    Action { tool: bin.into(), verb, mutating, dry_run, signature, files, snapshots, rollback }
+}
+
+/// What a kubectl change is about, as `get` arguments: the files it applies,
+/// or the resources named after the verb. Empty when there is nothing to
+/// fetch (stdin, or a brand-new object).
+fn kube_subject(p: &Parsed, skip: usize) -> String {
+    if p.files.iter().any(|f| f == "-") {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for f in &p.files {
+        parts.push(format!("-f {}", quote(f)));
+    }
+    for k in &p.kustomize {
+        parts.push(format!("-k {}", quote(k)));
+    }
+    if parts.is_empty() {
+        // `TYPE/NAME`, `TYPE NAME...` or `TYPE -l app=x`; `k=v` arguments end the list.
+        let resources: Vec<&String> = p.positionals.iter().skip(skip).take_while(|w| !w.contains('=')).collect();
+        if resources.is_empty() {
+            return String::new();
+        }
+        let verb = p.positionals.first().map(String::as_str).unwrap_or("");
+        if matches!(verb, "cordon" | "uncordon" | "drain") {
+            parts.push("node".into());
+        }
+        parts.extend(resources.iter().map(|r| quote(r)));
+        if let Some(sel) = &p.selector {
+            parts.push(format!("-l {}", quote(sel)));
+        }
+    }
+    parts.join(" ")
 }
 
 const HELM_VALUE_FLAGS: &[&str] = &[
@@ -742,12 +788,21 @@ fn helm_action(args: &[&str]) -> Action {
     files.sort();
     let dry_run = verb == "diff" || verb == "template" || (p.dry_run && matches!(verb.as_str(), "upgrade" | "install"));
     let mutating = !dry_run && matches!(verb.as_str(), "upgrade" | "install" | "rollback" | "uninstall" | "delete");
+    let flags = kube_flags(&p);
     let signature = if release.is_empty() || (chart.is_empty() && verb != "rollback") {
         String::new()
     } else {
-        format!("helm{} {release} {chart} {}", kube_flags(&p), files.join(" "))
+        format!("helm{flags} {release} {chart} {}", files.join(" "))
     };
-    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files }
+    let mut snapshots = Vec::new();
+    let mut rollback = String::new();
+    if mutating && !release.is_empty() {
+        let r = quote(&release);
+        snapshots.push(("values.yaml".into(), format!("helm get values {r} -o yaml{flags}")));
+        snapshots.push(("manifest.yaml".into(), format!("helm get manifest {r}{flags}")));
+        rollback = format!("helm rollback {r}{flags} (previous values in SNAPSHOT/values.yaml)");
+    }
+    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files, snapshots, rollback }
 }
 
 const TERRAFORM_VALUE_FLAGS: &[&str] =
@@ -777,7 +832,25 @@ fn terraform_action(bin: &str, args: &[&str]) -> Action {
         Some(sub) if matches!(verb.as_str(), "state" | "workspace") => format!("{verb} {sub}"),
         _ => verb,
     };
-    Action { tool: bin.into(), verb, mutating, dry_run, signature, files: plan_file.into_iter().collect() }
+    let mut snapshots = Vec::new();
+    let mut rollback = String::new();
+    if mutating {
+        let chdir_flag = if chdir.is_empty() { String::new() } else { format!(" -chdir={}", quote(&chdir)) };
+        snapshots.push(("terraform.tfstate".into(), format!("{bin}{chdir_flag} state pull")));
+        rollback = "re-apply the previous code revision; SNAPSHOT/terraform.tfstate is the state before the change \
+                    (terraform state push restores state only, not the real resources)"
+            .into();
+    }
+    Action {
+        tool: bin.into(),
+        verb,
+        mutating,
+        dry_run,
+        signature,
+        files: plan_file.into_iter().collect(),
+        snapshots,
+        rollback,
+    }
 }
 
 /// Other infrastructure CLIs: logged, with a verb-based guess at whether
@@ -914,6 +987,48 @@ impl Harness {
         self.records.push(rec);
     }
 
+    /// Captures the current state of what a change is about to touch, into a
+    /// fresh directory only the owner can read. Returns the directory, or a
+    /// note saying why there is nothing to keep.
+    pub fn snapshot(&self, action: &Action, command: &str) -> Result<PathBuf, String> {
+        if action.snapshots.is_empty() {
+            return Err("nothing to snapshot for this command".into());
+        }
+        let Some(dir) = &self.dir else { return Err("no project directory to keep snapshots in".into()) };
+        let slug: String = format!("{}-{}", action.tool, action.verb).replace(' ', "-");
+        let path = dir.join("snapshots").join(format!("{}-{slug}", crate::memory::now()));
+        let mut kept = 0;
+        let mut errors = Vec::new();
+        let mut files = Vec::new();
+        for (name, cmd) in &action.snapshots {
+            match crate::tools::run(cmd, Duration::from_secs(SNAPSHOT_SECS)) {
+                Ok((Some(Some(0)), out, _)) if !out.trim().is_empty() => {
+                    files.push((name.clone(), out));
+                    kept += 1;
+                }
+                Ok((Some(Some(0)), _, _)) => {}
+                Ok((_, _, err)) => errors.push(format!("`{cmd}`: {}", err.trim().lines().last().unwrap_or("failed"))),
+                Err(e) => errors.push(format!("`{cmd}`: {e}")),
+            }
+        }
+        if kept == 0 {
+            return Err(if errors.is_empty() {
+                "nothing to snapshot: the objects don't exist yet".into()
+            } else {
+                format!("snapshot failed: {}", errors.join("; "))
+            });
+        }
+        create_private_dir(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        for (name, out) in &files {
+            write_private(&path.join(name), out);
+            if name == "before.yaml" {
+                write_private(&path.join("rollback.yaml"), &strip_volatile(out));
+            }
+        }
+        write_private(&path.join("command.txt"), &format!("{command}\n"));
+        Ok(path)
+    }
+
     /// Records a command that never ran, with why.
     pub fn record_refusal(&mut self, mode: &str, cmd: &str, outcome: &str, note: &str) {
         if let Some(action) = inspect(cmd) {
@@ -1037,6 +1152,64 @@ pub fn outcome(result: &str) -> (String, Option<i32>) {
         return ("timed out".into(), None);
     }
     ("interrupted".into(), None)
+}
+
+/// How long one snapshot or verification command may take.
+const SNAPSHOT_SECS: u64 = 60;
+
+/// Drops the fields that make `kubectl get -o yaml` output unapplyable:
+/// resourceVersion, uid, creationTimestamp, generation, managedFields and
+/// status. Text-based on purpose: no YAML parser, and the raw copy is kept
+/// next to it anyway.
+pub fn strip_volatile(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    let mut skip_deeper_than: Option<usize> = None;
+    let mut metadata_indent: Option<usize> = None;
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let key = trimmed.trim_start_matches("- ").split(':').next().unwrap_or("");
+        let is_key = trimmed.trim_start_matches("- ").contains(':');
+        if let Some(d) = skip_deeper_than {
+            // kubectl puts list items at the key's own indent.
+            if indent > d || trimmed.is_empty() || (indent == d && trimmed.starts_with("- ")) {
+                continue;
+            }
+            skip_deeper_than = None;
+        }
+        if metadata_indent.is_some_and(|m| indent <= m) {
+            metadata_indent = None;
+        }
+        if is_key && key == "metadata" && !trimmed.starts_with("- ") {
+            metadata_indent = Some(indent);
+        }
+        let direct_child = metadata_indent.is_some_and(|m| indent == m + 2);
+        if direct_child && matches!(key, "resourceVersion" | "uid" | "creationTimestamp" | "generation" | "selfLink") {
+            continue;
+        }
+        if (direct_child && key == "managedFields")
+            || (is_key && key == "status" && indent <= 2 && !trimmed.starts_with("- "))
+        {
+            skip_deeper_than = Some(indent);
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
+
+fn write_private(path: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path) {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 /// Appends to a file only its owner can read.
@@ -1171,6 +1344,74 @@ mod tests {
         assert_eq!(act("kubectl rollout restart deploy/api").verb, "rollout restart");
         assert!(act("kubectl apply -f -").signature.is_empty(), "stdin has no dry-run signature");
         assert!(inspect("cargo test && ls").is_none());
+    }
+
+    #[test]
+    fn kubectl_changes_know_what_to_snapshot() {
+        let snap = |cmd: &str| act(cmd).snapshots.into_iter().map(|(_, c)| c).collect::<Vec<_>>();
+        assert_eq!(
+            snap("kubectl apply -f deploy.yaml -f svc.yaml -n payments"),
+            ["kubectl get -f deploy.yaml -f svc.yaml -o yaml --ignore-not-found -n payments"]
+        );
+        assert_eq!(snap("kubectl apply -k overlays/prod"), ["kubectl get -k overlays/prod -o yaml --ignore-not-found"]);
+        assert_eq!(
+            snap("kubectl scale deploy/api --replicas=3"),
+            ["kubectl get deploy/api -o yaml --ignore-not-found"]
+        );
+        assert_eq!(
+            snap("kubectl set image deployment/api api=img:2 --context c"),
+            ["kubectl get deployment/api -o yaml --ignore-not-found --context c"]
+        );
+        assert_eq!(snap("kubectl rollout restart deploy/api"), ["kubectl get deploy/api -o yaml --ignore-not-found"]);
+        assert_eq!(snap("kubectl delete pods -l app=api"), ["kubectl get pods -l app=api -o yaml --ignore-not-found"]);
+        assert_eq!(
+            snap("kubectl patch deploy api -p '{\"a\":1}'"),
+            ["kubectl get deploy api -o yaml --ignore-not-found"]
+        );
+        assert_eq!(
+            snap("kubectl drain node-1 --ignore-daemonsets"),
+            ["kubectl get node node-1 -o yaml --ignore-not-found"]
+        );
+        assert!(snap("kubectl apply -f -").is_empty());
+        assert!(snap("kubectl run tmp --image=busybox").is_empty());
+        assert!(snap("kubectl get pods").is_empty());
+        assert_eq!(act("kubectl apply -f d.yaml -n x").rollback, "kubectl apply -f SNAPSHOT/rollback.yaml -n x");
+        assert_eq!(
+            snap("helm upgrade api ./chart -n payments"),
+            ["helm get values api -o yaml -n payments", "helm get manifest api -n payments"]
+        );
+        assert_eq!(snap("terraform -chdir=infra apply tf.plan"), ["terraform -chdir=infra state pull"]);
+        assert_eq!(snap("terraform apply tf.plan"), ["terraform state pull"]);
+    }
+
+    #[test]
+    fn stripped_yaml_is_applyable() {
+        let yaml = "apiVersion: v1\nitems:\n- apiVersion: apps/v1\n  kind: Deployment\n  metadata:\n    annotations:\n      a: b\n    creationTimestamp: \"2026-01-01T00:00:00Z\"\n    generation: 3\n    managedFields:\n    - apiVersion: apps/v1\n      fieldsType: FieldsV1\n    name: api\n    namespace: payments\n    resourceVersion: \"12345\"\n    uid: abc\n  spec:\n    replicas: 2\n    template:\n      metadata:\n        labels:\n          app: api\n  status:\n    readyReplicas: 2\n    conditions:\n    - type: Available\nkind: List\nmetadata:\n  resourceVersion: \"\"\n";
+        let got = strip_volatile(yaml);
+        for gone in [
+            "resourceVersion",
+            "uid:",
+            "creationTimestamp",
+            "generation",
+            "managedFields",
+            "fieldsType",
+            "status:",
+            "readyReplicas",
+            "Available",
+        ] {
+            assert!(!got.contains(gone), "{gone} survived:\n{got}");
+        }
+        for kept in [
+            "kind: Deployment",
+            "    name: api",
+            "    namespace: payments",
+            "      a: b",
+            "    replicas: 2",
+            "          app: api",
+            "kind: List",
+        ] {
+            assert!(got.contains(kept), "{kept} lost:\n{got}");
+        }
     }
 
     #[test]

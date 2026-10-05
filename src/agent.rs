@@ -687,20 +687,46 @@ impl Agent {
         }
     }
 
-    /// Runs a shell command through the infra harness, which logs anything
-    /// that touches infrastructure.
-    fn run_bash(&mut self, args: &Value, _d: &mut Display) -> Result<String> {
+    /// Runs a shell command through the infra harness: a change gets a
+    /// snapshot of what it is about to touch first, and everything that
+    /// touches infrastructure is logged.
+    fn run_bash(&mut self, args: &Value, d: &mut Display) -> Result<String> {
         let cmd = args["command"].as_str().unwrap_or("").to_string();
         let Some(action) = infra::inspect(&cmd) else { return tools::execute("bash", args) };
+        let mut snapshot = None;
+        let mut note = String::new();
+        if action.mutating && !action.snapshots.is_empty() {
+            d.set_status("snapshotting before the change".into());
+            d.tick();
+            match self.infra.snapshot(&action, &cmd) {
+                Ok(path) => {
+                    d.line(&format!("  {} {}", ui::accent("⎘ snapshot"), ui::dim(&path.display().to_string())));
+                    snapshot = Some(path.display().to_string());
+                }
+                Err(why) => {
+                    d.line(&format!("  {} {}", ui::dim("⎘"), ui::dim(&why)));
+                    note = why;
+                }
+            }
+            d.set_status(String::new());
+        }
         let started = Instant::now();
-        let out = tools::execute("bash", args)?;
+        let mut out = tools::execute("bash", args)?;
         let (outcome, exit) = infra::outcome(&out);
+        if let Some(path) = &snapshot {
+            out.push_str(&format!(
+                "\n[pre-change snapshot of the previous state: {path}. Rollback: {}]",
+                action.rollback.replace("SNAPSHOT", path)
+            ));
+        }
         let rec = infra::Record {
             command: cmd,
             action,
             outcome,
             exit,
             secs: started.elapsed().as_secs_f32(),
+            snapshot,
+            note,
             ..infra::empty_record()
         };
         self.infra.record(self.execution_mode.name(), rec);

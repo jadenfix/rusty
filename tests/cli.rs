@@ -400,6 +400,67 @@ fn infrastructure_commands_are_audited_and_summarised() {
     assert!(out.contains("nothing changed in infrastructure this session"), "{out}");
 }
 
+#[test]
+fn a_change_is_snapshotted_before_it_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new("snapshot");
+    s.fake(
+        "kubectl",
+        "case \"$*\" in \
+         \"get -f deploy.yaml -o yaml --ignore-not-found -n payments\") printf 'apiVersion: apps/v1\\nkind: Deployment\\nmetadata:\\n  name: api\\n  resourceVersion: \"7\"\\nspec:\\n  replicas: 1\\nstatus:\\n  readyReplicas: 1\\n';; \
+         \"get -f new.yaml\"*) exit 0;; \
+         apply*) printf 'deployment.apps/api configured\\n';; esac",
+    );
+    s.fake("helm", "case \"$*\" in \"get values\"*) printf 'image:\\n  tag: v1\\n';; \"get manifest\"*) printf 'kind: Deployment\\n';; upgrade*) printf 'Release api has been upgraded\\n';; esac");
+    std::fs::write(s.project.join("deploy.yaml"), "kind: Deployment\n").unwrap();
+    let (out, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "standard", "deploy"],
+        vec![
+            bash_reply("kubectl apply -f deploy.yaml -n payments"),
+            bash_reply("kubectl apply -f new.yaml"),
+            bash_reply("helm upgrade api ./chart -n payments"),
+            text_reply("done"),
+        ],
+    );
+    let log = s.calls();
+    // The first call is the target probe at startup.
+    let calls: Vec<&str> = log.lines().skip(1).collect();
+    assert_eq!(calls[0], "kubectl get -f deploy.yaml -o yaml --ignore-not-found -n payments", "{calls:?}");
+    assert_eq!(calls[1], "kubectl apply -f deploy.yaml -n payments");
+    assert_eq!(calls[4], "helm get values api -o yaml -n payments");
+    assert_eq!(calls[5], "helm get manifest api -n payments");
+    assert_eq!(calls[6], "helm upgrade api ./chart -n payments");
+    assert!(out.contains("⎘ snapshot") && out.contains("nothing to snapshot: the objects don't exist yet"), "{out}");
+    let seen = requests[1]["messages"].to_string();
+    assert!(
+        seen.contains("pre-change snapshot of the previous state") && seen.contains("Rollback: kubectl apply -f "),
+        "{seen}"
+    );
+    let mut snaps = Vec::new();
+    find_files(&s.home, "yaml", &mut snaps);
+    let before = snaps.iter().find(|p| p.ends_with("before.yaml")).expect("no before.yaml");
+    let dir = before.parent().unwrap();
+    assert!(dir.file_name().unwrap().to_string_lossy().ends_with("-kubectl-apply"));
+    assert!(std::fs::read_to_string(before).unwrap().contains("resourceVersion"));
+    let rollback = std::fs::read_to_string(dir.join("rollback.yaml")).unwrap();
+    assert!(
+        !rollback.contains("resourceVersion")
+            && !rollback.contains("readyReplicas")
+            && rollback.contains("replicas: 1"),
+        "{rollback}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("command.txt")).unwrap().trim(),
+        "kubectl apply -f deploy.yaml -n payments"
+    );
+    assert_eq!(std::fs::metadata(before).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(snaps.iter().any(|p| p.ends_with("values.yaml")) && snaps.iter().any(|p| p.ends_with("manifest.yaml")));
+    assert!(out.contains("change record · 3 changes"), "{out}");
+    assert!(out.contains("snapshot ") && out.contains("nothing to snapshot"), "{out}");
+}
+
 fn find_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();

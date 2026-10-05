@@ -281,6 +281,26 @@ fn search(args: &Value) -> Result<String> {
 fn bash(args: &Value) -> Result<String> {
     let command = arg(args, "command")?;
     let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
+    let (status, stdout, stderr) = run(command, timeout)?;
+    let mut out = match status {
+        Some(code) => format!("exit code: {}\n", code.map_or("signal".into(), |c| c.to_string())),
+        None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
+        None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
+    };
+    if !stdout.is_empty() {
+        let _ = write!(out, "stdout:\n{stdout}");
+    }
+    if !stderr.is_empty() {
+        let _ = write!(out, "\nstderr:\n{stderr}");
+    }
+    Ok(cap(out))
+}
+
+/// Runs a shell command with a time limit. Returns (exit status, stdout,
+/// stderr); the status is None when the command was killed, and
+/// Some(None) when it died from a signal. Also used by the infra harness
+/// for its own snapshot and verification commands.
+pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(command)
@@ -307,7 +327,7 @@ fn bash(args: &Value) -> Result<String> {
     let start = Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
-            break Some(s);
+            break Some(s.code());
         }
         signal::poll_keys();
         if start.elapsed() > timeout || signal::interrupted() {
@@ -319,19 +339,7 @@ fn bash(args: &Value) -> Result<String> {
     };
     let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
     let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
-
-    let mut out = match status {
-        Some(s) => format!("exit code: {}\n", s.code().map_or("signal".into(), |c| c.to_string())),
-        None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
-        None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
-    };
-    if !stdout.is_empty() {
-        let _ = write!(out, "stdout:\n{stdout}");
-    }
-    if !stderr.is_empty() {
-        let _ = write!(out, "\nstderr:\n{stderr}");
-    }
-    Ok(cap(out))
+    Ok((status, stdout, stderr))
 }
 
 fn has_rg() -> bool {
