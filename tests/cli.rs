@@ -320,6 +320,86 @@ fn secrets_in_tool_output_never_reach_the_model_or_the_session_file() {
     }
 }
 
+/// Runs one headless prompt against a scripted endpoint and returns
+/// (stdout, stderr, the requests the endpoint saw).
+fn scripted_run(
+    s: &Sandbox,
+    args: &[&str],
+    replies: Vec<serde_json::Value>,
+) -> (String, String, Vec<serde_json::Value>) {
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(30)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string(), requests)
+}
+
+fn text_reply(text: &str) -> serde_json::Value {
+    serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]})
+}
+
+fn bash_reply(command: &str) -> serde_json::Value {
+    tool_reply("bash", serde_json::json!({"command": command}))
+}
+
+#[test]
+fn infrastructure_commands_are_audited_and_summarised() {
+    let s = Sandbox::new("audit");
+    s.fake(
+        "kubectl",
+        "case \"$*\" in get*) printf 'api-1 Running\\n';; apply*) printf 'deployment.apps/api configured\\n';; esac",
+    );
+    std::fs::write(s.project.join("deploy.yaml"), "kind: Deployment\n").unwrap();
+    let (out, _, _) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "standard", "roll out the deployment"],
+        vec![
+            bash_reply("kubectl get pods"),
+            bash_reply("kubectl apply -f deploy.yaml"),
+            bash_reply("ls"),
+            text_reply("done"),
+        ],
+    );
+    assert!(out.contains("change record · 1 change"), "{out}");
+    assert!(out.contains("✓ kubectl apply -f deploy.yaml") && out.contains("not verified"), "{out}");
+    let mut logs = Vec::new();
+    find_files(&s.home, "jsonl", &mut logs);
+    let audit = logs.iter().find(|p| p.ends_with("audit.jsonl")).expect("no audit log");
+    let lines: Vec<serde_json::Value> =
+        std::fs::read_to_string(audit).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2, "ls is not an infrastructure command: {lines:?}");
+    assert_eq!(lines[0]["command"], "kubectl get pods");
+    assert_eq!(lines[0]["mutating"], false);
+    assert_eq!(lines[1]["verb"], "apply");
+    assert_eq!(lines[1]["mutating"], true);
+    assert_eq!(lines[1]["outcome"], "ran");
+    assert_eq!(lines[1]["exit"], 0);
+    assert_eq!(lines[1]["mode"], "standard");
+    let mut records = Vec::new();
+    find_files(&s.home, "txt", &mut records);
+    assert!(records.iter().any(|p| p.to_string_lossy().ends_with(".changes.txt")), "no change record saved");
+    // Refusals are logged too, and the log survives across sessions.
+    let (out, _, _) = scripted_run(
+        &s,
+        &["--permissions", "read-only", "delete it"],
+        vec![bash_reply("kubectl delete deploy api"), text_reply("could not")],
+    );
+    assert!(out.contains("denied by permissions"), "{out}");
+    let out = s.repl(&["/audit", "/changes"]);
+    assert!(out.contains("kubectl get pods") && out.contains("read"), "{out}");
+    assert!(out.contains("kubectl apply -f deploy.yaml") && out.contains("change"), "{out}");
+    assert!(out.contains("kubectl delete deploy api") && out.contains("denied"), "{out}");
+    assert!(out.contains("nothing changed in infrastructure this session"), "{out}");
+}
+
 fn find_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();

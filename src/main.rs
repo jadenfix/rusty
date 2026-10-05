@@ -149,14 +149,15 @@ fn run() -> Result<i32> {
     agent.delegation_override =
         cli.agents.is_some() || settings.delegation_override || settings.agents.mode != AgentsMode::Off;
     agent.set_execution_mode(execution_mode);
-    agent.target = infra::Target::detect(&cwd);
+    agent.infra.dir = Some(pdir.clone());
+    agent.infra.target = infra::Target::detect(&cwd);
     // Production starts careful unless the flag said otherwise. Not saved.
-    if agent.target.production && cli.mode.is_none() && execution_mode != ExecutionMode::Careful {
+    if agent.infra.target.production && cli.mode.is_none() && execution_mode != ExecutionMode::Careful {
         agent.set_execution_mode(ExecutionMode::Careful);
         println!(
             "{} {}",
             ui::warn("◇ careful"),
-            ui::dim(&format!("target looks like production: {}", agent.target.summary()))
+            ui::dim(&format!("target looks like production: {}", agent.infra.target.summary()))
         );
     }
 
@@ -187,6 +188,7 @@ fn run() -> Result<i32> {
             }
         };
         agent.save_session();
+        print_changes(&agent);
         if cli.stats {
             print_stats(&agent, started);
         }
@@ -337,8 +339,20 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         let _ = rl.save_history(h);
     }
     agent.save_session();
+    print_changes(agent);
     println!("{}", ui::dim("  ◌ link closed. go ship something."));
     Ok(())
+}
+
+/// What this session changed in infrastructure, if anything, with the
+/// rollback paths and verification results. Printed at the end so the
+/// person who reviews the session doesn't have to reconstruct it.
+fn print_changes(agent: &Agent) {
+    let rec = agent.infra.change_record();
+    if !rec.is_empty() {
+        println!("{} {}", ui::accent("▤"), rec.trim_end());
+        println!();
+    }
 }
 
 /// Handles a slash command. Returns true to quit.
@@ -484,11 +498,26 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!("  tips {}", on_off(agent.tips));
         }
         "/target" => {
-            agent.target = infra::Target::detect(cwd);
-            println!(
-                "  target {}",
-                if agent.target.is_empty() { ui::dim("none detected") } else { target_line(agent) }
-            );
+            agent.infra.target = infra::Target::detect(cwd);
+            let line = if agent.infra.target.is_empty() { ui::dim("none detected") } else { target_line(agent) };
+            println!("  target {line}");
+        }
+        "/changes" => {
+            let rec = agent.infra.change_record();
+            let none = ui::dim("  nothing changed in infrastructure this session");
+            println!("{}", if rec.is_empty() { none } else { rec });
+        }
+        "/audit" => {
+            let n = rest.parse().unwrap_or(20);
+            let tail = agent.infra.audit_tail(n);
+            if tail.is_empty() {
+                println!("{}", ui::dim("  no infrastructure commands logged yet"));
+            } else {
+                print!("{tail}");
+                if let Some(p) = agent.infra.audit_path() {
+                    println!("  {}", ui::dim(&p.display().to_string()));
+                }
+            }
         }
         "/settings" => print_settings(agent),
         "/permissions" | "/perms" => permissions_cmd(agent, rest),
@@ -572,7 +601,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
 
 /// The live target for the banner and `/target`, with production called out.
 fn target_line(agent: &Agent) -> String {
-    let t = &agent.target;
+    let t = &agent.infra.target;
     if t.production {
         format!("{} {}", t.summary(), ui::warn("· production"))
     } else {
@@ -670,7 +699,7 @@ fn print_settings(agent: &Agent) {
         ("swarm models", if a.swarm_models.is_empty() { "(subagent model)".into() } else { a.swarm_models.join(", ") }),
         ("swarm spread", format!("{:.1}", a.spread)),
         ("tips", if agent.tips { "on".into() } else { "off".into() }),
-        ("target", if agent.target.is_empty() { "-".into() } else { agent.target.summary() }),
+        ("target", if agent.infra.target.is_empty() { "-".into() } else { agent.infra.target.summary() }),
         ("context window", context::window().to_string()),
     ];
     for (k, v) in rows {
@@ -855,6 +884,7 @@ fn print_help(cwd: &Path) {
             &[
                 ("/permissions [mode]", "read-only · ask · auto · yolo · allow · deny · check"),
                 ("/target", "the kube context, cloud account, workspace and branch commands will hit"),
+                ("/changes · /audit [n]", "what this session changed in infrastructure · the audit log"),
                 ("/model [id] · /models", "switch or list models"),
                 ("/view default|verbose|adhd", "how much you see"),
                 ("/theme · /font", "themes rust neon matrix amber ice mono · fonts rust block thin classic"),

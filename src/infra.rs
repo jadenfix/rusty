@@ -1,9 +1,13 @@
 //! The infrastructure harness. A strong model can write a kubectl command;
-//! it cannot know on its own which cluster that command will hit. This module
-//! works out the live target (kube context, cloud account, terraform
-//! workspace, git branch) so the user sees it, the model is told it, and
-//! anything that looks like production starts in careful mode.
+//! it cannot know on its own which cluster that command will hit, keep a
+//! copy of what it is about to change, or prove the rollout finished. This
+//! module does the parts a model can't: it works out the live target (kube
+//! context, cloud account, terraform workspace, git branch), redacts secrets
+//! from tool output, understands kubectl, helm and terraform commands well
+//! enough to snapshot before and verify after, and keeps an append-only
+//! audit log of everything that touched infrastructure.
 
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -463,6 +467,614 @@ pub fn redaction_note(n: usize) -> String {
     )
 }
 
+// -------------------------------------------------------------- commands
+
+/// What a shell command does to infrastructure, as far as the harness needs
+/// to know: which tool, whether it changes anything, and whether it is the
+/// dry run of a change.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Action {
+    pub tool: String,
+    pub verb: String,
+    pub mutating: bool,
+    pub dry_run: bool,
+    /// Shared by a change and its dry run; empty when no dry run exists for it.
+    pub signature: String,
+    /// Local files the dry run depends on; editing one makes it stale.
+    pub files: Vec<String>,
+}
+
+/// Tools whose commands are worth an audit line even when rusty does not
+/// understand them in detail.
+const INFRA_CLIS: &[&str] = &[
+    "aws",
+    "gcloud",
+    "az",
+    "docker",
+    "docker-compose",
+    "ssh",
+    "ansible",
+    "ansible-playbook",
+    "flux",
+    "argocd",
+    "pulumi",
+    "eksctl",
+    "istioctl",
+    "velero",
+    "vault",
+    "consul",
+    "nomad",
+    "psql",
+    "mysql",
+    "redis-cli",
+    "fly",
+    "flyctl",
+    "doctl",
+    "heroku",
+    "vercel",
+    "wrangler",
+    "cdk",
+    "sam",
+    "serverless",
+    "kustomize",
+    "oc",
+];
+
+/// Looks at every segment of a command line and returns the first one that
+/// touches infrastructure.
+pub fn inspect(cmd: &str) -> Option<Action> {
+    segments(cmd).iter().find_map(|seg| {
+        let ws = words(seg);
+        let ws: Vec<&str> =
+            ws.iter().map(String::as_str).skip_while(|w| w.contains('=') && !w.starts_with('-')).collect();
+        let (first, rest) = ws.split_first()?;
+        let bin = first.rsplit('/').next().unwrap_or(first);
+        match bin {
+            "kubectl" | "oc" => Some(kubectl_action(bin, rest)),
+            "helm" => Some(helm_action(rest)),
+            "terraform" | "tofu" => Some(terraform_action(bin, rest)),
+            _ if INFRA_CLIS.contains(&bin) => Some(generic_action(bin, rest)),
+            _ => None,
+        }
+    })
+}
+
+/// Flags that take a value as the next word.
+const KUBECTL_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--context",
+    "--kubeconfig",
+    "--cluster",
+    "--user",
+    "--as",
+    "--as-group",
+    "-f",
+    "--filename",
+    "-k",
+    "--kustomize",
+    "-l",
+    "--selector",
+    "-o",
+    "--output",
+    "-p",
+    "--patch",
+    "--type",
+    "--timeout",
+    "--image",
+    "--replicas",
+    "--field-selector",
+    "--grace-period",
+    "--template",
+    "--from-file",
+    "--from-literal",
+    "--from-env-file",
+    "--port",
+    "--target-port",
+    "--container",
+    "-c",
+    "--server",
+    "-s",
+    "--token",
+    "--request-timeout",
+    "--min",
+    "--max",
+    "--cpu-percent",
+    "--sort-by",
+    "--since",
+    "--tail",
+    "--revision",
+    "--to-revision",
+    "--current-replicas",
+    "--resource-version",
+    "--label-columns",
+    "-L",
+    "--chunk-size",
+];
+
+/// A parsed command line: positionals, the flags the harness reuses, and
+/// the ones that change its meaning.
+#[derive(Default)]
+struct Parsed {
+    positionals: Vec<String>,
+    files: Vec<String>,
+    kustomize: Vec<String>,
+    namespace: Option<String>,
+    context: Option<String>,
+    kubeconfig: Option<String>,
+    selector: Option<String>,
+    values: Vec<String>,
+    dry_run: bool,
+    all: bool,
+}
+
+fn parse(args: &[&str], value_flags: &[&str]) -> Parsed {
+    let mut p = Parsed::default();
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i];
+        let (flag, value) = match w.split_once('=') {
+            Some((f, v)) if f.starts_with('-') => (f, Some(v.to_string())),
+            _ if w.starts_with('-') && value_flags.contains(&w) => {
+                i += 1;
+                (w, args.get(i).map(|v| v.to_string()))
+            }
+            _ if w.starts_with('-') => (w, None),
+            _ => {
+                p.positionals.push(w.to_string());
+                i += 1;
+                continue;
+            }
+        };
+        match (flag, value) {
+            ("-n" | "--namespace", v) => p.namespace = v,
+            ("--context" | "--kube-context", v) => p.context = v,
+            ("--kubeconfig", v) => p.kubeconfig = v,
+            ("-l" | "--selector", v) => p.selector = v,
+            ("-f" | "--filename", Some(v)) => p.files.push(v),
+            ("-k" | "--kustomize", Some(v)) => p.kustomize.push(v),
+            ("--values", Some(v)) => p.values.push(v),
+            ("--dry-run", v) => p.dry_run = v.as_deref() != Some("none"),
+            ("--all" | "-A" | "--all-namespaces", _) => p.all = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    p
+}
+
+/// The context/namespace flags, for commands the harness runs itself.
+fn kube_flags(p: &Parsed) -> String {
+    let mut s = String::new();
+    for (flag, v) in [("-n", &p.namespace), ("--context", &p.context), ("--kubeconfig", &p.kubeconfig)] {
+        if let Some(v) = v {
+            s.push_str(&format!(" {flag} {}", quote(v)));
+        }
+    }
+    s
+}
+
+const KUBECTL_MUTATING: &[&str] = &[
+    "apply",
+    "create",
+    "replace",
+    "patch",
+    "edit",
+    "scale",
+    "set",
+    "rollout",
+    "delete",
+    "label",
+    "annotate",
+    "taint",
+    "cordon",
+    "uncordon",
+    "drain",
+    "expose",
+    "run",
+    "autoscale",
+    "exec",
+    "cp",
+];
+
+fn kubectl_action(bin: &str, args: &[&str]) -> Action {
+    let p = parse(args, KUBECTL_VALUE_FLAGS);
+    let verb = p.positionals.first().cloned().unwrap_or_default();
+    let mut files: Vec<String> = p.files.iter().chain(&p.kustomize).cloned().collect();
+    files.sort();
+    let signature = if files.is_empty() || files.iter().any(|f| f == "-") {
+        String::new()
+    } else {
+        format!("{bin}{} {}", kube_flags(&p), files.join(" "))
+    };
+    let dry_run = verb == "diff" || (p.dry_run && matches!(verb.as_str(), "apply" | "create" | "replace"));
+    let mutating = !dry_run && KUBECTL_MUTATING.contains(&verb.as_str());
+    let sub = if matches!(verb.as_str(), "rollout" | "set") {
+        p.positionals.get(1).cloned().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let verb = if sub.is_empty() { verb } else { format!("{verb} {sub}") };
+    // rollout status/history and set with no subject are reads.
+    let mutating = mutating && !matches!(verb.as_str(), "rollout status" | "rollout history");
+    Action { tool: bin.into(), verb, mutating, dry_run, signature, files }
+}
+
+const HELM_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--kube-context",
+    "--kubeconfig",
+    "-f",
+    "--values",
+    "--set",
+    "--set-string",
+    "--set-file",
+    "--set-json",
+    "--version",
+    "--timeout",
+    "--description",
+    "--repo",
+    "--username",
+    "--password",
+    "--ca-file",
+    "--cert-file",
+    "--key-file",
+    "--history-max",
+    "-o",
+    "--output",
+    "--post-renderer",
+    "--revision",
+];
+
+fn helm_action(args: &[&str]) -> Action {
+    let p = parse(args, HELM_VALUE_FLAGS);
+    let verb = p.positionals.first().cloned().unwrap_or_default();
+    // `helm diff upgrade R C` and `helm template R C` line up with `helm upgrade R C`.
+    let offset = if verb == "diff" { 2 } else { 1 };
+    let release = p.positionals.get(offset).cloned().unwrap_or_default();
+    let chart = p.positionals.get(offset + 1).cloned().unwrap_or_default();
+    // helm takes values with -f, which parse() files under `files`.
+    let mut files: Vec<String> = p.files.iter().chain(&p.values).cloned().collect();
+    if chart.starts_with('.') || chart.starts_with('/') {
+        files.push(chart.clone());
+    }
+    files.sort();
+    let dry_run = verb == "diff" || verb == "template" || (p.dry_run && matches!(verb.as_str(), "upgrade" | "install"));
+    let mutating = !dry_run && matches!(verb.as_str(), "upgrade" | "install" | "rollback" | "uninstall" | "delete");
+    let signature = if release.is_empty() || (chart.is_empty() && verb != "rollback") {
+        String::new()
+    } else {
+        format!("helm{} {release} {chart} {}", kube_flags(&p), files.join(" "))
+    };
+    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files }
+}
+
+const TERRAFORM_VALUE_FLAGS: &[&str] =
+    &["-out", "-var", "-var-file", "-target", "-replace", "-state", "-backend-config", "-lock-timeout", "-parallelism"];
+
+fn terraform_action(bin: &str, args: &[&str]) -> Action {
+    let chdir = args.iter().find_map(|a| a.strip_prefix("-chdir=")).unwrap_or("").to_string();
+    let p = parse(args, TERRAFORM_VALUE_FLAGS);
+    let verb = p.positionals.first().cloned().unwrap_or_default();
+    let out = args
+        .iter()
+        .position(|a| *a == "-out")
+        .and_then(|i| args.get(i + 1).copied())
+        .or_else(|| args.iter().find_map(|a| a.strip_prefix("-out=")));
+    let plan_file = match verb.as_str() {
+        "plan" => out.map(str::to_string),
+        "apply" => p.positionals.get(1).cloned(),
+        _ => None,
+    };
+    let signature = plan_file.as_ref().map(|f| format!("{bin} {chdir} {f}")).unwrap_or_default();
+    let dry_run = matches!(verb.as_str(), "plan" | "validate" | "show" | "fmt" | "console" | "graph" | "output");
+    let mutating = matches!(verb.as_str(), "apply" | "destroy" | "import" | "taint" | "untaint" | "force-unlock")
+        || (verb == "state"
+            && p.positionals.get(1).is_some_and(|s| matches!(s.as_str(), "mv" | "rm" | "push" | "replace-provider")))
+        || (verb == "workspace" && p.positionals.get(1).is_some_and(|s| s == "delete"));
+    let verb = match p.positionals.get(1) {
+        Some(sub) if matches!(verb.as_str(), "state" | "workspace") => format!("{verb} {sub}"),
+        _ => verb,
+    };
+    Action { tool: bin.into(), verb, mutating, dry_run, signature, files: plan_file.into_iter().collect() }
+}
+
+/// Other infrastructure CLIs: logged, with a verb-based guess at whether
+/// they change anything. Permissions, not this guess, decide what runs.
+fn generic_action(bin: &str, args: &[&str]) -> Action {
+    let verbs: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).take(3).collect();
+    let read = verbs.iter().any(|v| {
+        [
+            "describe", "get", "list", "ls", "show", "status", "logs", "ps", "images", "inspect", "version", "info",
+            "diff", "preview", "events", "top", "search", "filter", "lookup", "query", "scan", "head", "cat", "stat",
+            "whoami", "check",
+        ]
+        .iter()
+        .any(|r| v == r || v.starts_with(&format!("{r}-")))
+    });
+    Action { tool: bin.into(), verb: verbs.join(" "), mutating: !read && !verbs.is_empty(), ..Action::default() }
+}
+
+/// Splits on `&&`, `||`, `;`, `|` and newlines that are outside quotes.
+fn segments(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in cmd.chars() {
+        if escaped {
+            escaped = false;
+            cur.push(ch);
+            continue;
+        }
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\\') => escaped = true,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, ';' | '|' | '&' | '\n') => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    out.push(cur);
+    out.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Whitespace-separated words with quotes removed and quoted spans kept whole.
+fn words(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut quoted = false;
+    for ch in seg.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(ch);
+                quoted = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if !cur.is_empty() || quoted {
+                    out.push(std::mem::take(&mut cur));
+                    quoted = false;
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() || quoted {
+        out.push(cur);
+    }
+    out
+}
+
+/// Shell-quotes a word for commands the harness builds itself.
+fn quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '=' | ','))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+// --------------------------------------------------------------- harness
+
+/// What happened to one infrastructure command. The audit log on disk gets
+/// every one; the change record at the end of the session lists the ones
+/// that changed something.
+#[derive(Debug, Clone)]
+pub struct Record {
+    pub t: u64,
+    pub command: String,
+    pub action: Action,
+    /// `ran`, `blocked`, `denied`, `declined`, `timed out` or `interrupted`.
+    pub outcome: String,
+    pub exit: Option<i32>,
+    pub secs: f32,
+    pub snapshot: Option<String>,
+    pub verified: Option<bool>,
+    pub note: String,
+}
+
+/// Per-session harness state: the target, where the audit log lives, and
+/// this session's records.
+#[derive(Default)]
+pub struct Harness {
+    pub target: Target,
+    /// The project's rusty directory; None means nothing is written.
+    pub dir: Option<PathBuf>,
+    pub records: Vec<Record>,
+}
+
+impl Harness {
+    pub fn audit_path(&self) -> Option<PathBuf> {
+        self.dir.as_ref().map(|d| d.join("audit.jsonl"))
+    }
+
+    /// Logs one command: a line in the audit file and an entry in memory.
+    pub fn record(&mut self, mode: &str, mut rec: Record) {
+        rec.t = crate::memory::now();
+        let line = json!({
+            "t": rec.t, "mode": mode, "target": self.target.summary(), "command": rec.command,
+            "tool": rec.action.tool, "verb": rec.action.verb, "mutating": rec.action.mutating, "dry_run": rec.action.dry_run,
+            "outcome": rec.outcome, "exit": rec.exit, "secs": rec.secs, "snapshot": rec.snapshot,
+            "verified": rec.verified, "note": rec.note,
+        });
+        if let Some(path) = self.audit_path() {
+            append_private(&path, &format!("{line}\n"));
+        }
+        self.records.push(rec);
+    }
+
+    /// Records a command that never ran, with why.
+    pub fn record_refusal(&mut self, mode: &str, cmd: &str, outcome: &str, note: &str) {
+        if let Some(action) = inspect(cmd) {
+            self.record(
+                mode,
+                Record { command: cmd.into(), action, outcome: outcome.into(), note: note.into(), ..empty_record() },
+            );
+        }
+    }
+
+    /// This session's changes: what ran against what, with the rollback
+    /// path and whether it was verified. Empty when nothing changed.
+    pub fn change_record(&self) -> String {
+        let changes: Vec<&Record> = self.records.iter().filter(|r| r.action.mutating).collect();
+        if changes.is_empty() {
+            return String::new();
+        }
+        let mut s = format!("change record · {} · target {}\n", plural(changes.len(), "change"), self.target.summary());
+        for r in changes {
+            let mark = match (r.outcome.as_str(), r.exit) {
+                ("ran", Some(0)) => "✓",
+                ("ran", _) => "✗",
+                _ => "⊘",
+            };
+            let mut tail = Vec::new();
+            if r.outcome != "ran" {
+                tail.push(r.outcome.clone());
+            } else if r.exit != Some(0) {
+                tail.push(format!("exit {}", r.exit.map_or("?".into(), |c| c.to_string())));
+            }
+            if let Some(p) = &r.snapshot {
+                tail.push(format!("snapshot {p}"));
+            }
+            match r.verified {
+                Some(true) => tail.push("verified".into()),
+                Some(false) => tail.push("NOT verified".into()),
+                None if r.outcome == "ran" => tail.push("not verified".into()),
+                None => {}
+            }
+            if !r.note.is_empty() {
+                tail.push(r.note.clone());
+            }
+            s.push_str(&format!(
+                "  {} {mark} {}\n      {}\n",
+                clock(r.t),
+                crate::ui::truncate(r.command.lines().next().unwrap_or(""), 100),
+                tail.join(" · ")
+            ));
+        }
+        if let Some(p) = self.audit_path() {
+            s.push_str(&format!("  audit log: {}\n", p.display()));
+        }
+        s
+    }
+
+    /// The last `n` lines of the audit log across all sessions, oldest first.
+    pub fn audit_tail(&self, n: usize) -> String {
+        let Some(path) = self.audit_path() else { return String::new() };
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = String::new();
+        for line in lines.iter().rev().take(n).rev() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let t = v["t"].as_u64().unwrap_or(0);
+            let outcome = v["outcome"].as_str().unwrap_or("");
+            let mark = match (outcome, v["exit"].as_i64()) {
+                ("ran", Some(0)) => "✓",
+                ("ran", _) => "✗",
+                _ => "⊘",
+            };
+            let kind = if v["mutating"].as_bool() == Some(true) {
+                "change"
+            } else if v["dry_run"].as_bool() == Some(true) {
+                "dry run"
+            } else {
+                "read"
+            };
+            let mut extra = vec![kind.to_string()];
+            if outcome != "ran" {
+                extra.push(outcome.into());
+            }
+            if v["snapshot"].is_string() {
+                extra.push("snapshot".into());
+            }
+            if let Some(ok) = v["verified"].as_bool() {
+                extra.push(if ok { "verified".into() } else { "NOT verified".into() });
+            }
+            out.push_str(&format!(
+                "  {} {} {mark} {}  {}\n",
+                day(t),
+                clock(t),
+                crate::ui::truncate(v["command"].as_str().unwrap_or("").lines().next().unwrap_or(""), 80),
+                extra.join(" · ")
+            ));
+        }
+        out
+    }
+}
+
+pub fn empty_record() -> Record {
+    Record {
+        t: 0,
+        command: String::new(),
+        action: Action::default(),
+        outcome: String::new(),
+        exit: None,
+        secs: 0.0,
+        snapshot: None,
+        verified: None,
+        note: String::new(),
+    }
+}
+
+/// How a bash tool result ended, from its first line.
+pub fn outcome(result: &str) -> (String, Option<i32>) {
+    let first = result.lines().next().unwrap_or("");
+    if let Some(code) = first.strip_prefix("exit code: ") {
+        return ("ran".into(), code.parse().ok());
+    }
+    if first.starts_with("timed out") {
+        return ("timed out".into(), None);
+    }
+    ("interrupted".into(), None)
+}
+
+/// Appends to a file only its owner can read.
+fn append_private(path: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path) {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// `hh:mm` UTC.
+pub fn clock(t: u64) -> String {
+    format!("{:02}:{:02}", (t % 86_400) / 3_600, (t % 3_600) / 60)
+}
+
+/// `mm-dd` UTC.
+fn day(t: u64) -> String {
+    let days = (t / 86_400) as i64;
+    // Civil-from-days (Howard Hinnant), month and day only.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +1131,115 @@ mod tests {
             assert_eq!(n, 0, "{text} -> {got}");
             assert_eq!(got, text);
         }
+    }
+
+    fn act(cmd: &str) -> Action {
+        inspect(cmd).unwrap_or_else(|| panic!("{cmd} is not an infra command"))
+    }
+
+    #[test]
+    fn kubectl_commands_are_understood() {
+        let a = act("kubectl apply -f deploy.yaml -f svc.yaml -n payments --context prod-eu");
+        assert!(a.mutating && !a.dry_run);
+        assert_eq!(a.signature, "kubectl -n payments --context prod-eu deploy.yaml svc.yaml");
+        assert_eq!(a.files, ["deploy.yaml", "svc.yaml"]);
+        let d = act("cd k8s && kubectl diff --context prod-eu -f svc.yaml -n payments -f deploy.yaml");
+        assert!(d.dry_run && !d.mutating);
+        assert_eq!(d.signature, a.signature, "a diff and its apply share a signature");
+        let s = act("kubectl apply -f svc.yaml -f deploy.yaml --dry-run=server -n payments --context=prod-eu");
+        assert!(s.dry_run && s.signature == a.signature, "{s:?}");
+        assert!(act("kubectl apply -f deploy.yaml --dry-run=none").mutating);
+        for cmd in [
+            "kubectl get pods -n x",
+            "kubectl rollout status deploy/api",
+            "kubectl logs -f pod/x",
+            "kubectl describe node n1",
+        ] {
+            let a = act(cmd);
+            assert!(!a.mutating && !a.dry_run, "{cmd}");
+        }
+        for cmd in [
+            "kubectl scale deploy/api --replicas=3",
+            "kubectl set image deployment/api api=img:2",
+            "kubectl rollout restart deploy/api",
+            "kubectl delete pod x",
+            "kubectl patch deploy api -p '{}'",
+            "kubectl apply -k overlays/prod",
+        ] {
+            assert!(act(cmd).mutating, "{cmd}");
+        }
+        assert_eq!(act("kubectl rollout restart deploy/api").verb, "rollout restart");
+        assert!(act("kubectl apply -f -").signature.is_empty(), "stdin has no dry-run signature");
+        assert!(inspect("cargo test && ls").is_none());
+    }
+
+    #[test]
+    fn helm_and_terraform_commands_are_understood() {
+        let up = act("helm upgrade --install api ./chart -n payments -f values.yaml --set image.tag=2");
+        assert!(up.mutating);
+        assert_eq!(up.signature, "helm -n payments api ./chart ./chart values.yaml");
+        let diff = act("helm diff upgrade api ./chart -f values.yaml -n payments");
+        assert!(diff.dry_run && diff.signature == up.signature);
+        assert!(act("helm upgrade api ./chart --dry-run").dry_run);
+        assert!(!act("helm list -A").mutating && !act("helm get values api").mutating);
+        assert!(act("helm rollback api 3 -n payments").mutating);
+        let plan = act("terraform plan -out=rusty.tfplan -var env=prod");
+        assert!(plan.dry_run && plan.signature == "terraform  rusty.tfplan");
+        let apply = act("terraform apply rusty.tfplan");
+        assert!(apply.mutating && apply.signature == plan.signature);
+        assert!(act("terraform apply").signature.is_empty());
+        assert!(act("terraform -chdir=infra plan -out tf.plan").signature == "terraform infra tf.plan");
+        for cmd in [
+            "terraform destroy",
+            "terraform state rm aws_instance.x",
+            "terraform import a.b id",
+            "tofu apply -auto-approve",
+        ] {
+            assert!(act(cmd).mutating, "{cmd}");
+        }
+        assert_eq!(act("terraform state rm a.b").verb, "state rm");
+        for cmd in ["terraform plan", "terraform state list", "terraform output", "terraform validate"] {
+            assert!(!act(cmd).mutating, "{cmd}");
+        }
+        assert!(!act("aws ec2 describe-instances").mutating);
+        assert!(act("aws ec2 terminate-instances --instance-ids i-1").mutating);
+        assert!(!act("docker ps").mutating && act("docker rm x").mutating);
+    }
+
+    #[test]
+    fn change_record_and_clock() {
+        assert_eq!(clock(3_661), "01:01");
+        assert_eq!(day(1_759_622_400), "10-05");
+        let mut h = Harness::default();
+        assert!(h.change_record().is_empty());
+        h.record(
+            "careful",
+            Record {
+                command: "kubectl get pods".into(),
+                action: act("kubectl get pods"),
+                outcome: "ran".into(),
+                exit: Some(0),
+                ..empty_record()
+            },
+        );
+        assert!(h.change_record().is_empty(), "reads are not changes");
+        h.record(
+            "careful",
+            Record {
+                command: "kubectl apply -f d.yaml".into(),
+                action: act("kubectl apply -f d.yaml"),
+                outcome: "ran".into(),
+                exit: Some(0),
+                snapshot: Some("/snap/1".into()),
+                verified: Some(true),
+                ..empty_record()
+            },
+        );
+        h.record_refusal("careful", "terraform apply", "blocked", "no plan file");
+        let rec = h.change_record();
+        assert!(rec.contains("2 changes"), "{rec}");
+        assert!(rec.contains("✓ kubectl apply -f d.yaml") && rec.contains("snapshot /snap/1 · verified"), "{rec}");
+        assert!(rec.contains("⊘ terraform apply") && rec.contains("blocked · no plan file"), "{rec}");
     }
 
     #[test]

@@ -116,8 +116,8 @@ pub struct Agent {
     pub last_prompt_tokens: u64,
     project_notes: String,
     pub session_path: Option<PathBuf>,
-    /// Where infrastructure commands will land; empty for workers.
-    pub target: infra::Target,
+    /// Target, audit log and change record; inert for workers.
+    pub infra: infra::Harness,
     is_worker: bool,
     progress: Option<Arc<AtomicUsize>>,
 }
@@ -148,7 +148,7 @@ impl Agent {
             last_prompt_tokens: 0,
             project_notes,
             session_path: None,
-            target: infra::Target::default(),
+            infra: infra::Harness::default(),
             is_worker: false,
             progress: None,
         }
@@ -254,7 +254,7 @@ impl Agent {
             std::env::consts::ARCH,
             self.policy.mode.name()
         ));
-        s.push_str(&self.target.prompt_block());
+        s.push_str(&self.infra.target.prompt_block());
         if !self.project_notes.is_empty() {
             s.push_str("\nProject instructions:\n");
             s.push_str(&self.project_notes);
@@ -627,6 +627,7 @@ impl Agent {
         match self.policy.decide(name, args, &self.cwd) {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
+                self.refused(name, args, "denied", &why);
                 return Ok(format!(
                     "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
                 ));
@@ -662,13 +663,48 @@ impl Agent {
                         self.policy.save();
                     }
                     Answer::No(None) => {
-                        return Ok("the user declined this call. Do not retry it; ask what they want instead.".into())
+                        self.refused(name, args, "declined", "");
+                        return Ok("the user declined this call. Do not retry it; ask what they want instead.".into());
                     }
-                    Answer::No(Some(fb)) => return Ok(format!("the user declined this call and said: {fb}")),
+                    Answer::No(Some(fb)) => {
+                        self.refused(name, args, "declined", &fb);
+                        return Ok(format!("the user declined this call and said: {fb}"));
+                    }
                 }
             }
         }
+        if name == "bash" {
+            return self.run_bash(args, d);
+        }
         tools::execute(name, args)
+    }
+
+    /// A shell command that never ran still gets its audit line.
+    fn refused(&mut self, name: &str, args: &Value, outcome: &str, note: &str) {
+        if name == "bash" {
+            let mode = self.execution_mode.name();
+            self.infra.record_refusal(mode, args["command"].as_str().unwrap_or(""), outcome, note);
+        }
+    }
+
+    /// Runs a shell command through the infra harness, which logs anything
+    /// that touches infrastructure.
+    fn run_bash(&mut self, args: &Value, _d: &mut Display) -> Result<String> {
+        let cmd = args["command"].as_str().unwrap_or("").to_string();
+        let Some(action) = infra::inspect(&cmd) else { return tools::execute("bash", args) };
+        let started = Instant::now();
+        let out = tools::execute("bash", args)?;
+        let (outcome, exit) = infra::outcome(&out);
+        let rec = infra::Record {
+            command: cmd,
+            action,
+            outcome,
+            exit,
+            secs: started.elapsed().as_secs_f32(),
+            ..infra::empty_record()
+        };
+        self.infra.record(self.execution_mode.name(), rec);
+        Ok(out)
     }
 
     fn recall(&mut self, query: &str) -> String {
@@ -1030,6 +1066,10 @@ impl Agent {
         }
         let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal});
         let _ = std::fs::write(path, body.to_string());
+        let changes = self.infra.change_record();
+        if !changes.is_empty() {
+            let _ = std::fs::write(path.with_extension("changes.txt"), changes);
+        }
     }
 
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
