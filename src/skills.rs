@@ -21,6 +21,9 @@ const BUILTIN: &[(&str, &str)] = &[
     ("debug", include_str!("../skills/debug.md")),
     ("test", include_str!("../skills/test.md")),
     ("commit", include_str!("../skills/commit.md")),
+    ("triage", include_str!("../skills/triage.md")),
+    ("change", include_str!("../skills/change.md")),
+    ("postmortem", include_str!("../skills/postmortem.md")),
 ];
 
 fn parse(name: &str, text: &str, source: &'static str) -> Skill {
@@ -78,7 +81,7 @@ mod tests {
     #[test]
     fn builtins_parse_with_descriptions() {
         let skills = all(Path::new("/nonexistent"));
-        for name in ["review", "explore", "feature", "debug", "test", "commit"] {
+        for name in ["review", "explore", "feature", "debug", "test", "commit", "triage", "change", "postmortem"] {
             let s = skills.iter().find(|s| s.name == name).unwrap();
             assert!(!s.description.is_empty(), "{name} has no description");
             assert!(s.body.contains("{{args}}"), "{name} ignores args");

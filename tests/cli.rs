@@ -151,9 +151,23 @@ fn banner_and_help_list_every_command() {
     let s = Sandbox::new("help");
     let out = s.repl(&["/help"]);
     assert!(out.contains("model") && out.contains("nemotron"), "banner missing model");
-    for cmd in
-        ["/goal", "/loop", "/agents", "/swarm", "/permissions", "/memory", "/context", "/view", "/theme", "/review"]
-    {
+    for cmd in [
+        "/goal",
+        "/loop",
+        "/agents",
+        "/swarm",
+        "/permissions",
+        "/memory",
+        "/context",
+        "/view",
+        "/theme",
+        "/review",
+        "/target",
+        "/audit",
+        "/triage",
+        "/change",
+        "/postmortem",
+    ] {
         assert!(out.contains(cmd), "/help is missing {cmd}");
     }
     assert!(out.contains("link closed"), "no goodbye on EOF");
