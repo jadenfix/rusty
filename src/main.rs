@@ -25,7 +25,7 @@ use config::{AgentsMode, Settings};
 use execution::ExecutionMode;
 use llm::Client;
 use memory::Memory;
-use permissions::{Mode, Policy};
+use permissions::{Mode, Policy, Verdict};
 
 /// A coding agent for your terminal.
 #[derive(Parser)]
@@ -474,7 +474,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/permissions" | "/perms" => permissions_cmd(agent, rest),
         "/yolo" => {
             agent.policy.mode = Mode::Yolo;
-            println!("  permissions {}", ui::warn("yolo · everything runs except deny rules"));
+            println!("  permissions {}", ui::warn("yolo · everything runs except deny rules and destructive commands"));
         }
         "/plan" => {
             if agent.plan.is_empty() {
@@ -680,10 +680,14 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
     match sub {
         "" => {
             println!("  mode {}", ui::bold(p.mode.name()));
-            println!("    read-only  reads and read-only commands only");
-            println!("    ask        ask before every edit or command that changes something");
-            println!("    auto       project edits and build/test commands run; risky things ask");
-            println!("    yolo       everything runs except deny rules");
+            println!("    read-only  reads, searches and read-only commands (cloud reads too)");
+            println!("    ask        asks before every edit or command that changes something");
+            println!("    auto       project work, everyday git and cloud reads run; the rest asks");
+            println!("    yolo       everything runs except deny rules and destructive commands");
+            println!(
+                "  {}",
+                ui::dim("destructive (force push, cloud or database deletes, rm -rf outside) asks every time")
+            );
             println!("  allow {}", if p.allow.is_empty() { "-".into() } else { p.allow.join(", ") });
             println!("  deny  {}", if p.deny.is_empty() { "-".into() } else { p.deny.join(", ") });
             println!(
@@ -715,8 +719,13 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
         "check" if !arg.is_empty() => {
             let args = serde_json::json!({"command": arg});
             let class = permissions::classify("bash", &args, &agent.cwd);
-            let verdict = p.decide("bash", &args, &agent.cwd);
-            println!("  class {class:?}\n  in {} mode → {verdict:?}", p.mode.name());
+            let verdict = match p.decide("bash", &args, &agent.cwd) {
+                Verdict::Allow => ui::ok("✓ runs"),
+                Verdict::Ask(_) => ui::warn("? asks first"),
+                Verdict::Confirm(_) => ui::err("‼ needs you every time"),
+                Verdict::Deny(why) => ui::err(&format!("✗ refused · {why}")),
+            };
+            println!("  {verdict} {}", ui::dim(&format!("· {} · {} mode", class.describe(), p.mode.name())));
         }
         m => match Mode::parse(m) {
             Some(mode) => {

@@ -156,13 +156,21 @@ fn permission_classifier_is_inspectable() {
         "/permissions check cargo test 2>&1 | tail",
         "/permissions allow git push",
         "/permissions check git push origin main",
+        "/permissions check aws s3 rm s3://prod --recursive",
+        "/permissions yolo",
+        "/permissions check terraform destroy",
         "/permissions read-only",
         "/permissions check touch x",
+        "/permissions check kubectl get pods",
     ]);
-    assert!(out.contains("Ask(\"forced operation\")"), "{out}");
-    assert!(out.contains("WorkspaceWrite"));
-    assert!(out.contains("in auto mode → Allow"));
-    assert!(out.contains("Deny(\"read-only mode"));
+    let lines: Vec<&str> = out.lines().map(str::trim_start).filter(|l| l.starts_with(['✓', '?', '‼', '✗'])).collect();
+    assert!(lines[0].contains("needs you every time") && lines[0].contains("destructive"), "{out}");
+    assert!(lines[1].contains("✓ runs") && lines[1].contains("changes the project"), "{out}");
+    assert!(lines[2].contains("✓ runs"), "an allow rule lets a push to main through: {out}");
+    assert!(lines[3].contains("needs you every time"), "{out}");
+    assert!(lines[4].contains("needs you every time") && lines[4].contains("yolo"), "yolo can't skip it: {out}");
+    assert!(lines[5].contains("refused"), "{out}");
+    assert!(lines[6].contains("✓ runs") && lines[6].contains("read-only"), "{out}");
     // Allow rules are saved per project.
     let out = s.repl(&["/permissions"]);
     assert!(out.contains("allow git push"));
@@ -305,7 +313,7 @@ fn execution_modes_persist_without_changing_permissions() {
     assert!(out.contains("execution vibe"), "{out}");
     assert!(out.contains("workers auto (≤3)"), "{out}");
     assert!(out.contains("swarm size      8"), "a mode must not rewrite the saved swarm size: {out}");
-    assert!(out.contains("Ask("), "vibe must not authorize git push: {out}");
+    assert!(out.contains("? asks first"), "vibe must not authorize git push: {out}");
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings["execution_mode"], "vibe");

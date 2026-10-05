@@ -615,13 +615,29 @@ impl Agent {
                     "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
                 ));
             }
+            Verdict::Confirm(why) => {
+                d.pause();
+                if display::view() == View::Adhd {
+                    println!("{} {}", ui::info("▸"), tools::summary(name, args));
+                }
+                print!("{}", tools::preview(name, args));
+                match ask_user(&why, true) {
+                    Answer::Yes | Answer::Always => {}
+                    Answer::No(None) => {
+                        return Ok("the user declined this destructive call. Do not retry it or look for another \
+                                   route to the same result; ask what they want instead."
+                            .into())
+                    }
+                    Answer::No(Some(fb)) => return Ok(format!("the user declined this call and said: {fb}")),
+                }
+            }
             Verdict::Ask(why) => {
                 d.pause();
                 if display::view() == View::Adhd {
                     println!("{} {}", ui::info("▸"), tools::summary(name, args));
                 }
                 print!("{}", tools::preview(name, args));
-                match ask_user(&why) {
+                match ask_user(&why, false) {
                     Answer::Yes => {}
                     Answer::Always => {
                         let rule = Policy::suggest_rule(name, args);
@@ -1055,10 +1071,37 @@ enum Answer {
 }
 
 /// Asks for approval. Uses line editing so Ctrl-C cleanly means "no, stop".
-fn ask_user(why: &str) -> Answer {
+/// Asks the person at the keyboard. A destructive call can only be approved
+/// once, by typing `yes` in full, and never in a session nobody is watching.
+fn ask_user(why: &str, destructive: bool) -> Answer {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
-        return Answer::No(Some("non-interactive session; the call needs approval".into()));
+        return Answer::No(Some(if destructive {
+            format!(
+                "refused: {why}. This can't be undone, so it needs a person to approve it and nobody is watching \
+                 this session. Don't retry it or work around it; tell the user the exact command so they can run \
+                 it themselves."
+            )
+        } else {
+            "non-interactive session; the call needs approval".into()
+        }));
+    }
+    if destructive {
+        println!("  {} {}", ui::err("‼ can't be undone:"), why);
+        let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));
+        let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+            Ok(l) => l,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                signal::trip();
+                return Answer::No(Some("the user pressed ctrl-c to stop".into()));
+            }
+            Err(_) => return Answer::No(None),
+        };
+        return match line.trim() {
+            "yes" | "YES" => Answer::Yes,
+            "" | "n" | "N" | "no" => Answer::No(None),
+            other => Answer::No(Some(other.to_string())),
+        };
     }
     println!("  {} {}", ui::warn("?"), why);
     let prompt = format!("  {} ", ui::dim("[y]es  [a]lways  [n]o  or say what to do instead ›"));
