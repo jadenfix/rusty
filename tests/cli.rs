@@ -407,7 +407,13 @@ fn infrastructure_commands_are_audited_and_summarised() {
         vec![bash_reply("kubectl delete deploy api"), text_reply("could not")],
     );
     assert!(out.contains("denied by permissions"), "{out}");
+    // A destructive command needs a person; with nobody watching it is declined and logged.
+    let (out, _, _) =
+        scripted_run(&s, &["drop it"], vec![bash_reply("terraform destroy -auto-approve"), text_reply("no")]);
+    assert!(out.contains("refused"), "{out}");
+    assert!(!s.calls().contains("terraform destroy"), "{}", s.calls());
     let out = s.repl(&["/audit", "/changes"]);
+    assert!(out.contains("terraform destroy -auto-approve") && out.contains("declined"), "{out}");
     assert!(out.contains("kubectl get pods") && out.contains("read"), "{out}");
     assert!(out.contains("kubectl apply -f deploy.yaml") && out.contains("change"), "{out}");
     assert!(out.contains("kubectl delete deploy api") && out.contains("denied"), "{out}");

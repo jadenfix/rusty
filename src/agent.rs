@@ -644,11 +644,15 @@ impl Agent {
                 match ask_user(&why, true) {
                     Answer::Yes | Answer::Always => {}
                     Answer::No(None) => {
+                        self.refused(name, args, "declined", &why);
                         return Ok("the user declined this destructive call. Do not retry it or look for another \
                                    route to the same result; ask what they want instead."
-                            .into())
+                            .into());
                     }
-                    Answer::No(Some(fb)) => return Ok(format!("the user declined this call and said: {fb}")),
+                    Answer::No(Some(fb)) => {
+                        self.refused(name, args, "declined", &fb);
+                        return Ok(format!("the user declined this call and said: {fb}"));
+                    }
                 }
             }
             Verdict::Ask(why) => {
