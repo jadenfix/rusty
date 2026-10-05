@@ -15,6 +15,7 @@ use crate::config::{AgentsConfig, AgentsMode};
 use crate::context;
 use crate::display::{self, Display, View};
 use crate::execution::{ExecutionMode, ReviewGate};
+use crate::infra;
 use crate::llm::{Client, Event, Reply, ToolCall};
 use crate::memory::{Memory, KINDS};
 use crate::permissions::{Mode, Policy, Verdict};
@@ -115,6 +116,8 @@ pub struct Agent {
     pub last_prompt_tokens: u64,
     project_notes: String,
     pub session_path: Option<PathBuf>,
+    /// Where infrastructure commands will land; empty for workers.
+    pub target: infra::Target,
     is_worker: bool,
     progress: Option<Arc<AtomicUsize>>,
 }
@@ -145,6 +148,7 @@ impl Agent {
             last_prompt_tokens: 0,
             project_notes,
             session_path: None,
+            target: infra::Target::default(),
             is_worker: false,
             progress: None,
         }
@@ -250,6 +254,7 @@ impl Agent {
             std::env::consts::ARCH,
             self.policy.mode.name()
         ));
+        s.push_str(&self.target.prompt_block());
         if !self.project_notes.is_empty() {
             s.push_str("\nProject instructions:\n");
             s.push_str(&self.project_notes);

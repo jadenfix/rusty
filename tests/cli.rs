@@ -16,6 +16,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_rusty");
 struct Sandbox {
     home: PathBuf,
     project: PathBuf,
+    /// Fake `kubectl`, `terraform` and friends go here, first on PATH, so no
+    /// test can reach a real cluster or account.
+    bin: PathBuf,
 }
 
 impl Sandbox {
@@ -24,18 +27,46 @@ impl Sandbox {
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
         let project = root.join("project");
+        let bin = root.join("bin");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&project).unwrap();
-        Self { home, project }
+        std::fs::create_dir_all(&bin).unwrap();
+        Self { home, project, bin }
+    }
+
+    /// Installs a fake command. It appends its arguments to `calls.log` in
+    /// the sandbox root, then runs `body` with them.
+    fn fake(&self, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.bin.join(name);
+        std::fs::write(&path, format!("#!/usr/bin/env bash\necho \"{name} $*\" >> \"$RUSTY_TEST_CALLS\"\n{body}\n"))
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.bin.parent().unwrap().join("calls.log")).unwrap_or_default()
     }
 
     fn cmd(&self) -> Command {
         let mut c = Command::new(BIN);
         c.current_dir(&self.project)
             .env("RUSTY_HOME", &self.home)
+            .env("HOME", &self.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+            .env("RUSTY_TEST_CALLS", self.bin.parent().unwrap().join("calls.log"))
             .env("RUSTY_NO_DOTENV", "1")
             .env("NVIDIA_API_KEY", "offline-test-key")
             .env("NO_COLOR", "1")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_DEFAULT_PROFILE")
+            .env_remove("AWS_ACCESS_KEY_ID")
+            .env_remove("AWS_REGION")
+            .env_remove("AWS_DEFAULT_REGION")
+            .env_remove("CLOUDSDK_CORE_PROJECT")
+            .env_remove("TF_WORKSPACE")
+            .env_remove("KUBECONFIG")
+            .env_remove("RUSTY_INFRA")
             .env_remove("RUSTY_MODEL")
             .env_remove("RUSTY_MODE")
             .env_remove("RUSTY_CAREFUL_MODEL")
@@ -214,6 +245,46 @@ fn unknown_command_and_goal_status() {
     assert!(out.contains("window"));
 }
 
+#[test]
+fn target_is_detected_shown_and_production_starts_careful() {
+    let s = Sandbox::new("target");
+    s.fake("kubectl", "printf 'prod-eu|payments'");
+    s.fake("aws", "case \"$*\" in *Account*) printf '123456789012\\n';; *region*) printf 'eu-west-1\\n';; esac");
+    std::fs::write(s.project.join("main.tf"), "").unwrap();
+    std::fs::create_dir_all(s.project.join(".terraform")).unwrap();
+    std::fs::write(s.project.join(".terraform/environment"), "staging").unwrap();
+    let out = s.repl(&["/mode", "/target", "/settings"]);
+    assert!(out.contains("target looks like production: kube prod-eu/payments"), "{out}");
+    assert!(out.contains("execution careful"), "production must start careful: {out}");
+    assert!(out.contains("terraform staging"), "{out}");
+    assert!(!out.contains("aws "), "no aws profile is configured in the sandbox: {out}");
+    // Nothing was saved: the next session with a harmless target is standard again.
+    s.fake("kubectl", "printf 'kind-dev|default'");
+    let out = s.repl(&["/mode", "/target"]);
+    assert!(out.contains("execution standard") && out.contains("kube kind-dev/default"), "{out}");
+    assert!(!out.contains("production"), "{out}");
+    // The flag wins over the heuristic.
+    s.fake("kubectl", "printf 'prod|default'");
+    let mut child = s.cmd().args(["--mode", "vibe"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    writeln!(child.stdin.take().unwrap(), "/mode").unwrap();
+    let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
+    assert!(text.contains("execution vibe") && text.contains("production"), "{text}");
+}
+
+#[test]
+fn aws_identity_comes_from_one_sts_call() {
+    let s = Sandbox::new("target-aws");
+    s.fake("aws", "case \"$*\" in *Account*) printf '123456789012\\n';; *region*) printf 'eu-west-1\\n';; esac");
+    let out = s.cmd().env("AWS_PROFILE", "ops").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut child = out;
+    writeln!(child.stdin.take().unwrap(), "/target").unwrap();
+    let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
+    assert!(text.contains("aws ops (123456789012, eu-west-1)"), "{text}");
+    assert!(s.calls().contains("aws sts get-caller-identity"), "{}", s.calls());
+    let out = s.repl(&["/target"]);
+    assert!(out.contains("none detected"), "{out}");
+}
+
 // ------------------------------------------------------------------ live
 
 fn live(name: &str) -> Option<Sandbox> {
@@ -225,7 +296,7 @@ fn live(name: &str) -> Option<Sandbox> {
 
 fn live_cmd(s: &Sandbox) -> Command {
     let mut c = Command::new(BIN);
-    c.current_dir(&s.project).env("RUSTY_HOME", &s.home).env("NO_COLOR", "1");
+    c.current_dir(&s.project).env("RUSTY_HOME", &s.home).env("NO_COLOR", "1").env("RUSTY_INFRA", "off");
     c
 }
 

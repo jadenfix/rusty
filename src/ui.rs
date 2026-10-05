@@ -433,6 +433,8 @@ pub struct BannerInfo<'a> {
     pub agents: &'a str,
     pub view: &'a str,
     pub keys: usize,
+    /// Live infrastructure target, empty when none was detected.
+    pub target: &'a str,
 }
 
 pub fn banner(b: &BannerInfo) {
@@ -470,6 +472,9 @@ pub fn banner(b: &BannerInfo) {
         mode.push_str(&format!("{sep}{}", dim(&format!("{} keys", b.keys))));
     }
     row("mode", mode);
+    if !b.target.is_empty() {
+        row("target", b.target.to_string());
+    }
     println!("  {}", dim(&rule));
     println!("  {}", dim("/help · ctrl-c stops a turn · ctrl-d quits"));
     println!();

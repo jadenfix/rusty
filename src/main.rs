@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod display;
 mod execution;
+mod infra;
 mod llm;
 mod markdown;
 mod memory;
@@ -148,6 +149,16 @@ fn run() -> Result<i32> {
     agent.delegation_override =
         cli.agents.is_some() || settings.delegation_override || settings.agents.mode != AgentsMode::Off;
     agent.set_execution_mode(execution_mode);
+    agent.target = infra::Target::detect(&cwd);
+    // Production starts careful unless the flag said otherwise. Not saved.
+    if agent.target.production && cli.mode.is_none() && execution_mode != ExecutionMode::Careful {
+        agent.set_execution_mode(ExecutionMode::Careful);
+        println!(
+            "{} {}",
+            ui::warn("◇ careful"),
+            ui::dim(&format!("target looks like production: {}", agent.target.summary()))
+        );
+    }
 
     let sessions = pdir.join("sessions");
     if cli.resume {
@@ -248,6 +259,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         agents: agent.agents.mode.name(),
         view: display::view_name(),
         keys: client.key_count(),
+        target: &target_line(agent),
     });
     let mut rl = rustyline::DefaultEditor::new()?;
     let history_file = config::config_dir().map(|d| d.join("history"));
@@ -430,6 +442,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                     agents: agent.agents.mode.name(),
                     view: display::view_name(),
                     keys: client.key_count(),
+                    target: &target_line(agent),
                 });
             }
         }
@@ -469,6 +482,13 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             settings.tips = agent.tips;
             settings.save();
             println!("  tips {}", on_off(agent.tips));
+        }
+        "/target" => {
+            agent.target = infra::Target::detect(cwd);
+            println!(
+                "  target {}",
+                if agent.target.is_empty() { ui::dim("none detected") } else { target_line(agent) }
+            );
         }
         "/settings" => print_settings(agent),
         "/permissions" | "/perms" => permissions_cmd(agent, rest),
@@ -548,6 +568,16 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         },
     }
     Ok(false)
+}
+
+/// The live target for the banner and `/target`, with production called out.
+fn target_line(agent: &Agent) -> String {
+    let t = &agent.target;
+    if t.production {
+        format!("{} {}", t.summary(), ui::warn("· production"))
+    } else {
+        t.summary()
+    }
 }
 
 fn on_off(b: bool) -> String {
@@ -640,6 +670,7 @@ fn print_settings(agent: &Agent) {
         ("swarm models", if a.swarm_models.is_empty() { "(subagent model)".into() } else { a.swarm_models.join(", ") }),
         ("swarm spread", format!("{:.1}", a.spread)),
         ("tips", if agent.tips { "on".into() } else { "off".into() }),
+        ("target", if agent.target.is_empty() { "-".into() } else { agent.target.summary() }),
         ("context window", context::window().to_string()),
     ];
     for (k, v) in rows {
@@ -823,6 +854,7 @@ fn print_help(cwd: &Path) {
             "setup",
             &[
                 ("/permissions [mode]", "read-only · ask · auto · yolo · allow · deny · check"),
+                ("/target", "the kube context, cloud account, workspace and branch commands will hit"),
                 ("/model [id] · /models", "switch or list models"),
                 ("/view default|verbose|adhd", "how much you see"),
                 ("/theme · /font", "themes rust neon matrix amber ice mono · fonts rust block thin classic"),
