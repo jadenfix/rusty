@@ -103,7 +103,12 @@ pub fn preview(name: &str, args: &Value) -> String {
     let mut out = String::new();
     match name {
         "bash" => {
-            for l in args["command"].as_str().unwrap_or("").lines() {
+            // A short one-liner is already on the tool line above.
+            let cmd = args["command"].as_str().unwrap_or("");
+            if !cmd.contains('\n') && cmd.chars().count() <= 80 {
+                return out;
+            }
+            for l in cmd.lines() {
                 let _ = writeln!(out, "    {} {}", ui::dim("$"), l);
             }
         }

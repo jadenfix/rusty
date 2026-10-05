@@ -1089,19 +1089,27 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
     if destructive {
         println!("  {} {}", ui::err("‼ can't be undone:"), why);
         let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));
-        let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
-            Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                signal::trip();
-                return Answer::No(Some("the user pressed ctrl-c to stop".into()));
-            }
-            Err(_) => return Answer::No(None),
-        };
-        return match line.trim() {
-            "yes" | "YES" => Answer::Yes,
-            "" | "n" | "N" | "no" => Answer::No(None),
-            other => Answer::No(Some(other.to_string())),
-        };
+        let mut prompt = prompt;
+        loop {
+            let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+                Ok(l) => l,
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    signal::trip();
+                    return Answer::No(Some("the user pressed ctrl-c to stop".into()));
+                }
+                Err(_) => return Answer::No(None),
+            };
+            return match line.trim() {
+                "yes" | "YES" => Answer::Yes,
+                // A reflexive `y` is exactly what this prompt guards against.
+                "y" | "Y" => {
+                    prompt = format!("  {} ", ui::dim("type the whole word yes to run it, or n ›"));
+                    continue;
+                }
+                "" | "n" | "N" | "no" => Answer::No(None),
+                other => Answer::No(Some(other.to_string())),
+            };
+        }
     }
     println!("  {} {}", ui::warn("?"), why);
     let prompt = format!("  {} ", ui::dim("[y]es  [a]lways  [n]o  or say what to do instead ›"));
