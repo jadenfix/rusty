@@ -224,6 +224,10 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
             }
             break;
         }
+        if text.starts_with(NOTE) {
+            // rusty's own nudges and reviews are not things the user said.
+            continue;
+        }
         let text = crate::ui::truncate(text, 2_000);
         if used + text.len() > max_chars {
             break;
@@ -236,6 +240,10 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
 }
 
 pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
+
+/// Marks a message rusty wrote into the user role (goal nudges, careful-mode
+/// reviews), so compaction never carries it over as something the user said.
+pub const NOTE: &str = "[from rusty, not the user] ";
 
 /// Splits a compaction reply into the summary and `MEMORY kind: text` lines.
 pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
@@ -291,6 +299,16 @@ mod tests {
         let s = compaction_split(&h).unwrap();
         assert_eq!(h[s]["role"], "assistant");
         assert_eq!(h[s - 1]["role"], "tool");
+    }
+
+    #[test]
+    fn rustys_own_notes_are_not_carried_as_user_messages() {
+        let h = vec![
+            json!({"role": "user", "content": "keep the API stable"}),
+            json!({"role": "user", "content": format!("{NOTE}Second look (1 of 2): check again")}),
+        ];
+        let carried = user_messages(&h, 8000);
+        assert!(carried.contains("keep the API stable") && !carried.contains("Second look"), "{carried}");
     }
 
     #[test]

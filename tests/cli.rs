@@ -303,7 +303,8 @@ fn execution_modes_persist_without_changing_permissions() {
     let s = Sandbox::new("execution-modes");
     let out = s.repl(&["/mode vibe", "/settings", "/permissions check git push origin main"]);
     assert!(out.contains("execution vibe"), "{out}");
-    assert!(out.contains("workers auto"), "{out}");
+    assert!(out.contains("workers auto (≤3)"), "{out}");
+    assert!(out.contains("swarm size      8"), "a mode must not rewrite the saved swarm size: {out}");
     assert!(out.contains("Ask("), "vibe must not authorize git push: {out}");
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("settings.json")).unwrap()).unwrap();
@@ -312,6 +313,8 @@ fn execution_modes_persist_without_changing_permissions() {
     assert!(out.contains("rechecks 2"), "{out}");
     let out = s.repl(&["/mode"]);
     assert!(out.contains("workers off"), "explicit delegation choice must persist: {out}");
+    let out = s.repl(&["/agents default", "/mode"]);
+    assert!(out.contains("workers auto"), "/agents default hands delegation back to the mode: {out}");
 }
 
 #[test]
@@ -414,9 +417,10 @@ fn careful_goal_cannot_skip_the_two_inference_rechecks() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 5);
-    assert!(requests.iter().all(|r| r["max_tokens"] == 32768));
-    assert!(requests[1]["messages"].to_string().contains("Careful recheck 1/2"));
-    assert!(requests[3]["messages"].to_string().contains("Careful recheck 2/2"));
+    // A local test endpoint is not the default NVIDIA model, so the cap stays at 16k.
+    assert!(requests.iter().all(|r| r["max_tokens"] == 16384));
+    assert!(requests[1]["messages"].to_string().contains("Second look (1 of 2)"));
+    assert!(requests[3]["messages"].to_string().contains("Second look (2 of 2)"));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("first-check") && text.contains("second-check"), "{text}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
@@ -468,10 +472,10 @@ fn careful_blocked_goal_does_not_spend_review_calls() {
 }
 
 #[test]
-fn careful_also_reviews_ordinary_answers() {
+fn careful_does_not_review_a_plain_answer() {
     let s = Sandbox::new("careful-answer");
     let reply = serde_json::json!({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]});
-    let (url, server) = scripted_endpoint(vec![reply.clone(), reply.clone(), reply]);
+    let (url, server) = scripted_endpoint(vec![reply]);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
@@ -482,9 +486,54 @@ fn careful_also_reviews_ordinary_answers() {
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
     assert!(out.status.success());
+    assert_eq!(server.join().unwrap().len(), 1, "a read-only answer needs no second look");
+}
+
+#[test]
+fn careful_reviews_an_answer_after_a_change() {
+    let s = Sandbox::new("careful-change");
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("write_file", serde_json::json!({"path": "note.txt", "content": "hi"})),
+        answer.clone(),
+        answer.clone(),
+        answer,
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "write a note"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
     let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[2]["messages"].to_string().contains("Careful recheck 2/2"));
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3]["messages"].to_string().contains("Second look (2 of 2)"));
+}
+
+#[test]
+fn careful_reviews_once_per_goal_not_once_per_goal_turn() {
+    let s = Sandbox::new("careful-goal-turns");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let text = serde_json::json!({"choices": [{"delta": {"content": "still checking"}, "finish_reason": "stop"}]});
+    // Turn 1: claims done, gets look 1, answers in text and the turn ends.
+    // Turn 2: claims done, gets look 2, claims done again and closes.
+    let (url, server) = scripted_endpoint(vec![done.clone(), text, done.clone(), done]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 4);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
 }
 
 #[test]

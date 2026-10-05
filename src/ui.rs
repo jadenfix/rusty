@@ -451,6 +451,7 @@ fn starfield(width: usize) -> String {
 
 pub struct BannerInfo<'a> {
     pub model: &'a str,
+    pub exec: &'a str,
     pub cwd: &'a str,
     pub perms: &'a str,
     pub agents: &'a str,
@@ -488,7 +489,7 @@ pub fn banner(b: &BannerInfo) {
     row("model", info(b.model));
     row("dir", b.cwd.to_string());
     let perms = if b.perms == "yolo" { warn(b.perms) } else { b.perms.to_string() };
-    let mut mode = format!("{perms}{sep}agents {}{sep}view {}", b.agents, b.view);
+    let mut mode = format!("{}{sep}permissions {perms}{sep}agents {}{sep}view {}", bold(b.exec), b.agents, b.view);
     if b.keys > 1 {
         mode.push_str(&format!("{sep}{}", dim(&format!("{} keys", b.keys))));
     }

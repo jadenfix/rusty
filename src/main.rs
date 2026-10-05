@@ -243,12 +243,12 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     ui::banner(&ui::BannerInfo {
         model: &agent.model,
         cwd: &tilde(cwd),
+        exec: agent.execution_mode.name(),
         perms: agent.policy.mode.name(),
         agents: agent.agents.mode.name(),
         view: display::view_name(),
         keys: client.key_count(),
     });
-    println!("  execution {}", agent.execution_mode.name());
     let mut rl = rustyline::DefaultEditor::new()?;
     let history_file = config::config_dir().map(|d| d.join("history"));
     if let Some(h) = &history_file {
@@ -361,13 +361,23 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 settings.execution_mode = mode;
                 settings.save();
             }
+            let m = agent.execution_mode;
+            let what = match m {
+                ExecutionMode::Careful => "thinks longer, takes two extra looks before calling work done",
+                ExecutionMode::Standard => "normal effort, checks what it changed",
+                ExecutionMode::Vibe => "quick passes, small checks, may send out a few read-only workers",
+            };
+            println!("  execution {} {}", ui::bold(m.name()), ui::dim(&format!("· {what}")));
             println!(
-                "  execution {} · rechecks {} · workers {}",
-                agent.execution_mode.name(),
-                agent.execution_mode.review_passes(),
-                agent.agents.mode.name()
+                "  {}",
+                ui::dim(&format!(
+                    "model {} · rechecks {} · workers {} (≤{})",
+                    agent.model,
+                    m.review_passes(),
+                    agent.agents.mode.name(),
+                    agent.swarm_cap()
+                ))
             );
-            println!("  model {}", agent.model);
         }
         "/models" => {
             for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
@@ -415,12 +425,22 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 ui::banner(&ui::BannerInfo {
                     model: &agent.model,
                     cwd: &tilde(cwd),
+                    exec: agent.execution_mode.name(),
                     perms: agent.policy.mode.name(),
                     agents: agent.agents.mode.name(),
                     view: display::view_name(),
                     keys: client.key_count(),
                 });
             }
+        }
+        "/agents" | "/subagents" if rest == "default" => {
+            // Hand delegation back to the execution mode.
+            agent.delegation_override = false;
+            settings.delegation_override = false;
+            agent.set_execution_mode(agent.execution_mode);
+            settings.agents.mode = AgentsMode::Off;
+            settings.save();
+            agents_cmd(agent, "");
         }
         "/agents" | "/subagents" => {
             agents_cmd(agent, rest);
@@ -548,7 +568,7 @@ fn agents_cmd(agent: &mut Agent, rest: &str) {
         m => match AgentsMode::parse(m) {
             Some(mode) => agent.agents.mode = mode,
             None => {
-                println!("  /agents off · sub · swarm · auto · model <id>");
+                println!("  /agents off · sub · swarm · auto · default · model <id>");
                 return;
             }
         },
@@ -773,9 +793,9 @@ fn print_help(cwd: &Path) {
             &[
                 ("/goal <objective>", "keep going until it's done and verified · status · resume · clear"),
                 ("/loop [5m] [x10] <prompt>", "repeat on an interval, or let rusty pick the pace"),
-                ("/agents off|sub|swarm|auto", "delegation · /agents model <id> sets the subagent model"),
+                ("/agents off|sub|swarm|auto", "delegation · default follows /mode · model <id> for subagents"),
                 ("/swarm size|models|spread", "tune parallel workers"),
-                ("/mode careful|standard|vibe", "reasoning and review depth; permissions stay separate"),
+                ("/mode careful|standard|vibe", "how hard rusty thinks and checks; permissions stay separate"),
                 ("/plan", "the current plan"),
             ],
         ),

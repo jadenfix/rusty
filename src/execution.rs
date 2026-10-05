@@ -49,6 +49,9 @@ impl ExecutionMode {
         }
     }
 
+    /// Vibe keeps delegation small unless the user picked a swarm size.
+    pub const VIBE_WORKERS: usize = 3;
+
     pub fn instructions(self) -> &'static str {
         match self {
             Self::Careful => "Execution: careful. Spend reasoning on assumptions, failure modes and side effects. Before critical changes inspect the target state and describe a bounded plan with recovery steps. Make small changes, verify the result, then recheck the diff and task constraints. Use actual tool evidence; a review is not proof of production safety. Reconcile uncertain external writes before retrying. Never invent checks or rerun side-effecting actions as verification.",
@@ -58,10 +61,12 @@ impl ExecutionMode {
     }
 
     /// The documented NVIDIA Super controls are opt-in for a known endpoint/model.
-    /// Unknown compatible endpoints keep their usual request schema.
+    /// Unknown compatible endpoints keep their usual request schema, and never
+    /// get an output cap above the 16k every model has handled so far.
     pub fn apply_inference(self, body: &mut Value, base_url: &str, model: &str) {
-        body["max_tokens"] = json!(self.max_tokens());
-        if base_url == crate::config::DEFAULT_BASE_URL && model == crate::config::DEFAULT_MODEL {
+        let known = base_url == crate::config::DEFAULT_BASE_URL && model == crate::config::DEFAULT_MODEL;
+        body["max_tokens"] = json!(if known { self.max_tokens() } else { self.max_tokens().min(16384) });
+        if known {
             match self {
                 Self::Careful => {
                     body["reasoning_effort"] = json!("high");
@@ -77,8 +82,10 @@ impl ExecutionMode {
     }
 }
 
-/// A separate inference pass is required after each completion proposal in careful mode.
-/// This does not independently grade the correctness of the model's checks.
+/// Careful mode takes two extra looks before it accepts "done". The gate lives
+/// on the agent: one per user turn that changed something, one per goal.
+/// It makes the model look again; it does not grade what it finds.
+#[derive(Default)]
 pub struct ReviewGate {
     remaining: usize,
 }
@@ -88,14 +95,27 @@ impl ReviewGate {
         Self { remaining: mode.review_passes() }
     }
 
-    pub fn next(&mut self) -> Option<&'static str> {
+    pub fn next(&mut self) -> Option<String> {
         let prompt = match self.remaining {
-            2 => "Careful recheck 1/2: treat the proposed completion as unverified. Inspect the actual changed code or system state and test evidence. Check edge cases and regressions with relevant tools; fix anything found. Never repeat external writes to check them. If no execution is appropriate, state why. Do not close the goal yet.",
-            1 => "Careful recheck 2/2: independently reconsider your assumptions using fresh reads or appropriate checks. Compare the final result against every user constraint; inspect security, data integrity and recovery where relevant. Resolve failures and distinguish executed checks from unknowns. Only then provide the final answer or call goal_done. Do not repeat consequential writes.",
+            2 => {
+                "Second look (1 of 2): assume the work is not done yet. Look at what actually changed and run the \
+                  relevant checks again. Try the edge cases and anything that might have broken nearby. Fix what you \
+                  find. Don't repeat anything that writes outside the project just to check it."
+            }
+            1 => {
+                "Second look (2 of 2): go back over every constraint the user gave and check each one against the \
+                  result, with fresh reads or commands where it helps. Then give your final answer, or call goal_done \
+                  if this is a goal. Say which checks you ran and what you could not check."
+            }
             _ => return None,
         };
         self.remaining -= 1;
-        Some(prompt)
+        Some(format!("{}{prompt}", crate::context::NOTE))
+    }
+
+    /// Which look comes next, for the status line.
+    pub fn step(&self) -> usize {
+        3 - self.remaining.min(2)
     }
 }
 
@@ -118,6 +138,9 @@ mod tests {
         assert_eq!(body["max_tokens"], 8192);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoning_budget").is_none());
+        let mut body = json!({});
+        ExecutionMode::Careful.apply_inference(&mut body, "http://localhost:11434/v1", "other-model");
+        assert_eq!(body["max_tokens"], 16384, "unknown models keep the old cap");
         ExecutionMode::Vibe.apply_inference(&mut body, crate::config::DEFAULT_BASE_URL, crate::config::DEFAULT_MODEL);
         assert_eq!(body["reasoning_effort"], "low");
     }
@@ -125,8 +148,8 @@ mod tests {
     #[test]
     fn careful_requires_two_separate_rechecks() {
         let mut gate = ReviewGate::new(ExecutionMode::Careful);
-        assert!(gate.next().unwrap().contains("1/2"));
-        assert!(gate.next().unwrap().contains("2/2"));
+        assert!(gate.next().unwrap().contains("1 of 2"));
+        assert!(gate.next().unwrap().contains("2 of 2"));
         assert!(gate.next().is_none());
         assert!(ReviewGate::new(ExecutionMode::Standard).next().is_none());
         assert!(ReviewGate::new(ExecutionMode::Vibe).next().is_none());

@@ -100,6 +100,7 @@ pub struct Agent {
     pub model_override: Option<String>,
     pub delegation_override: bool,
     pending_goal: Option<Value>,
+    reviews: ReviewGate,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     pub policy: Policy,
@@ -129,6 +130,7 @@ impl Agent {
             model_override: None,
             delegation_override: false,
             pending_goal: None,
+            reviews: ReviewGate::default(),
             cwd,
             history: Vec::new(),
             policy,
@@ -157,8 +159,25 @@ impl Agent {
             .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
         if !self.delegation_override {
             self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
-            self.agents.swarm_max = 3;
         }
+    }
+
+    /// The most workers one swarm may start. Vibe keeps it small unless the
+    /// user chose delegation settings themselves.
+    pub fn swarm_cap(&self) -> usize {
+        if self.execution_mode == ExecutionMode::Vibe && !self.delegation_override {
+            self.agents.swarm_max.min(ExecutionMode::VIBE_WORKERS)
+        } else {
+            self.agents.swarm_max
+        }
+    }
+
+    /// The next careful-mode review prompt, if any are left, with a status line.
+    fn second_look(&mut self, d: &mut Display) -> Option<String> {
+        let step = self.reviews.step();
+        let prompt = self.reviews.next()?;
+        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("second look {step}/2"))));
+        Some(prompt)
     }
 
     pub fn clear(&mut self) {
@@ -215,13 +234,13 @@ impl Agent {
                  context, and returns their reports. Use it for broad work that splits cleanly, such as surveying \
                  several modules or checking many files for the same problem. Give each worker a self-contained \
                  prompt and its own slice.\n",
-                self.agents.swarm_max
+                self.swarm_cap()
             )),
             AgentsMode::Auto => s.push_str(&format!(
                 "\nDelegation: task runs one read-only subagent; swarm runs up to {} in parallel. Pick the lightest \
                  option that works: do it yourself if it takes fewer than about five reads, use task for one deep \
                  investigation, and use swarm only when the work splits into three or more independent parts.\n",
-                self.agents.swarm_max
+                self.swarm_cap()
             )),
         }
         s.push_str(&format!(
@@ -312,7 +331,7 @@ impl Agent {
             defs.push(t(
                 "swarm",
                 "Run several read-only workers in parallel, one per task, and get all their reports.",
-                json!({"tasks": {"type": "array", "items": job, "maxItems": self.agents.swarm_max}}),
+                json!({"tasks": {"type": "array", "items": job, "maxItems": self.swarm_cap()}}),
                 &["tasks"],
             ));
         }
@@ -357,7 +376,14 @@ impl Agent {
         let mut seen: HashMap<String, u32> = HashMap::new();
         let mut outcome: Result<bool> = Ok(true);
         self.pending_goal = None;
-        let mut reviews = ReviewGate::new(if self.is_worker { ExecutionMode::Standard } else { self.execution_mode });
+        // Goals keep one review budget across all their turns (set in run_goal);
+        // every other turn gets its own.
+        let in_goal = self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active);
+        if !in_goal {
+            self.reviews = ReviewGate::new(if self.is_worker { ExecutionMode::Standard } else { self.execution_mode });
+        }
+        // Careful reviews only follow turns that changed something.
+        let mut changed = false;
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -411,14 +437,10 @@ impl Agent {
                 if reply.finish_reason.as_deref() == Some("length") {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
-                if reply.finish_reason.as_deref() != Some("length") {
-                    if let Some(prompt) = reviews.next() {
+                if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal {
+                    if let Some(prompt) = self.second_look(&mut d) {
                         self.history.push(json!({"role": "user", "content": prompt}));
-                        d.line(&ui::dim("  careful mode: checking the proposed completion"));
                         continue;
-                    }
-                    if let Some(args) = self.pending_goal.take() {
-                        self.close_goal(&args);
                     }
                 }
                 break;
@@ -430,6 +452,11 @@ impl Agent {
                     let repeats = seen.entry(format!("{}{}", call.name, call.arguments)).or_insert(0);
                     *repeats += 1;
                     let n = *repeats;
+                    let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                    if crate::permissions::classify(&call.name, &args, &self.cwd) != crate::permissions::Class::ReadOnly
+                    {
+                        changed = true;
+                    }
                     let mut out = self.dispatch(call, &mut d);
                     if n >= 3 && !matches!(call.name.as_str(), "plan" | "recall") {
                         out.push_str(&format!(
@@ -451,15 +478,12 @@ impl Agent {
                 d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 break;
             }
-            if self.pending_goal.is_some() {
-                if let Some(prompt) = reviews.next() {
-                    self.pending_goal = None;
-                    self.history.push(json!({"role": "user", "content": prompt}));
-                    d.line(&ui::dim("  careful mode: checking the proposed completion"));
-                    continue;
-                }
-                if let Some(args) = self.pending_goal.take() {
-                    self.close_goal(&args);
+            if let Some(args) = self.pending_goal.take() {
+                match self.second_look(&mut d) {
+                    Some(prompt) => self.history.push(json!({"role": "user", "content": prompt})),
+                    None => {
+                        self.close_goal(&args);
+                    }
                 }
             }
             if self.goal.as_ref().is_some_and(|g| g.status != GoalStatus::Active) {
@@ -636,7 +660,7 @@ impl Agent {
     /// One job is a subagent; several are a swarm.
     fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display) -> String {
         let cfg = self.agents.clone();
-        let n = jobs.len().min(cfg.swarm_max.max(1));
+        let n = jobs.len().min(self.swarm_cap().max(1));
         let label = if n == 1 { "subagent" } else { "swarm" };
         let (tx, rx) = std::sync::mpsc::channel();
         let mut counters = Vec::new();
@@ -747,16 +771,17 @@ impl Agent {
             Some(obj) => {
                 self.goal = Some(Goal { objective: obj.to_string(), status: GoalStatus::Active, turns: 0 });
                 format!(
-                    "New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
+                    "{}New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
                      Verify as you go with builds, tests or by running the code. When the goal is achieved and \
                      verified, call goal_done with the evidence. If you are blocked on something only the user can \
-                     provide, call goal_done with blocked=true and say what you need."
+                     provide, call goal_done with blocked=true and say what you need.",
+                    context::NOTE
                 )
             }
             None => match &mut self.goal {
                 Some(g) => {
                     g.status = GoalStatus::Active;
-                    "Resume work on the goal from where you left off.".to_string()
+                    format!("{}Resume work on the goal from where you left off.", context::NOTE)
                 }
                 None => {
                     println!("{}", ui::dim("  no goal set. /goal <objective>"));
@@ -765,6 +790,7 @@ impl Agent {
             },
         };
         println!("{} {}", ui::accent("◎ goal"), ui::bold(&self.goal.as_ref().unwrap().objective));
+        self.reviews = ReviewGate::new(self.execution_mode);
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
             let finished = self.run_turn(&prompt)?;
@@ -793,9 +819,10 @@ impl Agent {
             let open = self.plan.iter().filter(|p| p.status != "done").count();
             println!("{}", ui::dim(&format!("  ↻ goal turn {}: not closed yet, continuing", g.turns + 1)));
             prompt = format!(
-                "The goal is not closed yet ({open} plan items open). Keep going: pick the next step, do it, verify \
+                "{}The goal is not closed yet ({open} plan items open). Keep going: pick the next step, do it, verify \
                  it. If everything is done and verified, call goal_done with evidence. If you are blocked on the \
-                 user, call goal_done with blocked=true."
+                 user, call goal_done with blocked=true.",
+                context::NOTE
             );
         }
     }
