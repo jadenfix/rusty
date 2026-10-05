@@ -72,7 +72,16 @@ pub fn tool(name: &str, description: &str, properties: Value, required: &[&str])
 pub fn summary(name: &str, args: &Value) -> String {
     let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
     let text = match name {
-        "bash" => s("command").lines().next().unwrap_or("").to_string(),
+        "bash" => {
+            // Hide a redundant `cd <project> &&` so the command itself shows.
+            let cmd = s("command");
+            let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+            let cmd = ["cd {cwd} && ", "cd \"{cwd}\" && ", "cd {cwd}; "]
+                .iter()
+                .find_map(|p| cmd.strip_prefix(&p.replace("{cwd}", &cwd)).map(str::to_string))
+                .unwrap_or(cmd);
+            cmd.lines().next().unwrap_or("").to_string()
+        }
         "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().unwrap_or(".")),
         "glob" => s("pattern"),
         "outline" => s("path"),

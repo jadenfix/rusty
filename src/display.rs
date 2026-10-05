@@ -348,7 +348,18 @@ impl Display {
             if labels.is_empty() {
                 continue;
             }
-            let shown: Vec<String> = labels.iter().take(3).map(|l| short(l)).collect();
+            let shown: Vec<String> = labels
+                .iter()
+                .take(3)
+                .map(|l| match tool {
+                    // "/pattern/ in path" → "pattern"
+                    "search" => {
+                        ui::truncate(l.split("/ in ").next().unwrap_or(l).trim_start_matches('/'), 30).to_string()
+                    }
+                    "glob" | "recall" => ui::truncate(l, 30).to_string(),
+                    _ => short(l),
+                })
+                .collect();
             let more = if labels.len() > 3 { format!(" +{}", labels.len() - 3) } else { String::new() };
             parts.push(format!("{verb} {}{more}", shown.join(", ")));
         }

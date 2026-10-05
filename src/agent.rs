@@ -201,7 +201,8 @@ impl Agent {
             )),
         }
         s.push_str(&format!(
-            "\nEnvironment: {} {}, commands run with bash in the project directory. Permission mode: {}.\n",
+            "\nEnvironment: {} {}. Commands already run with bash in the project directory, so use relative \
+             paths and never cd into it. Permission mode: {}.\n",
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.policy.mode.name()
@@ -813,6 +814,10 @@ impl Agent {
             return Ok(());
         };
         let before = context::estimate(&self.history);
+        if manual && before < 2_000 {
+            d.line(&ui::dim(&format!("  nothing worth compacting yet (~{} tokens)", ui::human(before as u64))));
+            return Ok(());
+        }
         if !manual && context::estimate(&self.history[..split]) * 4 < before {
             // The bulk is in recent messages, so summarising older ones won't help.
             let saved = context::elide_tool_outputs(&mut self.history, 1);
