@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/main/.schema/devbox.schema.json",
+  "packages": ["rustup@latest", "ripgrep@latest", "python@3.12", "git@latest"],
+  "shell": {
+    "init_hook": ["rustup default stable >/dev/null 2>&1 || true"],
+    "scripts": {
+      "build": "cargo build --release",
+      "test": "cargo test",
+      "qa": "scripts/qa.sh",
+      "rusty": "cargo run --release --"
+    }
+  }
+}
