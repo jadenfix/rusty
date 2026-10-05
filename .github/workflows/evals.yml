@@ -1,0 +1,32 @@
+name: evals
+# Live model evals cost tokens, so they only run when asked.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: model id
+        default: nvidia/nemotron-3-super-120b-a12b
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep expect
+      - name: evals
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          RUSTY_MODEL: ${{ inputs.model }}
+        run: scripts/eval.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: target/evals/*.jsonl
