@@ -325,7 +325,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         let _ = rl.save_history(h);
     }
     agent.save_session();
-    println!("{}", ui::dim("  ☾ orbit closed. see you next transit."));
+    println!("{}", ui::dim("  ◌ link closed. go ship something."));
     Ok(())
 }
 

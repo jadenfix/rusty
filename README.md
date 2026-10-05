@@ -101,7 +101,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. |
 | **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
 | **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |
-| **Looks good** | Rust-and-steel themes, a starfield banner, today's sky and a coding horoscope, a star spinner with rotating verbs, grouped tool lines, rendered markdown. |
+| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a star spinner with rotating verbs, grouped tool lines, rendered markdown. |
 
 ## Quickstart
 

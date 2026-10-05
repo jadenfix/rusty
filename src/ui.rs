@@ -344,7 +344,7 @@ fn slat_banner() -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------- the sky
+// ------------------------------------------------------------ mission log
 
 /// (year, month, day) from days since 1970-01-01 (Howard Hinnant's algorithm).
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -363,74 +363,50 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// Zodiac sign for a month and day: (glyph, name).
-pub fn zodiac(m: u32, d: u32) -> (&'static str, &'static str) {
-    const SIGNS: [(u32, &str, &str); 12] = [
-        (20, "♒", "aquarius"),
-        (19, "♓", "pisces"),
-        (21, "♈", "aries"),
-        (20, "♉", "taurus"),
-        (21, "♊", "gemini"),
-        (21, "♋", "cancer"),
-        (23, "♌", "leo"),
-        (23, "♍", "virgo"),
-        (23, "♎", "libra"),
-        (23, "♏", "scorpio"),
-        (22, "♐", "sagittarius"),
-        (22, "♑", "capricorn"),
-    ];
-    let i = (m as usize - 1) % 12;
-    let (start, glyph, name) = SIGNS[i];
-    if d >= start {
-        (glyph, name)
-    } else {
-        let (_, g, n) = SIGNS[(i + 11) % 12];
-        (g, n)
-    }
-}
-
-/// Moon phase name from a unix time, using the 2000-01-06 new moon as epoch.
-pub fn moon(t: i64) -> &'static str {
-    const PHASES: [&str; 8] = [
-        "new moon",
-        "waxing crescent",
-        "first quarter",
-        "waxing gibbous",
-        "full moon",
-        "waning gibbous",
-        "last quarter",
-        "waning crescent",
-    ];
-    let age = ((t - 947_182_440) as f64 / 86_400.0).rem_euclid(29.530_588);
-    PHASES[((age / 29.530_588 * 8.0 + 0.5) as usize) % 8]
-}
-
-const HOROSCOPES: &[&str] = &[
-    "mercury is direct. ship it.",
-    "the stars favour small commits.",
-    "a good day to delete code you were afraid of.",
-    "an old bug returns. you will recognise it.",
-    "venus smiles on refactors.",
-    "jupiter expands scope. resist.",
-    "saturn asks for a regression test.",
-    "mars says: fix the flaky test first.",
-    "the moon pulls on your dependencies. pin them.",
-    "trust the tests, not the vibes.",
-    "your rising sign is `cargo check`.",
-    "read the error message twice. the answer is in it.",
-    "neptune clouds the logs. add one more print.",
-    "pluto suggests a rewrite. pluto is wrong.",
+/// Lines for the mission log under the banner, in the voice of the
+/// people building with agents right now.
+const DISPATCHES: &[&str] = &[
+    "ship it, then prove it.",
+    "the eval is the spec.",
+    "context is the new compute.",
+    "tokens are cheap. regressions aren't.",
+    "default to action. verify after.",
+    "small diffs compound.",
+    "make something agents want.",
+    "do things that don't scale. then automate them.",
+    "the bitter lesson applies to your codebase too.",
+    "your moat is your test suite.",
+    "one engineer, ten agents, zero flaky tests.",
+    "if it isn't in the eval, it didn't happen.",
+    "feel the agi. then run the tests.",
+    "cracked engineers read the error message twice.",
+    "we're so back. (once ci is green.)",
+    "the scaling laws hold. so does the linter.",
+    "lock in. small commits. no force pushes.",
+    "agents don't get tired. tests don't lie.",
 ];
 
-/// Today's sky line and horoscope; the same all day.
-fn sky() -> (String, String) {
+/// Today's mission line and dispatch; the same all day.
+fn mission() -> (String, String) {
     let t = unix_now();
     let days = t.div_euclid(86_400);
-    let (_, m, d) = civil(days);
-    let (glyph, sign) = zodiac(m, d);
-    let line = format!("{glyph} {sign} season · ☾ {}", moon(t));
-    let scope = HOROSCOPES[(days as usize).wrapping_mul(7) % HOROSCOPES.len()];
-    (line, scope.to_string())
+    let (y, m, d) = civil(days);
+    let day_of_year = days - days_from_civil(y, 1, 1) + 1;
+    let to_next = days_from_civil(y + 1, 1, 1) - days;
+    let line = format!("◉ {y}.{m:02}.{d:02} · day {day_of_year} · T−{to_next}d to {}", y + 1);
+    let dispatch = DISPATCHES[(days as usize).wrapping_mul(7) % DISPATCHES.len()];
+    (line, dispatch.to_string())
+}
+
+/// Days since 1970-01-01 for a date (the inverse of `civil`).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// A sparse, dim starfield that changes once a day.
@@ -480,8 +456,8 @@ pub fn banner(b: &BannerInfo) {
         pause(24);
     }
     println!("  {}", dim(&starfield(art_w).chars().rev().collect::<String>()));
-    let (sky_line, scope) = sky();
-    println!("  {}  {}", primary(&sky_line), dim(&format!("\u{201c}{scope}\u{201d}")));
+    let (mission_line, dispatch) = mission();
+    println!("  {}  {}", primary(&mission_line), dim(&format!("// {dispatch}")));
     let rule = "─".repeat(art_w.min(width().saturating_sub(4)));
     let sep = dim(" · ");
     println!("  {}", dim(&rule));
@@ -504,40 +480,37 @@ pub fn banner(b: &BannerInfo) {
 pub const VERBS: &[&str] = &[
     "Thinking",
     "Churning",
-    "Pondering",
-    "Percolating",
-    "Noodling",
-    "Cogitating",
-    "Ruminating",
-    "Simmering",
-    "Brewing",
-    "Tinkering",
-    "Mulling",
-    "Scheming",
-    "Untangling",
+    "Cooking",
+    "Locking in",
+    "Reasoning",
+    "Sampling",
     "Grokking",
+    "Speedrunning",
+    "Spinning up",
+    "Bootstrapping",
+    "Compounding",
+    "Distilling",
+    "Inferencing",
+    "Untangling",
     "Spelunking",
-    "Decrypting",
-    "Defragmenting",
-    "Rerouting",
-    "Splicing",
-    "Overclocking",
-    "Dialing in",
-    "Rewinding the tape",
-    "Buffering",
-    "Jacking in",
-    "Tracing",
-    "Reticulating",
+    "Tinkering",
+    "Scheming",
     "Synthesizing",
     "Wiring it up",
-    "Reading the stars",
-    "Consulting the ephemeris",
-    "Aligning the planets",
-    "Charting the houses",
-    "Casting the chart",
-    "Stargazing",
+    "Overclocking",
+    "Jacking in",
+    "Tracing",
+    "Rerouting",
+    "Hot-swapping",
+    "Plotting a course",
+    "Entering orbit",
     "Orbiting",
-    "Waiting on Mercury",
+    "Docking",
+    "Triangulating",
+    "Achieving liftoff",
+    "Warping",
+    "Running the evals",
+    "Shipping",
 ];
 
 const FRAMES: &[&str] = &["✶", "✷", "✸", "✹", "✺", "✹", "✸", "✷"];
@@ -614,16 +587,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn calendar_and_sky() {
+    fn calendar_round_trips() {
         assert_eq!(civil(0), (1970, 1, 1));
         assert_eq!(civil(20_731), (2026, 10, 5));
-        assert_eq!(zodiac(10, 5).1, "libra");
-        assert_eq!(zodiac(1, 19).1, "capricorn");
-        assert_eq!(zodiac(1, 20).1, "aquarius");
-        assert_eq!(zodiac(3, 21).1, "aries");
-        // 2024-04-08 was a new moon (the total eclipse); 2024-04-23 a full moon.
-        assert_eq!(moon(1_712_600_000), "new moon");
-        assert_eq!(moon(1_713_900_000), "full moon");
+        for days in [0, 20_731, 20_819, 11_016, -1] {
+            let (y, m, d) = civil(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+        assert_eq!(days_from_civil(2027, 1, 1) - 20_731, 88);
     }
 
     #[test]

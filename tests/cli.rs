@@ -125,7 +125,7 @@ fn banner_and_help_list_every_command() {
     {
         assert!(out.contains(cmd), "/help is missing {cmd}");
     }
-    assert!(out.contains("orbit closed"), "no goodbye on EOF");
+    assert!(out.contains("link closed"), "no goodbye on EOF");
 }
 
 #[test]
