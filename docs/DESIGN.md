@@ -26,22 +26,25 @@ explains why it's built the way it is.
 | **Doom loops** | The same failing command, eight times. | Repeated identical calls in one turn get a note telling the model to step back and change approach. |
 | **Amnesia** | Every session relearns how to run the tests. | Typed memories ranked by BM25 against each request and injected within a budget. Compaction also pulls lasting facts out of the turns it summarises. |
 | **Memory junk drawers** | A notes file that grows forever and gets pasted into every prompt. | Records, not a file. Near-duplicates merge, stale entries can be forgotten, and only the relevant few are injected. |
-| **Permission fatigue** | Prompts for `ls` train people to approve everything, and then something risky slips through. | A classifier: reads and normal build/test commands just run, and anything that deletes, leaves the project, rewrites history or touches the network asks. |
+| **Permission fatigue** | Prompts for `ls` train people to approve everything, and then something risky slips through. | A classifier that reads what a command will really run (scripts, `make` targets, `package.json` scripts, `$(…)`, heredocs). Routine work and cloud reads just run, outward actions ask, and the short list of things you can't undo needs a typed yes every time, even in yolo. |
 | **Exploration flooding context** | Fifty file reads to answer one question. | `outline` and `glob` show structure without file bodies, and subagents and swarms explore in their own context and return only a report. |
 | **Invisible cost** | You find out what it spent when the bill arrives. | Per-turn recaps, `/tokens` broken down by model and by tool, per-request traces on disk, and tips based on what each turn actually spent. |
 | **Hard to interrupt** | Ctrl-C kills the process or does nothing until the stream ends. | Requests run on a background thread, so Ctrl-C stops a turn mid-stream (about 1 ms in tests). The transcript stays valid and the next turn works. |
 
 ## Execution depth
 
-Execution mode is separate from permission mode. `standard` keeps the existing
-loop. `vibe` uses a smaller output and reasoning budget and enables bounded
-read-only research workers by default. `careful` uses a larger inference budget
-and intercepts completion proposals to run two additional review passes.
-The reviews remain in the same transcript and their usage is counted.
-They are model-driven reviews with tools available, not hidden grading or
-proof that every critical invariant holds. Explicit model and delegation
-choices override the profile defaults. Provider-specific reasoning fields
-are scoped to the documented NVIDIA Super endpoint to preserve compatibility.
+How hard rusty works and what it's allowed to touch are separate settings.
+`/mode` changes the first and `/permissions` the second, so "go fast"
+never quietly means "go unguarded".
+
+Careful mode doesn't trust the first "done". When a turn that changed
+something ends, or a goal calls `goal_done`, rusty asks the model for two
+more passes over the actual result. They're a second and third look, with
+tools available, not an independent grader. A plain question gets no
+extra passes, and a goal gets two in total, however many turns it takes,
+because extra passes on every turn cost far more than they find.
+rusty marks these prompts as its own, so compaction never carries them
+over as something you said.
 
 ## First principles for tools
 

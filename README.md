@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-12%2F12-ec7a34)
-![tests](https://img.shields.io/badge/tests-38%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-56%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -94,7 +94,8 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 |---|---|
 | **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
 | **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. |
-| **Permission classifier** | `ls`, `git diff`, `cargo test`, `chmod +x ./script.sh` just run. `rm -r`, `git push`, `curl … \| sh` and writes outside the project ask first. Four modes plus your own allow and deny rules. |
+| **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
+| **Execution modes** | `careful` takes two extra looks before calling work done, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
 | **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
 | **Subagents and swarms** | `/agents sub\|swarm\|auto`. Swarm workers can rotate models and spread their temperatures. Off by default, so you never pay for tokens you didn't ask for. |
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
@@ -135,6 +136,7 @@ when rate limited.
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
+| `/mode careful\|standard\|vibe` | how hard rusty thinks and checks its work |
 | `/view default\|verbose\|adhd` | how much you see |
 | `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
@@ -142,52 +144,83 @@ when rate limited.
 
 ## Execution modes
 
-Choose how much reasoning and review rusty spends, independently of permissions:
+How hard should rusty think, and how many times should it check its work?
+That's separate from what it's allowed to do.
 
-| Mode | Inference on the default NVIDIA Super model | Completion checks | Default delegation |
-|---|---|---|---|
-| `careful` | high effort, 24,576 reasoning tokens within a 32,768-token output cap | two additional review passes with tools available before accepting completion | off |
-| `standard` | provider defaults, existing 16,384-token output cap | relevant tests or direct verification | off |
-| `vibe` | low effort, 2,048 reasoning tokens within an 8,192-token output cap | focused smoke checks, no forced extra review | auto, up to three read-only workers |
+| | |
+|---|---|
+| `careful` | Thinks longer. When it says it's done, it has to take two more looks: run the checks again, try the edge cases, and go back over everything you asked for. A goal gets two looks in total, and a plain question gets none. |
+| `standard` | The default. Normal effort, and it checks what it changed. |
+| `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
 
 ```bash
-rusty --mode careful --goal "repair the migration and check data integrity"
-rusty --mode standard "fix the parser regression"
-rusty --mode vibe "prototype a settings screen"
+rusty --mode careful --goal "move the sessions table to the new schema without losing rows"
+rusty --mode vibe "sketch a settings page"
 ```
 
-Use `/mode careful`, `/mode standard` or `/mode vibe` in a session; `/mode`
-shows the current mode. Interactive choices persist. `--mode` or `RUSTY_MODE`
-overrides the saved choice for one invocation. Explicit `/agents` or `--agents`
-choices take precedence over mode defaults.
+Switch with `/mode careful|standard|vibe`; the choice is saved. `--mode` or
+`RUSTY_MODE` sets it for one run. To use a different model per mode, set
+`RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL` or `RUSTY_VIBE_MODEL`
+(`--model` and `/model` still win). If you choose `/agents` settings
+yourself, they stick; `/agents default` hands delegation back to the mode.
 
-Set `RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL` and `RUSTY_VIBE_MODEL` to
-route each mode to a different model. Explicit `--model`, `RUSTY_MODEL` or
-`/model` choices take precedence. The same model is used when none is configured.
-The NVIDIA reasoning fields are sent only for the documented default
-endpoint and Super model; other models keep their provider's reasoning defaults
-and receive the mode's output cap and workflow instructions.
-
-Careful mode enforces two extra inference passes, including when the model
-calls `goal_done` early. Reviews can inspect files, run relevant checks, and
-repair failures. Blocked goals and interrupted or truncated turns do not
-pretend to have completed the reviews. This is additional model review, not
-an independent verifier or a guarantee of production safety. Vibe still needs
-a relevant check; all modes preserve permission rules and explicit deny rules.
+On the default NVIDIA model, careful and vibe also set the model's
+reasoning budget. In a quick test, the low budget clearly cut reasoning,
+but asking for "high" made no difference on easy questions. The second
+looks are where careful mode really earns its keep.
 
 ## Permissions
 
+Built for letting an agent run on its own, with a hard stop for anything
+you can't take back.
+
 ```
-               read-only cmds    project edits,      rm -r, push, network,
-               reads, search     build, test, run    leaving the project
-read-only          run              denied               denied
-ask                run              asks                 asks
-auto               run              run                  asks        ← default
-yolo               run              run                  run
+                 reads, searches,   project edits,     pushes to main,    force push, cloud or
+                 cloud reads        builds, installs,  deploys, PRs,      database deletes,
+                                    feature pushes     anything unclear   rm -rf outside, disks
+read-only            run               refused            refused            refused
+ask                  run               asks               asks               needs you, every time
+auto                 run               run                asks               needs you, every time  ← default
+yolo                 run               run                run                needs you, every time
 ```
 
-Deny rules always win. At a prompt, `a` allows that kind of call for good, and
-typing anything else sends it to the model as feedback.
+- **Runs on its own in auto:**
+  - building, testing, linting and installing project dependencies;
+  - deleting build folders (`rm -rf node_modules dist target`);
+  - everyday git (commit, branch, rebase, pull, push a feature branch);
+  - calls to your local dev server, and plain downloads;
+  - read-only cloud commands: `aws … describe/list/get`, `kubectl get/logs/describe`, `terraform plan`, `gcloud … list`, `gh pr view`, `docker ps`, `SELECT` queries.
+- **Asks first:**
+  - pushing to `main` or another shared branch;
+  - `git reset --hard` and anything else that throws away uncommitted work;
+  - deploys, `terraform apply`, `kubectl apply`;
+  - opening or merging pull requests;
+  - writes outside the project;
+  - reading `~/.aws/credentials` and other keys;
+  - sending local data off the machine;
+  - commands rusty doesn't recognise.
+- **Needs a typed `yes` every time, even in yolo:**
+  - force pushes and deleting remote branches or history;
+  - `terraform destroy`;
+  - cloud deletes (`aws s3 rm`, `kubectl delete`, `gcloud … delete`, `fly apps destroy`);
+  - `DROP`, `TRUNCATE`, and `DELETE` without `WHERE`;
+  - `prisma migrate reset`;
+  - `rm -rf` outside the project;
+  - disk writes.
+
+  An allow rule can't skip this. With nobody at the keyboard (a script, CI, a benchmark), it's refused, and the model is told to hand the command to a person.
+
+rusty looks at what a command will really run, not just its first word:
+- the scripts it calls, `package.json` scripts, `make` targets;
+- heredocs piped into a shell, and `$(…)` substitutions;
+- commands sent through `ssh`, `docker exec` and `kubectl exec`;
+- code passed to `python -c`.
+
+So `npm run deploy` is judged by what `deploy` does.
+
+`/permissions check <command>` shows the verdict and why. Deny rules always
+win. At a prompt, `a` allows that kind of call from then on, and typing
+anything else sends it back to the model as feedback.
 
 ## Verified end to end
 
@@ -196,7 +229,7 @@ check is hidden from the agent.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 24 unit tests, 10 end-to-end tests on the real binary | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 33 unit tests (about 250 classified commands), 19 end-to-end tests on the real binary | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | Single-turn evals: Python, Rust, JS, code search, cross-file rename, CLI flag | 6/6 |
