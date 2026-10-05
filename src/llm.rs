@@ -135,10 +135,14 @@ impl Client {
         Ok(ids)
     }
 
-    /// Sends a request, rotating keys and backing off on 429 / 5xx / auth errors.
+    /// Sends a request, rotating keys and backing off on 429 / 5xx / auth
+    /// errors. Rounds wait 2, 4, 8, 16, then 30 seconds (or what the server
+    /// asks for in Retry-After), which rides out about a minute of rate limits.
     fn send(&self, url: &str, body: Option<&Value>) -> Result<Response> {
-        let attempts = self.keys.len() * 3;
+        const ROUNDS: usize = 6;
+        let attempts = self.keys.len() * ROUNDS;
         let mut last_err = String::new();
+        let mut retry_after: Option<u64> = None;
         for attempt in 0..attempts {
             let idx = self.key_idx.load(Ordering::Relaxed) % self.keys.len();
             let key = &self.keys[idx];
@@ -150,6 +154,14 @@ impl Client {
                 Ok(r) if r.status().is_success() => return Ok(r),
                 Ok(r) => {
                     let status = r.status();
+                    if let Some(secs) = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                    {
+                        retry_after = Some(retry_after.unwrap_or(0).max(secs.min(60)));
+                    }
                     let text = r.text().unwrap_or_default();
                     last_err = format!("HTTP {status}: {}", truncate(text.trim(), 400));
                     let retryable = status.as_u16() == 429
@@ -166,7 +178,8 @@ impl Client {
             // Back off once every key has been tried in this round.
             if (attempt + 1) % self.keys.len() == 0 && attempt + 1 < attempts {
                 let round = (attempt + 1) / self.keys.len();
-                std::thread::sleep(Duration::from_secs(2u64.pow(round as u32).min(20)));
+                let wait = retry_after.take().unwrap_or_else(|| 2u64.pow(round as u32).min(30));
+                std::thread::sleep(Duration::from_secs(wait));
             }
         }
         bail!("giving up after {attempts} attempts: {last_err}")
