@@ -589,8 +589,8 @@ fn print_tokens(agent: &Agent) {
         ui::human(t.completion),
         agent.context_pct()
     );
-    if t.requests > 0 {
-        println!("  {}", ui::dim(&format!("avg prompt {} per request", ui::human(t.prompt / t.requests))));
+    if let Some(avg) = t.prompt.checked_div(t.requests) {
+        println!("  {}", ui::dim(&format!("avg prompt {} per request", ui::human(avg))));
     }
     for (m, (r, p, c)) in &t.by_model {
         println!(
