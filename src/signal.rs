@@ -27,6 +27,7 @@ pub fn reset() {
 pub fn sleep(secs: u64) {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     while std::time::Instant::now() < end && !interrupted() {
+        poll_keys();
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
@@ -34,6 +35,47 @@ pub fn sleep(secs: u64) {
 /// Marks the current turn as interrupted (e.g. Ctrl-C at an approval prompt).
 pub fn trip() {
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+static QUEUED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Called while a turn runs. Ctrl-C normally arrives as SIGINT, but if the
+/// terminal ever hands it over as a raw byte this catches it too. Anything
+/// else typed during a turn is queued and becomes the next message.
+pub fn poll_keys() {
+    unsafe {
+        if libc::isatty(0) != 1 {
+            return;
+        }
+        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        if libc::poll(&mut p, 1, 0) <= 0 || p.revents & libc::POLLIN == 0 {
+            return;
+        }
+        let mut buf = [0u8; 512];
+        let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
+        if n <= 0 {
+            return;
+        }
+        let bytes = &buf[..n as usize];
+        if bytes.contains(&3) {
+            if INTERRUPTED.swap(true, Ordering::SeqCst) {
+                eprintln!("\nbye");
+                std::process::exit(130);
+            }
+            return;
+        }
+        if let Ok(mut q) = QUEUED.lock() {
+            q.push_str(&String::from_utf8_lossy(bytes));
+        }
+    }
+}
+
+/// A message typed while the last turn was running, if any.
+pub fn take_queued() -> Option<String> {
+    let mut q = QUEUED.lock().ok()?;
+    let text = std::mem::take(&mut *q);
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).

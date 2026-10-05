@@ -453,6 +453,7 @@ impl Agent {
                 d.end_stream();
                 return Ok(Reply { content, finish_reason: Some("interrupted".into()), ..Default::default() });
             }
+            signal::poll_keys();
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
@@ -638,6 +639,7 @@ impl Agent {
                     reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    signal::poll_keys();
                     if signal::interrupted() {
                         break;
                     }

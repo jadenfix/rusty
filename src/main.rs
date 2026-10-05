@@ -238,6 +238,19 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut armed_quit = false;
 
     loop {
+        // Something typed while the last turn ran goes next, as if just entered.
+        if let Some(queued) = signal::take_queued() {
+            println!("{} {}", ui::primary("›"), queued);
+            println!("{}", ui::dim("  (typed while rusty was working)"));
+            signal::restore_terminal();
+            signal::reset();
+            let _ = rl.add_history_entry(&queued);
+            if let Err(e) = agent.run_turn(&queued) {
+                println!("{} {e:#}\n", ui::err("error:"));
+            }
+            agent.save_session();
+            continue;
+        }
         let mut input = match rl.readline(&prompt) {
             Ok(l) => {
                 armed_quit = false;

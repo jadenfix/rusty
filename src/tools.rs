@@ -295,6 +295,7 @@ fn bash(args: &Value) -> Result<String> {
         if let Some(s) = child.try_wait()? {
             break Some(s);
         }
+        signal::poll_keys();
         if start.elapsed() > timeout || signal::interrupted() {
             let _ = child.kill();
             let _ = child.wait();
