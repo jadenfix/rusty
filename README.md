@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-12%2F12-ec7a34)
-![tests](https://img.shields.io/badge/tests-56%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-57%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -229,7 +229,7 @@ check is hidden from the agent.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 33 unit tests (about 250 classified commands), 19 end-to-end tests on the real binary | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 33 unit tests (about 250 classified commands), 20 end-to-end tests on the real binary | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | Single-turn evals: Python, Rust, JS, code search, cross-file rename, CLI flag | 6/6 |

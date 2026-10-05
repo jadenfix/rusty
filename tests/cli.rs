@@ -565,3 +565,37 @@ fn truncated_careful_review_leaves_the_goal_open() {
     assert_eq!(server.join().unwrap().len(), 3);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
 }
+
+#[test]
+fn yolo_still_refuses_a_destructive_command_when_nobody_is_watching() {
+    let s = Sandbox::new("yolo-destructive");
+    // Something precious in a (fake) home directory outside the project.
+    let user_home = s.home.parent().unwrap().join("user-home");
+    let precious = user_home.join("precious");
+    std::fs::create_dir_all(precious.join("data")).unwrap();
+    std::fs::write(precious.join("data/keep.txt"), "irreplaceable").unwrap();
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("bash", serde_json::json!({"command": "rm -rf ~/precious"})),
+        tool_reply("bash", serde_json::json!({"command": "rm -rf build && mkdir build && echo hi > build/x"})),
+        answer,
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("HOME", &user_home)
+        .args(["--yolo", "clean up"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert!(precious.join("data/keep.txt").exists(), "a destructive command ran unattended");
+    let told = requests[1]["messages"].to_string();
+    assert!(told.contains("refused") && told.contains("needs a person"), "{told}");
+    // Routine work in the same session still ran.
+    assert!(s.project.join("build/x").exists());
+}

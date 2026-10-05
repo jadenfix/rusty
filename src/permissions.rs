@@ -283,8 +283,12 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// Somewhere under a temp directory (not the temp directory itself).
+/// Somewhere under a temp directory (not the temp directory itself), and
+/// never inside the home directory, whatever TMPDIR says.
 fn scratch(p: &Path) -> bool {
+    if std::env::var("HOME").is_ok_and(|h| !h.is_empty() && p.starts_with(normalize(Path::new(&h)))) {
+        return false;
+    }
     let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp"), PathBuf::from("/var/tmp")];
     if let Ok(t) = std::env::var("TMPDIR") {
         roots.push(normalize(Path::new(&t)));
