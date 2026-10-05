@@ -288,13 +288,35 @@ fn target_is_detected_shown_and_production_starts_careful() {
 #[test]
 fn aws_identity_comes_from_one_sts_call() {
     let s = Sandbox::new("target-aws");
-    s.fake("aws", "case \"$*\" in *Account*) printf '123456789012\\n';; *region*) printf 'eu-west-1\\n';; esac");
-    let out = s.cmd().env("AWS_PROFILE", "ops").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    s.fake("aws", "case \"$*\" in *Account*) printf '123456789012\\n';; esac");
+    // Startup reads local config only: no aws CLI, no network.
+    let out = s
+        .cmd()
+        .env("AWS_PROFILE", "ops")
+        .env("AWS_DEFAULT_REGION", "eu-west-1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = out;
+    writeln!(child.stdin.take().unwrap(), "/exit").unwrap();
+    let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
+    assert!(text.contains("aws ops (eu-west-1)"), "{text}");
+    assert!(!s.calls().contains("aws"), "startup ran the aws CLI: {}", s.calls());
+    // /target asks for the identity, with exactly one STS call.
+    let out = s
+        .cmd()
+        .env("AWS_PROFILE", "ops")
+        .env("AWS_DEFAULT_REGION", "eu-west-1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut child = out;
     writeln!(child.stdin.take().unwrap(), "/target").unwrap();
     let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
     assert!(text.contains("aws ops (123456789012, eu-west-1)"), "{text}");
-    assert!(s.calls().contains("aws sts get-caller-identity"), "{}", s.calls());
+    assert_eq!(s.calls().matches("aws sts get-caller-identity").count(), 1, "{}", s.calls());
     let out = s.repl(&["/target"]);
     assert!(out.contains("none detected"), "{out}");
 }

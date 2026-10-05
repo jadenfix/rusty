@@ -32,13 +32,24 @@ pub struct Target {
 }
 
 impl Target {
-    /// Probes every tool in parallel. `RUSTY_INFRA=off` skips all of it.
+    /// Reads the live targets from local config only: no network and no
+    /// slow CLIs, so startup stays instant. `RUSTY_INFRA=off` skips it.
     pub fn detect(cwd: &Path) -> Target {
+        Self::probe(cwd, false)
+    }
+
+    /// The same, plus the AWS account behind the profile (one STS call).
+    /// Used by `/target`, where the user asked for it.
+    pub fn detect_with_identity(cwd: &Path) -> Target {
+        Self::probe(cwd, true)
+    }
+
+    fn probe(cwd: &Path, identity: bool) -> Target {
         if std::env::var("RUSTY_INFRA").is_ok_and(|v| v == "off") {
             return Target::default();
         }
         let kube = std::thread::spawn(probe_kube);
-        let aws = std::thread::spawn(probe_aws);
+        let aws = std::thread::spawn(move || probe_aws(identity));
         let gcloud = std::thread::spawn(probe_gcloud);
         let mut t = Target { git_branch: probe_git(cwd), ..Target::default() };
         (t.tf_workspace, t.tf_backend) = probe_terraform(cwd);
@@ -140,9 +151,9 @@ fn probe_kube() -> Option<(String, String)> {
     Some((ctx.to_string(), if ns.is_empty() { "default".into() } else { ns.to_string() }))
 }
 
-/// (profile, account, region). Identity is resolved with one STS call, only
-/// when something says credentials are configured at all.
-fn probe_aws() -> Option<(String, Option<String>, Option<String>)> {
+/// (profile, account, region). The region comes from the environment or
+/// ~/.aws/config; the account needs one STS call, so only with `identity`.
+fn probe_aws(identity: bool) -> Option<(String, Option<String>, Option<String>)> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     let has_files = home.join(".aws/credentials").exists() || home.join(".aws/config").exists();
@@ -152,13 +163,38 @@ fn probe_aws() -> Option<(String, Option<String>, Option<String>)> {
         None if has_files => "default".into(),
         None => return None,
     };
-    let region = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")).or_else(|| {
-        run("aws", &["configure", "get", "region"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    });
-    let account = run("aws", &["sts", "get-caller-identity", "--output", "text", "--query", "Account"])
+    let config = env("AWS_CONFIG_FILE").map(PathBuf::from).unwrap_or_else(|| home.join(".aws/config"));
+    let section = if matches!(profile.as_str(), "default" | "env") {
+        "default".to_string()
+    } else {
+        format!("profile {profile}")
+    };
+    let region = env("AWS_REGION")
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .or_else(|| ini_value(&std::fs::read_to_string(config).unwrap_or_default(), &section, "region"));
+    let account = identity
+        .then(|| run("aws", &["sts", "get-caller-identity", "--output", "text", "--query", "Account"]))
+        .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Some((profile, account, region))
+}
+
+/// `key = value` from `[section]` of an INI file.
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name.trim() == section;
+        } else if inside {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == key && !v.trim().is_empty() {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn probe_gcloud() -> Option<String> {
@@ -167,9 +203,13 @@ fn probe_gcloud() -> Option<String> {
             return Some(p.trim().to_string());
         }
     }
-    let out = run("gcloud", &["config", "get-value", "project"])?;
-    let p = out.trim();
-    (!p.is_empty() && p != "(unset)").then(|| p.to_string())
+    // gcloud itself takes a second to start; its config files don't.
+    let dir = std::env::var("CLOUDSDK_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/gcloud"));
+    let active = std::fs::read_to_string(dir.join("active_config")).unwrap_or_else(|_| "default".into());
+    let text = std::fs::read_to_string(dir.join(format!("configurations/config_{}", active.trim()))).ok()?;
+    ini_value(&text, "core", "project")
 }
 
 /// (workspace, backend) from the files terraform leaves behind; no CLI needed.
@@ -1494,6 +1534,14 @@ fn day(t: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ini_values_come_from_the_right_section() {
+        let text = "[default]\nregion = us-east-1\n\n[profile prod]\nregion=eu-west-1\n";
+        assert_eq!(ini_value(text, "default", "region").as_deref(), Some("us-east-1"));
+        assert_eq!(ini_value(text, "profile prod", "region").as_deref(), Some("eu-west-1"));
+        assert_eq!(ini_value(text, "profile dev", "region"), None);
+    }
 
     #[test]
     fn redacts_keys_tokens_and_blocks() {

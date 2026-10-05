@@ -498,7 +498,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!("  tips {}", on_off(agent.tips));
         }
         "/target" => {
-            agent.infra.target = infra::Target::detect(cwd);
+            agent.infra.target = infra::Target::detect_with_identity(cwd);
             let line = if agent.infra.target.is_empty() { ui::dim("none detected") } else { target_line(agent) };
             println!("  target {line}");
         }
