@@ -113,6 +113,8 @@ pub struct Settings {
     pub view: String,
     pub tips: bool,
     pub agents: AgentsConfig,
+    pub execution_mode: crate::execution::ExecutionMode,
+    pub delegation_override: bool,
 }
 
 impl Default for Settings {
@@ -123,6 +125,8 @@ impl Default for Settings {
             view: "default".into(),
             tips: true,
             agents: AgentsConfig::default(),
+            execution_mode: crate::execution::ExecutionMode::Standard,
+            delegation_override: false,
         }
     }
 }

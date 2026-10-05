@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod context;
 mod display;
+mod execution;
 mod llm;
 mod markdown;
 mod memory;
@@ -21,6 +22,7 @@ use std::time::Instant;
 
 use agent::{Agent, GoalStatus};
 use config::{AgentsMode, Settings};
+use execution::ExecutionMode;
 use llm::Client;
 use memory::Memory;
 use permissions::{Mode, Policy};
@@ -33,8 +35,12 @@ struct Cli {
     prompt: Vec<String>,
 
     /// Any model id your endpoint serves (see --list-models)
-    #[arg(short, long, env = "RUSTY_MODEL", default_value = config::DEFAULT_MODEL)]
-    model: String,
+    #[arg(short, long, env = "RUSTY_MODEL")]
+    model: Option<String>,
+
+    /// Execution mode: careful, standard or vibe (independent of permissions)
+    #[arg(long, env = "RUSTY_MODE")]
+    mode: Option<String>,
 
     /// Permission mode: read-only, ask, auto or yolo
     #[arg(short, long, env = "RUSTY_PERMISSIONS", default_value = "auto")]
@@ -108,6 +114,13 @@ fn run() -> Result<i32> {
         settings.agents.mode = AgentsMode::parse(a).ok_or_else(|| anyhow!("unknown agents mode `{a}`"))?;
     }
 
+    let execution_mode = match &cli.mode {
+        Some(mode) => ExecutionMode::parse(mode)
+            .ok_or_else(|| anyhow!("unknown execution mode `{mode}` (careful, standard, vibe)"))?,
+        None => settings.execution_mode,
+    };
+    let model =
+        cli.model.clone().or_else(|| execution_mode.model()).unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
     let client = Arc::new(Client::new(config::base_url(), config::api_keys())?);
     if cli.list_models {
         for m in client.list_models()? {
@@ -128,9 +141,13 @@ fn run() -> Result<i32> {
     let policy = Policy::load(pdir.join("permissions.json"), mode);
     let memory = Memory::load(pdir.join("memory.jsonl"), global.join("memory.jsonl"));
 
-    let mut agent = Agent::new(client.clone(), cli.model.clone(), cwd.clone(), policy, memory);
+    let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy, memory);
     agent.agents = settings.agents.clone();
     agent.tips = settings.tips;
+    agent.model_override = cli.model.clone();
+    agent.delegation_override =
+        cli.agents.is_some() || settings.delegation_override || settings.agents.mode != AgentsMode::Off;
+    agent.set_execution_mode(execution_mode);
 
     let sessions = pdir.join("sessions");
     if cli.resume {
@@ -186,6 +203,7 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
         "agent": "rusty",
         "version": env!("CARGO_PKG_VERSION"),
         "model": agent.model,
+        "execution_mode": agent.execution_mode.name(),
         "messages": agent.history,
         "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
     });
@@ -207,6 +225,7 @@ fn print_stats(agent: &Agent, started: Instant) {
     eprintln!(
         "{}",
         serde_json::json!({
+            "execution_mode": agent.execution_mode.name(),
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
         })
@@ -229,6 +248,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         view: display::view_name(),
         keys: client.key_count(),
     });
+    println!("  execution {}", agent.execution_mode.name());
     let mut rl = rustyline::DefaultEditor::new()?;
     let history_file = config::config_dir().map(|d| d.join("history"));
     if let Some(h) = &history_file {
@@ -329,8 +349,25 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/model" => {
             if !rest.is_empty() {
                 agent.model = rest.to_string();
+                agent.model_override = Some(rest.to_string());
             }
             println!("  model {}", ui::info(&agent.model));
+        }
+        "/mode" => {
+            if !rest.is_empty() {
+                let mode = ExecutionMode::parse(rest)
+                    .ok_or_else(|| anyhow!("unknown execution mode `{rest}` (careful, standard, vibe)"))?;
+                agent.set_execution_mode(mode);
+                settings.execution_mode = mode;
+                settings.save();
+            }
+            println!(
+                "  execution {} · rechecks {} · workers {}",
+                agent.execution_mode.name(),
+                agent.execution_mode.review_passes(),
+                agent.agents.mode.name()
+            );
+            println!("  model {}", agent.model);
         }
         "/models" => {
             for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
@@ -387,13 +424,21 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         }
         "/agents" | "/subagents" => {
             agents_cmd(agent, rest);
-            settings.agents = agent.agents.clone();
-            settings.save();
+            if !rest.is_empty() {
+                agent.delegation_override = true;
+                settings.delegation_override = true;
+                settings.agents = agent.agents.clone();
+                settings.save();
+            }
         }
         "/swarm" => {
             swarm_cmd(agent, rest);
-            settings.agents = agent.agents.clone();
-            settings.save();
+            if !rest.is_empty() {
+                agent.delegation_override = true;
+                settings.delegation_override = true;
+                settings.agents = agent.agents.clone();
+                settings.save();
+            }
         }
         "/tips" => {
             agent.tips = match rest {
@@ -563,6 +608,8 @@ fn print_settings(agent: &Agent) {
     let a = &agent.agents;
     let rows = [
         ("model", agent.model.clone()),
+        ("execution", agent.execution_mode.name().to_string()),
+        ("rechecks", agent.execution_mode.review_passes().to_string()),
         ("permissions", agent.policy.mode.name().to_string()),
         ("view", display::view_name().to_string()),
         ("theme", ui::theme().name.to_string()),
@@ -728,6 +775,7 @@ fn print_help(cwd: &Path) {
                 ("/loop [5m] [x10] <prompt>", "repeat on an interval, or let rusty pick the pace"),
                 ("/agents off|sub|swarm|auto", "delegation · /agents model <id> sets the subagent model"),
                 ("/swarm size|models|spread", "tune parallel workers"),
+                ("/mode careful|standard|vibe", "reasoning and review depth; permissions stay separate"),
                 ("/plan", "the current plan"),
             ],
         ),

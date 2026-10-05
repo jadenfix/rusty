@@ -37,6 +37,10 @@ impl Sandbox {
             .env("NVIDIA_API_KEY", "offline-test-key")
             .env("NO_COLOR", "1")
             .env_remove("RUSTY_MODEL")
+            .env_remove("RUSTY_MODE")
+            .env_remove("RUSTY_CAREFUL_MODEL")
+            .env_remove("RUSTY_STANDARD_MODEL")
+            .env_remove("RUSTY_VIBE_MODEL")
             .env_remove("RUSTY_AGENTS")
             .env_remove("RUSTY_PERMISSIONS");
         c
@@ -292,4 +296,215 @@ fn live_swarm_runs_workers_in_parallel() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("alpha") && text.contains("beta"), "{text}");
     assert!(text.contains("swarm"), "swarm tool was not used:\n{text}");
+}
+
+#[test]
+fn execution_modes_persist_without_changing_permissions() {
+    let s = Sandbox::new("execution-modes");
+    let out = s.repl(&["/mode vibe", "/settings", "/permissions check git push origin main"]);
+    assert!(out.contains("execution vibe"), "{out}");
+    assert!(out.contains("workers auto"), "{out}");
+    assert!(out.contains("Ask("), "vibe must not authorize git push: {out}");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["execution_mode"], "vibe");
+    let out = s.repl(&["/mode", "/agents off", "/mode careful", "/mode vibe"]);
+    assert!(out.contains("rechecks 2"), "{out}");
+    let out = s.repl(&["/mode"]);
+    assert!(out.contains("workers off"), "explicit delegation choice must persist: {out}");
+}
+
+#[test]
+fn execution_mode_cli_and_model_precedence() {
+    let s = Sandbox::new("mode-models");
+    s.repl(&["/mode careful"]);
+    let out = s
+        .cmd()
+        .args(["--mode", "vibe", "--model", "explicit-model"])
+        .env("RUSTY_VIBE_MODEL", "fast-model")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = out;
+    writeln!(child.stdin.take().unwrap(), "/mode\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("execution vibe") && text.contains("model explicit-model"), "{text}");
+    // CLI choice must not overwrite the saved mode.
+    assert!(s.repl(&["/mode"]).contains("execution careful"));
+    let out = s.cmd().args(["--mode", "nonsense", "hi"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown execution mode"));
+}
+
+/// A scripted SSE endpoint drives the real loop without paying for inference.
+fn scripted_endpoint(replies: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+    use std::io::{BufRead, BufReader, Read};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for reply in replies {
+            let start = Instant::now();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(start.elapsed() < Duration::from_secs(15), "expected another request");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut size = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("content-length") {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).unwrap();
+            requests.push(serde_json::from_slice(&body).unwrap());
+            let sse = format!("data: {}\n\ndata: [DONE]\n\n", reply);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
+        }
+        requests
+    });
+    (url, handle)
+}
+
+fn tool_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call", "type": "function",
+        "function": {"name": name, "arguments": args.to_string()}}]}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+}
+
+#[test]
+fn careful_goal_cannot_skip_the_two_inference_rechecks() {
+    let s = Sandbox::new("careful-loop");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let (url, server) = scripted_endpoint(vec![
+        done.clone(),
+        tool_reply("bash", serde_json::json!({"command": "printf first-check"})),
+        done.clone(),
+        tool_reply("bash", serde_json::json!({"command": "printf second-check"})),
+        done,
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--goal", "check the workspace", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(requests.iter().all(|r| r["max_tokens"] == 32768));
+    assert!(requests[1]["messages"].to_string().contains("Careful recheck 1/2"));
+    assert!(requests[3]["messages"].to_string().contains("Careful recheck 2/2"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("first-check") && text.contains("second-check"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
+}
+
+#[test]
+fn standard_and_vibe_finish_without_extra_reviews() {
+    for mode in ["standard", "vibe"] {
+        let s = Sandbox::new(mode);
+        let (url, server) =
+            scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"evidence": "checked"}))]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--mode", mode, "--goal", "inspect", "--stats"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(|child| wait(child, Duration::from_secs(20)))
+            .unwrap();
+        assert!(out.status.success());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["max_tokens"], if mode == "vibe" { 8192 } else { 16384 });
+        let tools = requests[0]["tools"].to_string();
+        assert_eq!(tools.contains("Run several read-only workers"), mode == "vibe");
+    }
+}
+
+#[test]
+fn careful_blocked_goal_does_not_spend_review_calls() {
+    let s = Sandbox::new("careful-blocked");
+    let (url, server) = scripted_endpoint(vec![tool_reply(
+        "goal_done",
+        serde_json::json!({"evidence": "need a target", "blocked": true}),
+    )]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(server.join().unwrap().len(), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"blocked\""));
+}
+
+#[test]
+fn careful_also_reviews_ordinary_answers() {
+    let s = Sandbox::new("careful-answer");
+    let reply = serde_json::json!({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_endpoint(vec![reply.clone(), reply.clone(), reply]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "explain the code"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]["messages"].to_string().contains("Careful recheck 2/2"));
+}
+
+#[test]
+fn truncated_careful_review_leaves_the_goal_open() {
+    let s = Sandbox::new("careful-truncated");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let mut truncated = done.clone();
+    truncated["choices"][0]["finish_reason"] = serde_json::json!("length");
+    let (url, server) = scripted_endpoint(vec![done.clone(), done, truncated]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(server.join().unwrap().len(), 3);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
 }

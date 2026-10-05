@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::config::{AgentsConfig, AgentsMode};
 use crate::context;
 use crate::display::{self, Display, View};
+use crate::execution::{ExecutionMode, ReviewGate};
 use crate::llm::{Client, Event, Reply, ToolCall};
 use crate::memory::{Memory, KINDS};
 use crate::permissions::{Mode, Policy, Verdict};
@@ -95,6 +96,10 @@ pub struct Agent {
     client: Arc<Client>,
     pub model: String,
     pub temperature: f32,
+    pub execution_mode: ExecutionMode,
+    pub model_override: Option<String>,
+    pub delegation_override: bool,
+    pending_goal: Option<Value>,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     pub policy: Policy,
@@ -120,6 +125,10 @@ impl Agent {
             client,
             model,
             temperature: 0.2,
+            execution_mode: ExecutionMode::Standard,
+            model_override: None,
+            delegation_override: false,
+            pending_goal: None,
             cwd,
             history: Vec::new(),
             policy,
@@ -136,6 +145,19 @@ impl Agent {
             session_path: None,
             is_worker: false,
             progress: None,
+        }
+    }
+
+    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.execution_mode = mode;
+        self.model = self
+            .model_override
+            .clone()
+            .or_else(|| mode.model())
+            .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
+        if !self.delegation_override {
+            self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
+            self.agents.swarm_max = 3;
         }
     }
 
@@ -180,6 +202,8 @@ impl Agent {
              reading, read ranges of big files, don't re-read what you just read, and keep command output short \
              (tail, head, -q flags).\n",
         );
+        s.push_str(self.execution_mode.instructions());
+        s.push('\n');
         match self.agents.mode {
             AgentsMode::Off => {}
             AgentsMode::Sub => s.push_str(
@@ -332,6 +356,8 @@ impl Agent {
         // How often each exact call has been made this turn, to catch doom loops.
         let mut seen: HashMap<String, u32> = HashMap::new();
         let mut outcome: Result<bool> = Ok(true);
+        self.pending_goal = None;
+        let mut reviews = ReviewGate::new(if self.is_worker { ExecutionMode::Standard } else { self.execution_mode });
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -385,6 +411,16 @@ impl Agent {
                 if reply.finish_reason.as_deref() == Some("length") {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
+                if reply.finish_reason.as_deref() != Some("length") {
+                    if let Some(prompt) = reviews.next() {
+                        self.history.push(json!({"role": "user", "content": prompt}));
+                        d.line(&ui::dim("  careful mode: checking the proposed completion"));
+                        continue;
+                    }
+                    if let Some(args) = self.pending_goal.take() {
+                        self.close_goal(&args);
+                    }
+                }
                 break;
             }
             for call in &reply.tool_calls {
@@ -404,6 +440,27 @@ impl Agent {
                     out
                 };
                 self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
+            }
+            if signal::interrupted() {
+                self.pending_goal = None;
+                outcome = Ok(false);
+                break;
+            }
+            if reply.finish_reason.as_deref() == Some("length") {
+                self.pending_goal = None;
+                d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
+                break;
+            }
+            if self.pending_goal.is_some() {
+                if let Some(prompt) = reviews.next() {
+                    self.pending_goal = None;
+                    self.history.push(json!({"role": "user", "content": prompt}));
+                    d.line(&ui::dim("  careful mode: checking the proposed completion"));
+                    continue;
+                }
+                if let Some(args) = self.pending_goal.take() {
+                    self.close_goal(&args);
+                }
             }
             if self.goal.as_ref().is_some_and(|g| g.status != GoalStatus::Active) {
                 break;
@@ -446,7 +503,7 @@ impl Agent {
     /// Sends one request on a background thread and renders it as it streams.
     /// Ctrl-C returns at once with whatever text arrived.
     fn ask(&mut self, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
-        let rx = self.client.start_chat(self.model.clone(), messages, tools, self.temperature);
+        let rx = self.client.start_chat(self.model.clone(), messages, tools, self.temperature, self.execution_mode);
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
             if signal::interrupted() {
@@ -592,10 +649,12 @@ impl Agent {
             let temperature = if n > 1 { 0.2 + cfg.spread * i as f32 / (n - 1) as f32 } else { 0.2 };
             let counter = Arc::new(AtomicUsize::new(0));
             counters.push(counter.clone());
+            let execution_mode = self.execution_mode;
             let (client, cwd, deny, tx) = (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), tx.clone());
             std::thread::spawn(move || {
                 let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
                 w.is_worker = true;
+                w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
                 w.progress = Some(counter);
                 w.policy.deny = deny;
@@ -663,6 +722,15 @@ impl Agent {
     // ------------------------------------------------------------- goal mode
 
     fn finish_goal(&mut self, args: &Value) -> String {
+        if self.execution_mode == ExecutionMode::Careful && !args["blocked"].as_bool().unwrap_or(false) {
+            self.pending_goal = Some(args.clone());
+            return "completion proposed; careful mode will recheck before closing the goal".into();
+        }
+        self.pending_goal = None;
+        self.close_goal(args)
+    }
+
+    fn close_goal(&mut self, args: &Value) -> String {
         let evidence = args["evidence"].as_str().unwrap_or("").to_string();
         let Some(g) = &mut self.goal else { return "no active goal".into() };
         g.status = if args["blocked"].as_bool().unwrap_or(false) {
@@ -774,7 +842,10 @@ impl Agent {
     // --------------------------------------------------------------- context
 
     fn system_tokens(&self) -> usize {
-        1_800 + self.project_notes.len() / 4 + context::MEMORY_CHARS / 4
+        1_800
+            + self.project_notes.len() / 4
+            + context::MEMORY_CHARS / 4
+            + (self.execution_mode.max_tokens() as usize).saturating_sub(context::REPLY_RESERVE)
     }
 
     pub fn context_pct(&self) -> usize {
@@ -920,6 +991,7 @@ impl Agent {
         let line = json!({
             "t": crate::memory::now(),
             "model": self.model,
+            "execution_mode": self.execution_mode.name(),
             "ms": took.as_millis() as u64,
             "prompt": reply.usage.map(|u| u.prompt),
             "completion": reply.usage.map(|u| u.completion),

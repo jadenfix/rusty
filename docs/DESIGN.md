@@ -31,6 +31,18 @@ explains why it's built the way it is.
 | **Invisible cost** | You find out what it spent when the bill arrives. | Per-turn recaps, `/tokens` broken down by model and by tool, per-request traces on disk, and tips based on what each turn actually spent. |
 | **Hard to interrupt** | Ctrl-C kills the process or does nothing until the stream ends. | Requests run on a background thread, so Ctrl-C stops a turn mid-stream (about 1 ms in tests). The transcript stays valid and the next turn works. |
 
+## Execution depth
+
+Execution mode is separate from permission mode. `standard` keeps the existing
+loop. `vibe` uses a smaller output and reasoning budget and enables bounded
+read-only research workers by default. `careful` uses a larger inference budget
+and intercepts completion proposals to run two additional review passes.
+The reviews remain in the same transcript and their usage is counted.
+They are model-driven reviews with tools available, not hidden grading or
+proof that every critical invariant holds. Explicit model and delegation
+choices override the profile defaults. Provider-specific reasoning fields
+are scoped to the documented NVIDIA Super endpoint to preserve compatibility.
+
 ## First principles for tools
 
 An agent's tools should be the ones a strong engineer reaches for in a

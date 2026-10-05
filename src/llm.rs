@@ -9,6 +9,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::execution::ExecutionMode;
 use crate::ui::truncate;
 
 /// What a background request sends back to the UI thread.
@@ -79,11 +80,12 @@ impl Client {
         messages: Vec<Value>,
         tools: Value,
         temperature: f32,
+        execution_mode: ExecutionMode,
     ) -> Receiver<Event> {
         let (tx, rx) = channel();
         let me = self.clone();
         std::thread::spawn(move || {
-            let result = me.chat(&model, &messages, &tools, temperature, &mut |d| {
+            let result = me.chat(&model, &messages, &tools, temperature, execution_mode, &mut |d| {
                 let ev = match d {
                     Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
                     Delta::Content(s) => Event::Content(s.to_string()),
@@ -104,6 +106,7 @@ impl Client {
         messages: &[Value],
         tools: &Value,
         temperature: f32,
+        execution_mode: ExecutionMode,
         on: &mut dyn FnMut(Delta) -> bool,
     ) -> Result<Reply> {
         let mut body = json!({
@@ -114,6 +117,7 @@ impl Client {
             "max_tokens": 16384,
             "temperature": temperature,
         });
+        execution_mode.apply_inference(&mut body, &self.base_url, model);
         if tools.as_array().is_some_and(|t| !t.is_empty()) {
             body["tools"] = tools.clone();
             body["tool_choice"] = json!("auto");

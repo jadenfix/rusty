@@ -140,6 +140,41 @@ when rate limited.
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
 | `/model` · `/models` · `/plan` · `/tips` · `/settings` · `/clear` · `/exit` | |
 
+## Execution modes
+
+Choose how much reasoning and review rusty spends, independently of permissions:
+
+| Mode | Inference on the default NVIDIA Super model | Completion checks | Default delegation |
+|---|---|---|---|
+| `careful` | high effort, 24,576 reasoning tokens within a 32,768-token output cap | two additional review passes with tools available before accepting completion | off |
+| `standard` | provider defaults, existing 16,384-token output cap | relevant tests or direct verification | off |
+| `vibe` | low effort, 2,048 reasoning tokens within an 8,192-token output cap | focused smoke checks, no forced extra review | auto, up to three read-only workers |
+
+```bash
+rusty --mode careful --goal "repair the migration and check data integrity"
+rusty --mode standard "fix the parser regression"
+rusty --mode vibe "prototype a settings screen"
+```
+
+Use `/mode careful`, `/mode standard` or `/mode vibe` in a session; `/mode`
+shows the current mode. Interactive choices persist. `--mode` or `RUSTY_MODE`
+overrides the saved choice for one invocation. Explicit `/agents` or `--agents`
+choices take precedence over mode defaults.
+
+Set `RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL` and `RUSTY_VIBE_MODEL` to
+route each mode to a different model. Explicit `--model`, `RUSTY_MODEL` or
+`/model` choices take precedence. The same model is used when none is configured.
+The NVIDIA reasoning fields are sent only for the documented default
+endpoint and Super model; other models keep their provider's reasoning defaults
+and receive the mode's output cap and workflow instructions.
+
+Careful mode enforces two extra inference passes, including when the model
+calls `goal_done` early. Reviews can inspect files, run relevant checks, and
+repair failures. Blocked goals and interrupted or truncated turns do not
+pretend to have completed the reviews. This is additional model review, not
+an independent verifier or a guarantee of production safety. Vibe still needs
+a relevant check; all modes preserve permission rules and explicit deny rules.
+
 ## Permissions
 
 ```
