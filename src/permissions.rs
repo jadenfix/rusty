@@ -1759,6 +1759,12 @@ fn kubectl(args: &[&str], ctx: &Ctx) -> Class {
             Class::ReadOnly
         }
         "rollout" if matches!(what, "status" | "history") => Class::ReadOnly,
+        // A dry run only shows what would change; `--dry-run=none` is real.
+        "apply" | "create" | "replace" | "patch" | "scale" | "set" | "label" | "annotate"
+            if args.iter().any(|a| matches!(unq(a), "--dry-run=server" | "--dry-run=client" | "--dry-run")) =>
+        {
+            Class::ReadOnly
+        }
         "delete" | "drain" => destructive(format!("kubectl {verb}")),
         "replace" if has("--force") => destructive("kubectl replace --force recreates resources"),
         "apply" if has("--prune") => destructive("kubectl apply --prune deletes resources"),
@@ -1773,7 +1779,12 @@ fn kubectl(args: &[&str], ctx: &Ctx) -> Class {
 }
 
 fn helm(args: &[&str]) -> Class {
+    let dry_run =
+        args.iter().any(|a| unq(a) == "--dry-run" || unq(a).starts_with("--dry-run=") && unq(a) != "--dry-run=none");
     let pos = positionals(skip_options(args, &["-n", "--namespace", "--kube-context", "--kubeconfig"]));
+    if dry_run && matches!(pos.first(), Some(&("upgrade" | "install" | "rollback"))) {
+        return Class::ReadOnly;
+    }
     match (pos.first().copied().unwrap_or(""), pos.get(1).copied().unwrap_or("")) {
         ("uninstall" | "delete" | "del" | "un", _) => destructive("helm uninstall removes a release"),
         (
@@ -2331,6 +2342,10 @@ mod tests {
                 "kubectl describe node worker-1",
                 "helm list -A",
                 "terraform plan -out tf.plan",
+                "kubectl diff -f k8s/",
+                "kubectl apply -f k8s/ --dry-run=server",
+                "helm upgrade --install api ./chart --dry-run",
+                "helm diff upgrade api ./chart",
                 "terraform state list",
                 "docker ps -a",
                 "docker compose logs web",
@@ -2418,6 +2433,7 @@ mod tests {
                 "gh pr create --fill",
                 "gh pr merge 12",
                 "kubectl apply -f deploy.yaml",
+                "kubectl apply -f deploy.yaml --dry-run=none",
                 "kubectl get secret db -o yaml",
                 "terraform apply",
                 "aws lambda update-function-code --function-name f --zip-file fileb://f.zip",
