@@ -1,0 +1,528 @@
+//! The agent's tools: read, write, edit, list, search and run shell commands.
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use std::fmt::Write as _;
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::signal;
+use crate::ui::{self, truncate};
+
+const MAX_OUTPUT: usize = 30_000;
+const SKIP_DIRS: &[&str] =
+    &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
+
+pub fn definitions() -> Value {
+    json!([
+        tool("read_file", "Read a text file. Returns numbered lines. For big files, outline or search first and read only the range you need.", json!({
+            "path": {"type": "string", "description": "File path"},
+            "offset": {"type": "integer", "description": "1-based line to start at (default 1)"},
+            "limit": {"type": "integer", "description": "Max lines to return (default 800)"}
+        }), &["path"]),
+        tool("write_file", "Create or overwrite a file with the given content. Creates parent directories.", json!({
+            "path": {"type": "string"},
+            "content": {"type": "string", "description": "Full new file content"}
+        }), &["path", "content"]),
+        tool("edit_file", "Replace an exact string in a file. old_string must match exactly once unless replace_all is true. Read the file first.", json!({
+            "path": {"type": "string"},
+            "old_string": {"type": "string", "description": "Exact text to replace, including whitespace"},
+            "new_string": {"type": "string"},
+            "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
+        }), &["path", "old_string", "new_string"]),
+        tool("list_files", "List files and directories recursively (skips .git, target, node_modules, ...).", json!({
+            "path": {"type": "string", "description": "Directory (default .)"},
+            "max_depth": {"type": "integer", "description": "Default 3"}
+        }), &[]),
+        tool("search", "Search file contents with a regex (ripgrep if installed, else grep). Smart case. Returns file:line:text. The cheapest way to find where something lives.", json!({
+            "pattern": {"type": "string"},
+            "path": {"type": "string", "description": "Directory or file (default .)"},
+            "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
+            "context": {"type": "integer", "description": "Lines of context around each match (default 0)"}
+        }), &["pattern"]),
+        tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents.", json!({
+            "pattern": {"type": "string"},
+            "path": {"type": "string", "description": "Directory to search (default .)"}
+        }), &["pattern"]),
+        tool("outline", "List the definitions (functions, types, classes, impls) in a file or directory with line numbers. Use it to understand structure before reading.", json!({
+            "path": {"type": "string"}
+        }), &["path"]),
+        tool("bash", "Run a shell command in the working directory and return exit code, stdout and stderr. Use for builds, tests, git, etc. Non-interactive only.", json!({
+            "command": {"type": "string"},
+            "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}
+        }), &["command"]),
+    ])
+}
+
+pub fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": { "type": "object", "properties": properties, "required": required }
+        }
+    })
+}
+
+/// One-line description of a call, shown as its header.
+pub fn summary(name: &str, args: &Value) -> String {
+    let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
+    let text = match name {
+        "bash" => s("command").lines().next().unwrap_or("").to_string(),
+        "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().unwrap_or(".")),
+        "glob" => s("pattern"),
+        "outline" => s("path"),
+        "swarm" => format!("{} tasks", args["tasks"].as_array().map_or(0, Vec::len)),
+        "list_files" => args["path"].as_str().unwrap_or(".").to_string(),
+        "task" => s("description"),
+        "remember" => format!("{}: {}", s("kind"), s("text")),
+        "recall" => s("query"),
+        "forget" => s("id"),
+        "plan" => format!("{} items", args["items"].as_array().map_or(0, Vec::len)),
+        "goal_done" | "loop_next" => String::new(),
+        _ => s("path"),
+    };
+    truncate(&text, 120).to_string()
+}
+
+/// A longer preview shown when asking the user to approve a call.
+pub fn preview(name: &str, args: &Value) -> String {
+    let mut out = String::new();
+    match name {
+        "bash" => {
+            for l in args["command"].as_str().unwrap_or("").lines() {
+                let _ = writeln!(out, "    {} {}", ui::dim("$"), l);
+            }
+        }
+        "write_file" => {
+            let content = args["content"].as_str().unwrap_or("");
+            let n = content.lines().count();
+            for l in content.lines().take(15) {
+                let _ = writeln!(out, "    {}", ui::ok(&format!("+ {l}")));
+            }
+            if n > 15 {
+                let _ = writeln!(out, "    {}", ui::dim(&format!("… {} more lines", n - 15)));
+            }
+        }
+        "edit_file" => {
+            for (key, sign) in [("old_string", "-"), ("new_string", "+")] {
+                let text = args[key].as_str().unwrap_or("");
+                for l in text.lines().take(20) {
+                    let line = format!("{sign} {l}");
+                    let painted = if sign == "-" { ui::err(&line) } else { ui::ok(&line) };
+                    let _ = writeln!(out, "    {painted}");
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+pub fn execute(name: &str, args: &Value) -> Result<String> {
+    match name {
+        "read_file" => read_file(args),
+        "glob" => glob(args),
+        "outline" => outline(args),
+        "write_file" => write_file(args),
+        "edit_file" => edit_file(args),
+        "list_files" => list_files(args),
+        "search" => search(args),
+        "bash" => bash(args),
+        other => bail!("unknown tool `{other}`"),
+    }
+}
+
+fn arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args[key].as_str().ok_or_else(|| anyhow!("missing string argument `{key}`"))
+}
+
+fn read_file(args: &Value) -> Result<String> {
+    let path = arg(args, "path")?;
+    let text = fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
+    let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(800).max(1) as usize;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Ok("(empty file)".into());
+    }
+    let mut out = String::new();
+    for (i, l) in lines.iter().enumerate().skip(offset - 1).take(limit) {
+        let _ = writeln!(out, "{:>6}\t{}", i + 1, truncate(l, 2000));
+    }
+    let shown_to = (offset - 1 + limit).min(lines.len());
+    if shown_to < lines.len() {
+        let _ = writeln!(out, "… {} more lines (use offset={})", lines.len() - shown_to, shown_to + 1);
+    }
+    Ok(cap(out))
+}
+
+fn write_file(args: &Value) -> Result<String> {
+    let path = arg(args, "path")?;
+    let content = arg(args, "content")?;
+    if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content).with_context(|| format!("cannot write {path}"))?;
+    Ok(format!("wrote {} lines to {path}", content.lines().count()))
+}
+
+fn edit_file(args: &Value) -> Result<String> {
+    let path = arg(args, "path")?;
+    let old = arg(args, "old_string")?;
+    let new = arg(args, "new_string")?;
+    if old.is_empty() {
+        bail!("old_string is empty; use write_file to create files");
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
+    let count = text.matches(old).count();
+    let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+    let updated = match count {
+        0 => bail!("old_string not found in {path}; read the file and copy the text exactly"),
+        1 => text.replacen(old, new, 1),
+        _ if replace_all => text.replace(old, new),
+        n => bail!("old_string matches {n} times in {path}; add context to make it unique or set replace_all"),
+    };
+    fs::write(path, updated)?;
+    Ok(format!("edited {path} ({} replacement{})", count, if count == 1 { "" } else { "s" }))
+}
+
+fn list_files(args: &Value) -> Result<String> {
+    let root = args["path"].as_str().unwrap_or(".");
+    let max_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
+    let mut entries = Vec::new();
+    walk(Path::new(root), Path::new(root), 0, max_depth, &mut entries)?;
+    let total = entries.len();
+    entries.truncate(500);
+    let mut out = entries.join("\n");
+    if total > 500 {
+        let _ = write!(out, "\n… {} more entries (narrow the path or depth)", total - 500);
+    }
+    Ok(if out.is_empty() { "(empty)".into() } else { out })
+}
+
+fn walk(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<String>) -> Result<()> {
+    let mut items: Vec<_> =
+        fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))?.filter_map(|e| e.ok()).collect();
+    items.sort_by_key(|e| e.file_name());
+    for e in items {
+        let name = e.file_name().to_string_lossy().to_string();
+        let path = e.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+        if path.is_dir() {
+            if SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            out.push(format!("{rel}/"));
+            if depth + 1 < max_depth && out.len() < 2000 {
+                walk(root, &path, depth + 1, max_depth, out)?;
+            }
+        } else {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+fn search(args: &Value) -> Result<String> {
+    let pattern = arg(args, "pattern")?;
+    let path = args["path"].as_str().unwrap_or(".");
+    let context = args["context"].as_u64().unwrap_or(0).min(10).to_string();
+    let output = if has_rg() {
+        let mut cmd = Command::new("rg");
+        cmd.args(["--line-number", "--no-heading", "--color", "never", "--smart-case", "--max-columns", "300"]);
+        cmd.args(["--max-count", "30", "-C", &context]);
+        if let Some(g) = args["glob"].as_str() {
+            cmd.args(["-g", g]);
+        }
+        cmd.args(["-e", pattern, path]).output()?
+    } else {
+        let mut cmd = Command::new("grep");
+        cmd.args(["-rnEI", "-C", &context]);
+        for d in SKIP_DIRS {
+            cmd.arg(format!("--exclude-dir={d}"));
+        }
+        if let Some(g) = args["glob"].as_str() {
+            cmd.arg(format!("--include={g}"));
+        }
+        cmd.args(["-e", pattern, path]).output()?
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok(if stderr.trim().is_empty() { "no matches".into() } else { format!("error: {}", stderr.trim()) });
+    }
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut out = lines.iter().take(200).copied().collect::<Vec<_>>().join("\n");
+    if lines.len() > 200 {
+        let _ = write!(out, "\n… {} more matches", lines.len() - 200);
+    }
+    Ok(cap(out))
+}
+
+fn bash(args: &Value) -> Result<String> {
+    let command = arg(args, "command")?;
+    let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn bash")?;
+
+    // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break Some(s);
+        }
+        if start.elapsed() > timeout || signal::interrupted() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
+    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+
+    let mut out = match status {
+        Some(s) => format!("exit code: {}\n", s.code().map_or("signal".into(), |c| c.to_string())),
+        None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
+        None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
+    };
+    if !stdout.is_empty() {
+        let _ = write!(out, "stdout:\n{stdout}");
+    }
+    if !stderr.is_empty() {
+        let _ = write!(out, "\nstderr:\n{stderr}");
+    }
+    Ok(cap(out))
+}
+
+fn has_rg() -> bool {
+    static RG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RG.get_or_init(|| Command::new("rg").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok())
+}
+
+/// Every file under `root`, skipping build and dependency directories.
+fn files_under(root: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    let mut items: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    items.sort_by_key(|e| e.file_name());
+    for e in items {
+        if out.len() >= 20_000 {
+            return;
+        }
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                files_under(&path, out);
+            }
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+fn glob(args: &Value) -> Result<String> {
+    let pattern = arg(args, "pattern")?;
+    let root = args["path"].as_str().unwrap_or(".");
+    let mut files = Vec::new();
+    files_under(Path::new(root), &mut files);
+    let hits: Vec<String> = files
+        .iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().trim_start_matches("./").to_string();
+            let target =
+                if pattern.contains('/') { rel.clone() } else { rel.rsplit('/').next().unwrap_or(&rel).to_string() };
+            wildcard(pattern.as_bytes(), target.as_bytes()).then_some(rel)
+        })
+        .collect();
+    if hits.is_empty() {
+        return Ok("no files match".into());
+    }
+    let mut out = hits.iter().take(300).cloned().collect::<Vec<_>>().join("\n");
+    if hits.len() > 300 {
+        let _ = write!(out, "\n… {} more", hits.len() - 300);
+    }
+    Ok(out)
+}
+
+/// Glob matching: `*` and `?` stay within one path segment, `**` crosses them.
+pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
+    if p.starts_with(b"**/") {
+        return (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && wildcard(&p[3..], &s[i..]));
+    }
+    if p.starts_with(b"**") {
+        return (0..=s.len()).any(|i| wildcard(&p[2..], &s[i..]));
+    }
+    match p.first() {
+        None => s.is_empty(),
+        Some(b'*') => {
+            for i in 0..=s.len() {
+                if wildcard(&p[1..], &s[i..]) {
+                    return true;
+                }
+                if i < s.len() && s[i] == b'/' {
+                    break;
+                }
+            }
+            false
+        }
+        Some(b'?') => !s.is_empty() && s[0] != b'/' && wildcard(&p[1..], &s[1..]),
+        Some(c) => s.first() == Some(c) && wildcard(&p[1..], &s[1..]),
+    }
+}
+
+const SOURCE_EXT: &[&str] = &[
+    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "kt", "swift", "c", "h", "cc", "cpp", "hpp", "rb", "php", "cs",
+    "scala", "ex", "exs", "lua", "sh", "zig",
+];
+
+const DEF_PREFIXES: &[&str] = &[
+    "pub fn ",
+    "fn ",
+    "pub(crate) fn ",
+    "async fn ",
+    "pub async fn ",
+    "pub struct ",
+    "struct ",
+    "pub enum ",
+    "enum ",
+    "pub trait ",
+    "trait ",
+    "impl ",
+    "impl<",
+    "pub mod ",
+    "mod ",
+    "macro_rules!",
+    "pub type ",
+    "pub const ",
+    "def ",
+    "async def ",
+    "class ",
+    "function ",
+    "async function ",
+    "export function ",
+    "export async function ",
+    "export default ",
+    "export class ",
+    "export const ",
+    "export interface ",
+    "export type ",
+    "interface ",
+    "func ",
+    "public ",
+    "private ",
+    "protected ",
+    "module ",
+];
+
+fn outline(args: &Value) -> Result<String> {
+    let path = Path::new(arg(args, "path")?);
+    if path.is_file() {
+        return outline_file(path).map(|o| if o.is_empty() { "(no definitions found)".into() } else { o });
+    }
+    let mut files = Vec::new();
+    files_under(path, &mut files);
+    files.retain(|f| f.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXT.contains(&e)));
+    let mut out = String::new();
+    for f in files.iter().take(60) {
+        if let Ok(o) = outline_file(f) {
+            if !o.is_empty() {
+                let _ = writeln!(out, "## {}\n{o}", f.display());
+            }
+        }
+        if out.len() > MAX_OUTPUT {
+            break;
+        }
+    }
+    if files.len() > 60 {
+        let _ = writeln!(out, "… {} more files; outline a subdirectory", files.len() - 60);
+    }
+    Ok(cap(if out.is_empty() { "(no definitions found)".into() } else { out }))
+}
+
+fn outline_file(path: &Path) -> Result<String> {
+    let text = fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent > 8 || !DEF_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            continue;
+        }
+        // Skip `public`/`private` lines that are fields rather than methods.
+        if (trimmed.starts_with("public ") || trimmed.starts_with("private ") || trimmed.starts_with("protected "))
+            && !trimmed.contains('(')
+        {
+            continue;
+        }
+        let sig = trimmed.trim_end_matches(['{', ':', ' ']);
+        let _ = writeln!(out, "{:>5}: {}{}", i + 1, " ".repeat(indent.min(8)), truncate(sig, 160));
+    }
+    Ok(out)
+}
+
+/// Keeps the head and tail of long outputs so the model sees both ends.
+fn cap(s: String) -> String {
+    if s.len() <= MAX_OUTPUT {
+        return s;
+    }
+    let head = truncate(&s, MAX_OUTPUT / 2);
+    let mut start = s.len() - MAX_OUTPUT / 2;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{head}\n… [{} bytes omitted] …\n{}", s.len() - head.len() - (s.len() - start), &s[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_matching() {
+        assert!(wildcard(b"*.rs", b"main.rs"));
+        assert!(!wildcard(b"*.rs", b"src/main.rs"));
+        assert!(wildcard(b"src/**/*.rs", b"src/a/b/c.rs"));
+        assert!(wildcard(b"src/**/*.rs", b"src/c.rs"));
+        assert!(wildcard(b"**/test_?.py", b"x/y/test_a.py"));
+        assert!(!wildcard(b"test_?.py", b"test_ab.py"));
+    }
+
+    #[test]
+    fn outline_finds_definitions() {
+        let dir = std::env::temp_dir().join(format!("rusty-outline-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("m.py");
+        fs::write(&f, "import os\n\nclass Cache:\n    def get(self, k):\n        return 1\n\ndef main():\n    pass\n")
+            .unwrap();
+        let o = outline_file(&f).unwrap();
+        assert!(o.contains("3: class Cache"));
+        assert!(o.contains("4:     def get(self, k)"));
+        assert!(o.contains("7: def main()"));
+        let _ = fs::remove_dir_all(dir);
+    }
+}

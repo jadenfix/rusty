@@ -1,0 +1,356 @@
+//! Token budgeting. The context window is split into fixed allowances:
+//!
+//! - system prompt + project instructions: fixed, kept small
+//! - memory: at most `MEMORY_CHARS`
+//! - plan and goal: pinned, never compacted
+//! - reply reserve: `REPLY_RESERVE` tokens kept free for the answer
+//! - history: everything else
+//!
+//! When history outgrows its share, rusty gives tokens back in order of how
+//! cheap they are to get back: first it shrinks old tool outputs (the model
+//! can re-run a read), and only then does it summarise older turns. Your own
+//! messages, the plan and the goal are never dropped.
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+pub const MEMORY_CHARS: usize = 3_000;
+pub const REPLY_RESERVE: usize = 16_000;
+/// Tool results among the newest N stay intact.
+const KEEP_RECENT_TOOL_RESULTS: usize = 8;
+const ELIDE_OVER_CHARS: usize = 1_500;
+const ELIDED_MARK: &str = "[elided to save context";
+
+/// Rough token count: about 4 characters per token for code and English.
+pub fn estimate(messages: &[Value]) -> usize {
+    messages.iter().map(estimate_one).sum()
+}
+
+pub fn estimate_one(m: &Value) -> usize {
+    let mut chars = 16; // role and framing overhead
+    if let Some(s) = m["content"].as_str() {
+        chars += s.len();
+    }
+    if let Some(calls) = m["tool_calls"].as_array() {
+        for c in calls {
+            chars += c["function"]["arguments"].as_str().map_or(0, str::len) + 32;
+        }
+    }
+    chars / 4
+}
+
+pub fn window() -> usize {
+    std::env::var("RUSTY_CONTEXT_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(128_000)
+}
+
+/// Token budget for conversation history.
+pub fn history_budget(system_tokens: usize) -> usize {
+    window().saturating_sub(REPLY_RESERVE + system_tokens)
+}
+
+/// Shrinks old, large tool results in place. Returns tokens saved.
+pub fn elide_old_tool_outputs(history: &mut [Value]) -> usize {
+    elide_tool_outputs(history, KEEP_RECENT_TOOL_RESULTS)
+}
+
+/// Shrinks large tool results except the newest `keep_recent`. Returns tokens saved.
+pub fn elide_tool_outputs(history: &mut [Value], keep_recent: usize) -> usize {
+    let tool_idx: Vec<usize> =
+        history.iter().enumerate().filter(|(_, m)| m["role"] == "tool").map(|(i, _)| i).collect();
+    let cutoff = tool_idx.len().saturating_sub(keep_recent);
+    let mut saved = 0;
+    for &i in &tool_idx[..cutoff] {
+        let Some(text) = history[i]["content"].as_str() else { continue };
+        if text.len() <= ELIDE_OVER_CHARS || text.contains(ELIDED_MARK) {
+            continue;
+        }
+        let head = crate::ui::truncate(text, 400);
+        let short =
+            format!("{head}\n{ELIDED_MARK}: {} more chars; re-run the tool if you need them]", text.len() - head.len());
+        saved += (text.len() - short.len()) / 4;
+        history[i]["content"] = json!(short);
+    }
+    saved
+}
+
+/// Picks where to cut history for compaction so that roughly the newest third
+/// survives. Cuts land on a user message or on the start of an assistant step,
+/// never between a tool call and its result. Cutting mid-turn matters: one
+/// long autonomous turn has a single user message and would otherwise never
+/// be compactable.
+pub fn compaction_split(history: &[Value]) -> Option<usize> {
+    let total = estimate(history);
+    let mut tail = 0;
+    let mut split = None;
+    for i in (2..history.len()).rev() {
+        tail += estimate_one(&history[i]);
+        if matches!(history[i]["role"].as_str(), Some("user" | "assistant")) {
+            split = Some(i);
+            if tail * 3 >= total {
+                break;
+            }
+        }
+    }
+    split
+}
+
+const COMPACT_PROMPT: &str = "\
+Summarise the conversation above so work can continue without it. Be specific and complete; \
+this summary replaces the original messages. The user's own messages and a list of files and \
+commands are kept separately, word for word, so spend your words on understanding, not inventory.
+
+Write these sections:
+1. Task: what the user wants and every constraint or preference they gave, including ones \
+they gave early on.
+2. Done: what has been completed and the decisions made (and why), with file paths.
+3. State: exactly where things stand. What was in progress, open errors, failing tests, \
+anything half-edited.
+4. Next: the concrete next steps, in order.
+5. Facts: commands, names, APIs, findings and dead ends the next steps depend on. Note \
+approaches that were tried and failed so they aren't repeated.
+
+After the summary you may add up to 3 lines of long-term memory, each as
+MEMORY <kind>: <one sentence>
+with <kind> one of preference, fact, decision, gotcha. Only record things that will still be true \
+and useful in a fresh session next week: how to build or test, project conventions, traps, and \
+preferences the user stated. Never record the current task, what happened in this session, or \
+file contents. Writing no MEMORY lines is fine and often right.";
+
+/// The summarisation prompt, optionally steered by what the user wants kept.
+pub fn compact_prompt(focus: Option<&str>) -> String {
+    match focus.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => format!(
+            "{COMPACT_PROMPT}\n\nThe user asked for this summary to focus on: {f}\n\
+             Give that the most detail and keep everything related to it, even if it seems minor."
+        ),
+        None => COMPACT_PROMPT.to_string(),
+    }
+}
+
+pub const WORKING_SET_HEADER: &str = "[Working set, from the tool log]";
+
+/// Facts pulled straight from the tool calls, so compaction can't lose them:
+/// files changed, files read, recent commands with exit codes, the last error.
+pub fn working_set(history: &[Value]) -> String {
+    let mut edited: Vec<String> = Vec::new();
+    let mut read: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut last_error = String::new();
+    let mut pending: HashMap<String, (String, Value)> = HashMap::new();
+    let push = |v: &mut Vec<String>, item: String| {
+        v.retain(|x| x != &item);
+        v.push(item);
+    };
+    for m in history {
+        // Earlier compactions: keep the files they recorded as changed.
+        if let Some(text) = m["content"].as_str() {
+            if let Some((_, ws)) = text.split_once(WORKING_SET_HEADER) {
+                if let Some(line) = ws.lines().find_map(|l| l.strip_prefix("- changed: ")) {
+                    for f in line.split(", ") {
+                        push(&mut edited, f.to_string());
+                    }
+                }
+            }
+        }
+        for c in m["tool_calls"].as_array().into_iter().flatten() {
+            let name = c["function"]["name"].as_str().unwrap_or("").to_string();
+            let args: Value =
+                serde_json::from_str(c["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
+            pending.insert(c["id"].as_str().unwrap_or("").to_string(), (name, args));
+        }
+        if m["role"] == "tool" {
+            let Some((name, args)) = pending.remove(m["tool_call_id"].as_str().unwrap_or("")) else { continue };
+            let out = m["content"].as_str().unwrap_or("");
+            let path = args["path"].as_str().unwrap_or("").to_string();
+            match name.as_str() {
+                "edit_file" | "write_file" if !out.starts_with("error") && !out.starts_with("denied") => {
+                    push(&mut edited, path)
+                }
+                "read_file" if !out.starts_with("error") => push(&mut read, path),
+                "bash" => {
+                    let cmd = args["command"].as_str().unwrap_or("").lines().next().unwrap_or("").to_string();
+                    let code = out.lines().next().unwrap_or("").trim_start_matches("exit code: ").to_string();
+                    commands.push(format!("`{}` → {}", crate::ui::truncate(&cmd, 120), crate::ui::truncate(&code, 40)));
+                    if code != "0" {
+                        let tail: String = out.chars().rev().take(700).collect::<Vec<_>>().into_iter().rev().collect();
+                        last_error = format!("`{}` failed:\n{}", crate::ui::truncate(&cmd, 120), tail.trim());
+                    } else if !last_error.is_empty() && last_error.contains(&crate::ui::truncate(&cmd, 120).to_string())
+                    {
+                        last_error.clear(); // the same command passes now
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    if !edited.is_empty() {
+        out.push_str(&format!("- changed: {}\n", edited.join(", ")));
+    }
+    if !read.is_empty() {
+        let recent: Vec<&str> = read.iter().rev().take(15).rev().map(String::as_str).collect();
+        out.push_str(&format!("- read recently: {}\n", recent.join(", ")));
+    }
+    if !commands.is_empty() {
+        out.push_str("- last commands:\n");
+        for c in commands.iter().rev().take(8).rev() {
+            out.push_str(&format!("  - {c}\n"));
+        }
+    }
+    if !last_error.is_empty() {
+        out.push_str(&format!("- last unresolved error: {last_error}\n"));
+    }
+    out
+}
+
+/// For a manual /compact: everything. The user's messages and the working
+/// set carry over verbatim, so nothing they said or did is lost, and the
+/// summary never contradicts a raw tail.
+pub fn manual_split(history: &[Value]) -> Option<usize> {
+    (history.len() >= 2).then_some(history.len())
+}
+
+/// The user's messages from a span of history, verbatim, newest kept when
+/// they exceed `max_chars`. Compaction carries these over untouched.
+pub fn user_messages(history: &[Value], max_chars: usize) -> String {
+    let mut picked: Vec<&str> = Vec::new();
+    let mut used = 0;
+    for m in history.iter().rev().filter(|m| m["role"] == "user") {
+        let Some(text) = m["content"].as_str() else { continue };
+        if text.starts_with("[Summary of the conversation so far]") {
+            // Already-carried messages live inside the previous summary block.
+            if let Some((_, kept)) = text.split_once(USER_MESSAGES_HEADER) {
+                picked.push(kept.trim());
+            }
+            break;
+        }
+        let text = crate::ui::truncate(text, 2_000);
+        if used + text.len() > max_chars {
+            break;
+        }
+        used += text.len();
+        picked.push(text);
+    }
+    picked.reverse();
+    picked.join("\n---\n")
+}
+
+pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
+
+/// Splits a compaction reply into the summary and `MEMORY kind: text` lines.
+pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
+    let mut summary = String::new();
+    let mut memories = Vec::new();
+    for line in reply.lines() {
+        let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
+        if let Some(rest) = trimmed.strip_prefix("MEMORY ") {
+            if let Some((kind, text)) = rest.split_once(':') {
+                memories.push((kind.trim().to_lowercase(), text.trim().to_string()));
+                continue;
+            }
+        }
+        summary.push_str(line);
+        summary.push('\n');
+    }
+    (summary.trim().to_string(), memories)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elides_only_old_large_outputs() {
+        let mut h: Vec<Value> = (0..12).map(|i| json!({"role": "tool", "content": "x".repeat(3000 + i)})).collect();
+        let saved = elide_old_tool_outputs(&mut h);
+        assert!(saved > 0);
+        assert!(h[0]["content"].as_str().unwrap().contains(ELIDED_MARK));
+        assert!(!h[11]["content"].as_str().unwrap().contains(ELIDED_MARK));
+        assert_eq!(elide_old_tool_outputs(&mut h), 0, "second pass is a no-op");
+    }
+
+    #[test]
+    fn split_lands_on_user_message() {
+        let mut h = Vec::new();
+        for i in 0..10 {
+            h.push(json!({"role": "user", "content": format!("q{i} {}", "y".repeat(400))}));
+            h.push(json!({"role": "assistant", "content": "a".repeat(400)}));
+        }
+        let s = compaction_split(&h).unwrap();
+        assert_ne!(h[s]["role"], "tool");
+        assert!(s > 0 && s < h.len());
+    }
+
+    #[test]
+    fn single_long_turn_is_compactable() {
+        let mut h = vec![json!({"role": "user", "content": "do the thing"})];
+        for i in 0..10 {
+            h.push(json!({"role": "assistant", "content": "", "tool_calls": [{"id": format!("c{i}"), "function": {"arguments": "{}"}}]}));
+            h.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "z".repeat(2000)}));
+        }
+        let s = compaction_split(&h).unwrap();
+        assert_eq!(h[s]["role"], "assistant");
+        assert_eq!(h[s - 1]["role"], "tool");
+    }
+
+    #[test]
+    fn user_messages_survive_repeated_compaction() {
+        let first =
+            vec![json!({"role": "user", "content": "fix the parser"}), json!({"role": "assistant", "content": "ok"})];
+        let carried = user_messages(&first, 8000);
+        let second = vec![
+            json!({"role": "user", "content": format!("[Summary of the conversation so far]\nstuff\n\n{USER_MESSAGES_HEADER}\n{carried}")}),
+            json!({"role": "user", "content": "also add tests"}),
+        ];
+        let again = user_messages(&second, 8000);
+        assert!(again.contains("fix the parser") && again.contains("also add tests"));
+    }
+
+    #[test]
+    fn working_set_tracks_files_commands_and_errors() {
+        let call = |id: &str, name: &str, args: Value| json!({"role": "assistant", "content": "", "tool_calls": [{"id": id, "function": {"name": name, "arguments": args.to_string()}}]});
+        let res = |id: &str, out: &str| json!({"role": "tool", "tool_call_id": id, "content": out});
+        let h = vec![
+            json!({"role": "user", "content": "go"}),
+            call("1", "read_file", json!({"path": "src/a.rs"})),
+            res("1", "1\tfn a()"),
+            call("2", "edit_file", json!({"path": "src/a.rs"})),
+            res("2", "edited src/a.rs (1 replacement)"),
+            call("3", "bash", json!({"command": "cargo test"})),
+            res("3", "exit code: 101\nstdout:\ntest a ... FAILED"),
+            call("4", "edit_file", json!({"path": "src/missing.rs"})),
+            res("4", "error: cannot read src/missing.rs"),
+        ];
+        let ws = working_set(&h);
+        assert!(ws.contains("- changed: src/a.rs\n"), "{ws}");
+        assert!(!ws.contains("missing.rs"), "failed edits are not changes");
+        assert!(ws.contains("read recently: src/a.rs"));
+        assert!(ws.contains("`cargo test` → 101"));
+        assert!(ws.contains("last unresolved error") && ws.contains("FAILED"));
+        // A later compaction keeps the files an earlier one recorded.
+        let again = vec![json!({"role": "user", "content": format!("[Summary]\nx\n\n{WORKING_SET_HEADER}\n{ws}")})];
+        assert!(working_set(&again).contains("- changed: src/a.rs"));
+    }
+
+    #[test]
+    fn manual_split_takes_everything() {
+        let h = vec![
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "assistant", "content": "b"}),
+            json!({"role": "user", "content": "c"}),
+            json!({"role": "assistant", "content": "d"}),
+        ];
+        assert_eq!(manual_split(&h), Some(4));
+        assert_eq!(manual_split(&h[..1]), None);
+        assert!(compact_prompt(Some("the auth bug")).contains("focus on: the auth bug"));
+        assert_eq!(compact_prompt(Some("  ")), compact_prompt(None));
+    }
+
+    #[test]
+    fn parses_memories_out_of_summary() {
+        let (s, m) = parse_compaction("1. Task: fix it\nMEMORY gotcha: tests need DB\n- MEMORY fact: use make\n");
+        assert_eq!(s, "1. Task: fix it");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].0, "gotcha");
+    }
+}
