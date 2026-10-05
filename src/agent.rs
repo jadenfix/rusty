@@ -254,7 +254,7 @@ impl Agent {
             std::env::consts::ARCH,
             self.policy.mode.name()
         ));
-        s.push_str(&self.infra.target.prompt_block());
+        s.push_str(&self.infra.target.prompt_block(self.execution_mode == ExecutionMode::Careful));
         if !self.project_notes.is_empty() {
             s.push_str("\nProject instructions:\n");
             s.push_str(&self.project_notes);
@@ -607,6 +607,9 @@ impl Agent {
             Ok(t) => (t, true),
             Err(e) => (format!("error: {e:#}"), false),
         };
+        if ok && matches!(call.name.as_str(), "write_file" | "edit_file") {
+            self.infra.invalidate(args["path"].as_str().unwrap_or(""));
+        }
         // Secrets never reach the model, the screen or the session file.
         let (mut text, redacted) = infra::redact(&text);
         if redacted > 0 {
@@ -693,6 +696,12 @@ impl Agent {
     fn run_bash(&mut self, args: &Value, d: &mut Display) -> Result<String> {
         let cmd = args["command"].as_str().unwrap_or("").to_string();
         let Some(action) = infra::inspect(&cmd) else { return tools::execute("bash", args) };
+        if self.execution_mode == ExecutionMode::Careful {
+            if let Some(refusal) = self.infra.gate(&action) {
+                self.infra.record_refusal("careful", &cmd, "blocked", "needs a dry run first");
+                return Ok(refusal);
+            }
+        }
         let mut snapshot = None;
         let mut note = String::new();
         if action.mutating && !action.snapshots.is_empty() {
@@ -713,6 +722,7 @@ impl Agent {
         let started = Instant::now();
         let mut out = tools::execute("bash", args)?;
         let (outcome, exit) = infra::outcome(&out);
+        self.infra.saw_dry_run(&action, exit);
         if let Some(path) = &snapshot {
             out.push_str(&format!(
                 "\n[pre-change snapshot of the previous state: {path}. Rollback: {}]",

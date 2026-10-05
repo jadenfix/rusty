@@ -89,7 +89,7 @@ impl Target {
     }
 
     /// The block the model sees. Short: it is paid for on every step.
-    pub fn prompt_block(&self) -> String {
+    pub fn prompt_block(&self, careful: bool) -> String {
         if self.is_empty() {
             return String::new();
         }
@@ -100,9 +100,17 @@ impl Target {
         s.push_str(
             " Commands run against exactly these unless they pass --context, --profile or similar; name the \
              target before any change, and never change one the user has not confirmed. Diff or plan before \
-             you apply (kubectl diff or --dry-run=server, helm diff, terraform plan -out=FILE then apply FILE). \
-             Never add --force, --prune or -auto-approve unless the user asked for exactly that.\n",
+             you apply (kubectl diff or --dry-run=server, helm diff or --dry-run, terraform plan -out=FILE then \
+             apply FILE). Never add --force, --prune or -auto-approve unless the user asked for exactly that. \
+             rusty snapshots what a change touches before it runs and tells you the rollback path.",
         );
+        if careful {
+            s.push_str(
+                " Careful mode refuses an apply whose dry run has not run in this session against the same files \
+                 and target, and runs it again if a file was edited since.",
+            );
+        }
+        s.push('\n');
         s
     }
 }
@@ -486,6 +494,8 @@ pub struct Action {
     pub snapshots: Vec<(String, String)>,
     /// How to undo the change from the snapshot, for the model and the record.
     pub rollback: String,
+    /// The dry run careful mode wants to have seen first, if one exists.
+    pub dry_run_hint: String,
 }
 
 /// Tools whose commands are worth an audit line even when rusty does not
@@ -534,8 +544,8 @@ pub fn inspect(cmd: &str) -> Option<Action> {
         let (first, rest) = ws.split_first()?;
         let bin = first.rsplit('/').next().unwrap_or(first);
         match bin {
-            "kubectl" | "oc" => Some(kubectl_action(bin, rest)),
-            "helm" => Some(helm_action(rest)),
+            "kubectl" | "oc" => Some(kubectl_action(bin, rest, seg)),
+            "helm" => Some(helm_action(rest, seg)),
             "terraform" | "tofu" => Some(terraform_action(bin, rest)),
             _ if INFRA_CLIS.contains(&bin) => Some(generic_action(bin, rest)),
             _ => None,
@@ -681,7 +691,7 @@ const KUBECTL_MUTATING: &[&str] = &[
     "cp",
 ];
 
-fn kubectl_action(bin: &str, args: &[&str]) -> Action {
+fn kubectl_action(bin: &str, args: &[&str], seg: &str) -> Action {
     let p = parse(args, KUBECTL_VALUE_FLAGS);
     let verb = p.positionals.first().cloned().unwrap_or_default();
     let mut files: Vec<String> = p.files.iter().chain(&p.kustomize).cloned().collect();
@@ -711,7 +721,20 @@ fn kubectl_action(bin: &str, args: &[&str]) -> Action {
             rollback = format!("{bin} apply -f SNAPSHOT/rollback.yaml{flags}");
         }
     }
-    Action { tool: bin.into(), verb, mutating, dry_run, signature, files, snapshots, rollback }
+    // Applying files is the one kubectl change with a real dry run.
+    let dry_run_hint = match verb.as_str() {
+        "apply" | "create" | "replace" if mutating && !p.files.is_empty() && p.files.iter().all(|f| f != "-") => {
+            format!("{} --dry-run=server", seg.trim())
+        }
+        "apply" | "create" | "replace" if mutating && !p.kustomize.is_empty() => {
+            format!("{} --dry-run=server", seg.trim())
+        }
+        "apply" | "create" | "replace" if mutating => {
+            "write the manifest to a file and diff that file; careful mode does not apply from stdin".into()
+        }
+        _ => String::new(),
+    };
+    Action { tool: bin.into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint }
 }
 
 /// What a kubectl change is about, as `get` arguments: the files it applies,
@@ -773,7 +796,7 @@ const HELM_VALUE_FLAGS: &[&str] = &[
     "--revision",
 ];
 
-fn helm_action(args: &[&str]) -> Action {
+fn helm_action(args: &[&str], seg: &str) -> Action {
     let p = parse(args, HELM_VALUE_FLAGS);
     let verb = p.positionals.first().cloned().unwrap_or_default();
     // `helm diff upgrade R C` and `helm template R C` line up with `helm upgrade R C`.
@@ -802,7 +825,12 @@ fn helm_action(args: &[&str]) -> Action {
         snapshots.push(("manifest.yaml".into(), format!("helm get manifest {r}{flags}")));
         rollback = format!("helm rollback {r}{flags} (previous values in SNAPSHOT/values.yaml)");
     }
-    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files, snapshots, rollback }
+    let dry_run_hint = if mutating && matches!(verb.as_str(), "upgrade" | "install") {
+        format!("{} --dry-run (or helm diff upgrade … if the plugin is installed)", seg.trim())
+    } else {
+        String::new()
+    };
+    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint }
 }
 
 const TERRAFORM_VALUE_FLAGS: &[&str] =
@@ -834,13 +862,23 @@ fn terraform_action(bin: &str, args: &[&str]) -> Action {
     };
     let mut snapshots = Vec::new();
     let mut rollback = String::new();
+    let chdir_flag = if chdir.is_empty() { String::new() } else { format!(" -chdir={}", quote(&chdir)) };
     if mutating {
-        let chdir_flag = if chdir.is_empty() { String::new() } else { format!(" -chdir={}", quote(&chdir)) };
         snapshots.push(("terraform.tfstate".into(), format!("{bin}{chdir_flag} state pull")));
         rollback = "re-apply the previous code revision; SNAPSHOT/terraform.tfstate is the state before the change \
                     (terraform state push restores state only, not the real resources)"
             .into();
     }
+    let dry_run_hint = match verb.as_str() {
+        "apply" if plan_file.is_some() => format!("{bin}{chdir_flag} plan -out={}", plan_file.as_deref().unwrap_or("")),
+        "apply" => {
+            format!("{bin}{chdir_flag} plan -out=rusty.tfplan, read it, then {bin}{chdir_flag} apply rusty.tfplan")
+        }
+        "destroy" => format!(
+            "{bin}{chdir_flag} plan -destroy -out=rusty.tfplan, read it, then {bin}{chdir_flag} apply rusty.tfplan"
+        ),
+        _ => String::new(),
+    };
     Action {
         tool: bin.into(),
         verb,
@@ -850,6 +888,7 @@ fn terraform_action(bin: &str, args: &[&str]) -> Action {
         files: plan_file.into_iter().collect(),
         snapshots,
         rollback,
+        dry_run_hint,
     }
 }
 
@@ -957,17 +996,69 @@ pub struct Record {
     pub note: String,
 }
 
-/// Per-session harness state: the target, where the audit log lives, and
-/// this session's records.
+/// Per-session harness state: the target, where the audit log lives, the
+/// dry runs seen so far and this session's records.
 #[derive(Default)]
 pub struct Harness {
     pub target: Target,
     /// The project's rusty directory; None means nothing is written.
     pub dir: Option<PathBuf>,
     pub records: Vec<Record>,
+    /// Dry runs that have run this session: (signature, files they depend on).
+    dry_runs: Vec<(String, Vec<String>)>,
 }
 
 impl Harness {
+    /// Remembers a dry run that completed, so the matching change may run.
+    pub fn saw_dry_run(&mut self, action: &Action, exit: Option<i32>) {
+        let completed = match action.tool.as_str() {
+            // diff exits 1 when there are differences; plan exits 2 with -detailed-exitcode.
+            "kubectl" | "oc" => matches!(exit, Some(0 | 1)),
+            "terraform" | "tofu" => matches!(exit, Some(0 | 2)),
+            _ => exit == Some(0),
+        };
+        if action.dry_run && completed && !action.signature.is_empty() {
+            self.dry_runs.retain(|(sig, _)| *sig != action.signature);
+            self.dry_runs.push((action.signature.clone(), action.files.clone()));
+        }
+    }
+
+    /// Editing a file a dry run depended on makes that dry run stale.
+    pub fn invalidate(&mut self, path: &str) {
+        let p = path.trim_start_matches("./");
+        self.dry_runs.retain(|(_, files)| {
+            !files.iter().any(|f| {
+                let f = f.trim_start_matches("./").trim_end_matches('/');
+                p == f || p.starts_with(&format!("{f}/"))
+            })
+        });
+    }
+
+    /// In careful mode a change that has a dry run must have run it first,
+    /// in this session, against the same files and target. Returns the
+    /// refusal to hand the model, or None to let the change run.
+    pub fn gate(&self, action: &Action) -> Option<String> {
+        if !action.mutating || action.dry_run_hint.is_empty() {
+            return None;
+        }
+        if !action.signature.is_empty() && self.dry_runs.iter().any(|(sig, _)| *sig == action.signature) {
+            return None;
+        }
+        let why = if action.signature.is_empty() {
+            "it has no reviewable dry run".to_string()
+        } else if self.records.iter().any(|r| r.action.dry_run && r.action.signature == action.signature) {
+            "its dry run is stale: a file it depends on was edited since".to_string()
+        } else {
+            "no diff or plan for it has run in this session".to_string()
+        };
+        Some(format!(
+            "blocked by careful mode: {why}. Run `{}` first, read the result, then run the change again. This is \
+             the harness, not a permission: it cannot be approved, and piping or splitting the command does not \
+             change it.",
+            action.dry_run_hint
+        ))
+    }
+
     pub fn audit_path(&self) -> Option<PathBuf> {
         self.dir.as_ref().map(|d| d.join("audit.jsonl"))
     }
@@ -1448,6 +1539,39 @@ mod tests {
     }
 
     #[test]
+    fn careful_gate_wants_a_fresh_dry_run() {
+        let mut h = Harness::default();
+        let apply = act("kubectl apply -f deploy.yaml -n payments");
+        assert!(h.gate(&apply).unwrap().contains("no diff or plan"));
+        assert!(h.gate(&act("kubectl scale deploy/api --replicas=2")).is_none(), "scale has no dry run to insist on");
+        assert!(h.gate(&act("kubectl get pods")).is_none());
+        h.saw_dry_run(&act("kubectl diff -f deploy.yaml -n payments"), Some(1));
+        assert!(h.gate(&apply).is_none(), "a diff with differences counts");
+        assert!(
+            h.gate(&act("kubectl apply -f deploy.yaml -n staging")).is_some(),
+            "a different namespace is a different change"
+        );
+        h.invalidate("./deploy.yaml");
+        assert!(h.gate(&apply).is_some(), "editing the file makes the diff stale");
+        h.saw_dry_run(&act("kubectl diff -f deploy.yaml -n payments"), Some(2));
+        assert!(h.gate(&apply).is_some(), "a diff that errored does not count");
+        assert!(h.gate(&act("kubectl apply -f -")).unwrap().contains("stdin"));
+        let tf = act("terraform apply rusty.tfplan");
+        assert!(h.gate(&tf).is_some());
+        assert!(h.gate(&act("terraform apply")).unwrap().contains("plan -out=rusty.tfplan"));
+        assert!(h.gate(&act("terraform destroy")).unwrap().contains("plan -destroy"));
+        h.saw_dry_run(&act("terraform plan -out=rusty.tfplan"), Some(2));
+        assert!(h.gate(&tf).is_none());
+        assert!(h.gate(&act("terraform apply other.tfplan")).is_some());
+        let helm = act("helm upgrade api ./chart -f values.yaml -n payments");
+        assert!(h.gate(&helm).unwrap().contains("--dry-run"));
+        h.saw_dry_run(&act("helm diff upgrade api ./chart -f values.yaml -n payments"), Some(0));
+        assert!(h.gate(&helm).is_none());
+        h.invalidate("chart/templates/deploy.yaml");
+        assert!(h.gate(&helm).is_some(), "editing the chart makes the diff stale");
+    }
+
+    #[test]
     fn change_record_and_clock() {
         assert_eq!(clock(3_661), "01:01");
         assert_eq!(day(1_759_622_400), "10-05");
@@ -1510,8 +1634,9 @@ mod tests {
             t.summary(),
             "kube prod-eu/payments · aws ops (123456789012) · terraform prod (s3 tf-state) · git main"
         );
-        assert!(t.prompt_block().contains("PRODUCTION"));
-        assert!(Target::default().prompt_block().is_empty());
+        assert!(t.prompt_block(false).contains("PRODUCTION"));
+        assert!(t.prompt_block(true).contains("refuses an apply") && !t.prompt_block(false).contains("refuses"));
+        assert!(Target::default().prompt_block(true).is_empty());
     }
 
     #[test]

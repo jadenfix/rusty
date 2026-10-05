@@ -282,7 +282,8 @@ impl Display {
             return;
         }
         let first = text.lines().next().unwrap_or("");
-        if !ok || first.starts_with("denied") || first.starts_with("the user declined") {
+        if !ok || first.starts_with("denied") || first.starts_with("the user declined") || first.starts_with("blocked")
+        {
             self.line(&format!("  {} {}", ui::err("└"), ui::err(ui::truncate(first, 160))));
             return;
         }

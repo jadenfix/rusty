@@ -461,6 +461,67 @@ fn a_change_is_snapshotted_before_it_runs() {
     assert!(out.contains("snapshot ") && out.contains("nothing to snapshot"), "{out}");
 }
 
+#[test]
+fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
+    let s = Sandbox::new("gate");
+    s.fake("kubectl", "case \"$*\" in diff*) printf 'diff'; exit 1;; apply*) printf 'configured\\n';; esac");
+    s.fake("terraform", "case \"$*\" in plan*) touch rusty.tfplan;; esac; printf 'ok\\n'");
+    std::fs::write(s.project.join("deploy.yaml"), "replicas: 1\n").unwrap();
+    let (out, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "careful", "deploy"],
+        vec![
+            bash_reply("kubectl apply -f deploy.yaml"),
+            bash_reply("kubectl diff -f deploy.yaml"),
+            bash_reply("kubectl apply -f deploy.yaml"),
+            tool_reply("edit_file", serde_json::json!({"path": "deploy.yaml", "old_string": "1", "new_string": "2"})),
+            bash_reply("kubectl apply -f deploy.yaml"),
+            bash_reply("terraform apply"),
+            bash_reply("terraform plan -out=rusty.tfplan"),
+            bash_reply("terraform apply rusty.tfplan"),
+            text_reply("done"),
+            text_reply("done"),
+            text_reply("done"),
+        ],
+    );
+    let log = s.calls();
+    let calls: Vec<&str> = log.lines().filter(|l| !l.contains("config view")).collect();
+    assert_eq!(
+        calls,
+        [
+            "kubectl diff -f deploy.yaml",
+            "kubectl get -f deploy.yaml -o yaml --ignore-not-found",
+            "kubectl apply -f deploy.yaml",
+            "terraform plan -out=rusty.tfplan",
+            "terraform state pull",
+            "terraform apply rusty.tfplan",
+        ],
+        "blocked commands must never reach the tool"
+    );
+    let result = |i: usize| requests[i]["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(
+        result(1).contains("blocked by careful mode: no diff or plan") && result(1).contains("--dry-run=server"),
+        "{}",
+        result(1)
+    );
+    assert!(result(3).contains("exit code: 0"), "{}", result(3));
+    assert!(result(5).contains("stale"), "{}", result(5));
+    assert!(result(6).contains("plan -out=rusty.tfplan"), "{}", result(6));
+    assert!(out.contains("blocked by careful mode"), "{out}");
+    assert!(out.contains("change record · 5 changes"), "{out}");
+    assert!(out.matches("blocked").count() >= 3, "{out}");
+    // Standard mode only advises; it does not refuse.
+    let s2 = Sandbox::new("gate-standard");
+    s2.fake("kubectl", "printf 'configured\\n'");
+    std::fs::write(s2.project.join("deploy.yaml"), "replicas: 1\n").unwrap();
+    scripted_run(
+        &s2,
+        &["--yolo", "--mode", "standard", "deploy"],
+        vec![bash_reply("kubectl apply -f deploy.yaml"), text_reply("done")],
+    );
+    assert!(s2.calls().contains("kubectl apply -f deploy.yaml"));
+}
+
 fn find_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();
