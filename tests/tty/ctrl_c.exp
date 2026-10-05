@@ -3,18 +3,22 @@
 #   2. the next turn still works
 #   3. Ctrl-C twice at an empty prompt quits
 # Usage: expect tests/tty/ctrl_c.exp /path/to/rusty
+# Exit 0 pass, 1 fail, 2 inconclusive (the model finished before the keypress).
 set timeout 90
 set bin [lindex $argv 0]
 spawn -noecho $bin --yolo
 proc ready {} { expect -re {\?2004h}; sleep 0.4 }
 ready
-send -- "count from one to three thousand in words, one per line, no tools\r"
-expect -re {[A-Z][a-z]+(ing)?[^\n]*…}
-sleep 3
+send -- "Write a 1500 word essay on the history of Unix, in plain prose. Do not use any tools.\r"
+# Match the spinner's ellipsis literally: a regex over hundreds of \r-separated
+# frames is slow enough to delay the keypress past the end of the turn.
+expect -ex "…"
+expect -timeout 2 -ex "NEVER_MATCHES"
 set t0 [clock milliseconds]
 send "\x03"
 expect {
-  -re {stopped} { set ms [expr {[clock milliseconds] - $t0}] }
+  -ex "stopped" { set ms [expr {[clock milliseconds] - $t0}] }
+  -ex "✓ " { puts "\nINCONCLUSIVE: the turn finished before ctrl-c"; exit 2 }
   timeout { puts "\nFAIL: ctrl-c did not stop the turn"; exit 1 }
 }
 if {$ms > 2000} { puts "\nFAIL: took ${ms}ms to stop"; exit 1 }
@@ -26,7 +30,7 @@ expect {
 }
 ready
 send "\x03"
-expect -re {again to quit}
+expect -ex "again to quit"
 send "\x03"
 expect eof
 puts "\nPASS: stopped in ${ms}ms, recovered, quit on double ctrl-c"
