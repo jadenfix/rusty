@@ -200,12 +200,6 @@ impl Agent {
                 self.agents.swarm_max
             )),
         }
-        if display::view() == View::Adhd {
-            s.push_str(
-                "\nThe user is in focus mode. Keep every reply very short: open with the bottom line in one \
-                 sentence, then at most three short bullets. No preamble, no recap of what you did step by step.\n",
-            );
-        }
         s.push_str(&format!(
             "\nEnvironment: {} {}, commands run with bash in the project directory. Permission mode: {}.\n",
             std::env::consts::OS,
@@ -230,6 +224,14 @@ impl Agent {
             for p in &self.plan {
                 s.push_str(&format!("- [{}] {}\n", p.status, p.text));
             }
+        }
+        if display::view() == View::Adhd {
+            // Last in the prompt, where it carries the most weight.
+            s.push_str(
+                "\nFOCUS MODE. Your final reply must be at most 40 words: one bolded bottom-line sentence, then \
+                 at most three bullets of a few words each. No preamble, no step-by-step recap, no caveats \
+                 unless something failed.\n",
+            );
         }
         (s, ids)
     }
