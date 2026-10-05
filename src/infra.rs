@@ -496,6 +496,30 @@ pub struct Action {
     pub rollback: String,
     /// The dry run careful mode wants to have seen first, if one exists.
     pub dry_run_hint: String,
+    /// How to prove the change landed healthy, run after it in careful mode.
+    pub verify: Verify,
+}
+
+/// A check that a change finished: rollouts for Kubernetes workloads, the
+/// release status for helm, an empty plan for terraform.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Verify {
+    #[default]
+    None,
+    Kube {
+        /// A `get ... -o name` that lists the objects the change touched.
+        list: Option<String>,
+        /// Workloads named on the command line.
+        objects: Vec<String>,
+        flags: String,
+    },
+    Helm {
+        release: String,
+        flags: String,
+    },
+    Terraform {
+        chdir_flag: String,
+    },
 }
 
 /// Tools whose commands are worth an audit line even when rusty does not
@@ -714,11 +738,22 @@ fn kubectl_action(bin: &str, args: &[&str], seg: &str) -> Action {
     let flags = kube_flags(&p);
     let mut snapshots = Vec::new();
     let mut rollback = String::new();
+    let mut verify = Verify::None;
+    let skip = if sub.is_empty() { 1 } else { 2 };
     if mutating && !matches!(verb.as_str(), "exec" | "cp" | "run" | "expose" | "autoscale") {
-        let subject = kube_subject(&p, if sub.is_empty() { 1 } else { 2 });
+        let subject = kube_subject(&p, skip);
         if !subject.is_empty() {
             snapshots.push(("before.yaml".into(), format!("{bin} get {subject} -o yaml --ignore-not-found{flags}")));
             rollback = format!("{bin} apply -f SNAPSHOT/rollback.yaml{flags}");
+        }
+        // Deletes have nothing to roll out; everything else waits for its workloads.
+        if verb != "delete" && !matches!(verb.as_str(), "rollout pause" | "cordon" | "uncordon" | "drain" | "taint") {
+            let list =
+                (!p.files.is_empty() || !p.kustomize.is_empty()).then(|| format!("{bin} get {subject} -o name{flags}"));
+            let objects = if list.is_some() { Vec::new() } else { kube_workloads(&p, skip) };
+            if list.is_some() || !objects.is_empty() {
+                verify = Verify::Kube { list, objects, flags: flags.clone() };
+            }
         }
     }
     // Applying files is the one kubectl change with a real dry run.
@@ -734,7 +769,38 @@ fn kubectl_action(bin: &str, args: &[&str], seg: &str) -> Action {
         }
         _ => String::new(),
     };
-    Action { tool: bin.into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint }
+    Action { tool: bin.into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint, verify }
+}
+
+/// The workloads a command names, as `TYPE/NAME`, from `TYPE/NAME` or
+/// `TYPE NAME...` after the verb.
+fn kube_workloads(p: &Parsed, skip: usize) -> Vec<String> {
+    let resources: Vec<&String> = p.positionals.iter().skip(skip).take_while(|w| !w.contains('=')).collect();
+    let objects: Vec<String> = match resources.split_first() {
+        Some((first, rest)) if first.contains('/') => {
+            resources.iter().map(|r| r.to_string()).filter(|_| rest.len() < usize::MAX).collect()
+        }
+        Some((kind, names)) if !names.is_empty() => names.iter().map(|n| format!("{kind}/{n}")).collect(),
+        _ => Vec::new(),
+    };
+    objects.into_iter().filter(|o| is_workload(o)).collect()
+}
+
+/// `deployment.apps/api`, `deploy/api`, `sts/db`, `daemonset/node-exporter`.
+fn is_workload(object: &str) -> bool {
+    let kind = object.split('/').next().unwrap_or("").split('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        kind.as_str(),
+        "deploy"
+            | "deployment"
+            | "deployments"
+            | "sts"
+            | "statefulset"
+            | "statefulsets"
+            | "ds"
+            | "daemonset"
+            | "daemonsets"
+    )
 }
 
 /// What a kubectl change is about, as `get` arguments: the files it applies,
@@ -830,7 +896,12 @@ fn helm_action(args: &[&str], seg: &str) -> Action {
     } else {
         String::new()
     };
-    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint }
+    let verify = if mutating && !release.is_empty() && matches!(verb.as_str(), "upgrade" | "install" | "rollback") {
+        Verify::Helm { release: quote(&release), flags: flags.clone() }
+    } else {
+        Verify::None
+    };
+    Action { tool: "helm".into(), verb, mutating, dry_run, signature, files, snapshots, rollback, dry_run_hint, verify }
 }
 
 const TERRAFORM_VALUE_FLAGS: &[&str] =
@@ -879,6 +950,8 @@ fn terraform_action(bin: &str, args: &[&str]) -> Action {
         ),
         _ => String::new(),
     };
+    let verify =
+        if verb == "apply" { Verify::Terraform { chdir_flag: format!("{bin}{chdir_flag}") } } else { Verify::None };
     Action {
         tool: bin.into(),
         verb,
@@ -889,6 +962,7 @@ fn terraform_action(bin: &str, args: &[&str]) -> Action {
         snapshots,
         rollback,
         dry_run_hint,
+        verify,
     }
 }
 
@@ -1120,6 +1194,79 @@ impl Harness {
         Ok(path)
     }
 
+    /// Proves a change landed: waits for every workload it touched to roll
+    /// out, checks the helm release status, or runs a post-apply plan that
+    /// must be empty. Returns (healthy, what was checked).
+    pub fn verify(&self, action: &Action) -> (bool, String) {
+        let timeout = rollout_timeout();
+        let limit = Duration::from_secs(timeout + 30);
+        let run = |cmd: &str| match crate::tools::run(cmd, limit) {
+            Ok((Some(Some(code)), out, err)) => (Some(code), format!("{out}{err}")),
+            Ok((_, out, err)) => (None, format!("{out}{err}timed out after {}s", limit.as_secs())),
+            Err(e) => (None, e.to_string()),
+        };
+        let tail = |text: &str| text.trim().lines().last().unwrap_or("").trim().to_string();
+        match &action.verify {
+            Verify::None => (true, "nothing to verify for this command".into()),
+            Verify::Kube { list, objects, flags } => {
+                let mut objects = objects.clone();
+                let mut notes = Vec::new();
+                if let Some(list) = list {
+                    let (code, out) = run(list);
+                    if code != Some(0) {
+                        return (false, format!("could not list the objects: {}", tail(&out)));
+                    }
+                    let all: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                    objects.extend(all.iter().filter(|o| is_workload(o)).map(|o| o.to_string()));
+                    if objects.is_empty() {
+                        return (true, format!("{} present, no workloads to roll out", all.join(", ")));
+                    }
+                }
+                let tool = action.tool.as_str();
+                let mut healthy = true;
+                for o in &objects {
+                    let (code, out) = run(&format!("{tool} rollout status {o} --timeout={timeout}s{flags}"));
+                    healthy &= code == Some(0);
+                    notes.push(format!("{o}: {}", tail(&out)));
+                }
+                (healthy, notes.join("; "))
+            }
+            Verify::Helm { release, flags } => {
+                let (code, out) = run(&format!("helm status {release}{flags}"));
+                let status = out.lines().find_map(|l| l.strip_prefix("STATUS: ")).unwrap_or("").trim().to_string();
+                if code != Some(0) || status != "deployed" {
+                    return (
+                        false,
+                        format!("helm status {release}: {}", if status.is_empty() { tail(&out) } else { status }),
+                    );
+                }
+                let (code, out) =
+                    run(&format!("helm get manifest {release}{flags} | {} get -f - -o name{flags}", "kubectl"));
+                let workloads: Vec<String> =
+                    out.lines().map(str::trim).filter(|o| is_workload(o)).map(String::from).collect();
+                if code != Some(0) || workloads.is_empty() {
+                    return (true, format!("release {release} deployed; no workloads to roll out"));
+                }
+                let mut healthy = true;
+                let mut notes = vec![format!("release {release} deployed")];
+                for o in &workloads {
+                    let (code, out) = run(&format!("kubectl rollout status {o} --timeout={timeout}s{flags}"));
+                    healthy &= code == Some(0);
+                    notes.push(format!("{o}: {}", tail(&out)));
+                }
+                (healthy, notes.join("; "))
+            }
+            Verify::Terraform { chdir_flag } => {
+                let (code, out) = run(&format!("{chdir_flag} plan -detailed-exitcode -input=false -no-color"));
+                match code {
+                    Some(0) => (true, "post-apply plan is empty: state matches the configuration".into()),
+                    Some(2) => (false, "post-apply plan still has changes: the apply did not converge".into()),
+                    _ => (false, format!("post-apply plan failed: {}", tail(&out))),
+                }
+            }
+        }
+    }
+
     /// Records a command that never ran, with why.
     pub fn record_refusal(&mut self, mode: &str, cmd: &str, outcome: &str, note: &str) {
         if let Some(action) = inspect(cmd) {
@@ -1245,8 +1392,13 @@ pub fn outcome(result: &str) -> (String, Option<i32>) {
     ("interrupted".into(), None)
 }
 
-/// How long one snapshot or verification command may take.
+/// How long one snapshot command may take.
 const SNAPSHOT_SECS: u64 = 60;
+
+/// How long to wait for one rollout. `RUSTY_ROLLOUT_TIMEOUT` overrides it.
+fn rollout_timeout() -> u64 {
+    std::env::var("RUSTY_ROLLOUT_TIMEOUT").ok().and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(180)
+}
 
 /// Drops the fields that make `kubectl get -o yaml` output unapplyable:
 /// resourceVersion, uid, creationTimestamp, generation, managedFields and
@@ -1473,6 +1625,41 @@ mod tests {
         );
         assert_eq!(snap("terraform -chdir=infra apply tf.plan"), ["terraform -chdir=infra state pull"]);
         assert_eq!(snap("terraform apply tf.plan"), ["terraform state pull"]);
+    }
+
+    #[test]
+    fn changes_know_how_to_verify_themselves() {
+        let v = |cmd: &str| act(cmd).verify;
+        assert_eq!(
+            v("kubectl apply -f d.yaml -n payments"),
+            Verify::Kube {
+                list: Some("kubectl get -f d.yaml -o name -n payments".into()),
+                objects: vec![],
+                flags: " -n payments".into()
+            }
+        );
+        assert_eq!(
+            v("kubectl set image deployment/api api=img:2"),
+            Verify::Kube { list: None, objects: vec!["deployment/api".into()], flags: String::new() }
+        );
+        assert_eq!(
+            v("kubectl scale deploy api web --replicas=2"),
+            Verify::Kube { list: None, objects: vec!["deploy/api".into(), "deploy/web".into()], flags: String::new() }
+        );
+        assert!(
+            matches!(v("kubectl rollout restart sts/db"), Verify::Kube { ref objects, .. } if objects == &["sts/db"])
+        );
+        assert_eq!(v("kubectl patch configmap cfg -p '{}'"), Verify::None, "a configmap has no rollout");
+        assert_eq!(v("kubectl delete deploy api"), Verify::None);
+        assert_eq!(v("kubectl get pods"), Verify::None);
+        assert_eq!(v("helm upgrade api ./c -n x"), Verify::Helm { release: "api".into(), flags: " -n x".into() });
+        assert_eq!(v("helm uninstall api"), Verify::None);
+        assert_eq!(
+            v("terraform -chdir=infra apply p.tfplan"),
+            Verify::Terraform { chdir_flag: "terraform -chdir=infra".into() }
+        );
+        assert_eq!(v("terraform import a.b c"), Verify::None);
+        assert!(is_workload("deployment.apps/api") && is_workload("ds/x") && !is_workload("service/api"));
     }
 
     #[test]

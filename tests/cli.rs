@@ -485,7 +485,11 @@ fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
         ],
     );
     let log = s.calls();
-    let calls: Vec<&str> = log.lines().filter(|l| !l.contains("config view")).collect();
+    // Leave out the target probe and careful mode's verification commands.
+    let calls: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.contains("config view") && !l.contains("-o name") && !l.contains("-detailed-exitcode"))
+        .collect();
     assert_eq!(
         calls,
         [
@@ -520,6 +524,64 @@ fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
         vec![bash_reply("kubectl apply -f deploy.yaml"), text_reply("done")],
     );
     assert!(s2.calls().contains("kubectl apply -f deploy.yaml"));
+}
+
+#[test]
+fn careful_mode_verifies_rollouts_after_a_change() {
+    let s = Sandbox::new("verify");
+    s.fake(
+        "kubectl",
+        "case \"$*\" in \
+         diff*) exit 1;; \
+         \"get -f deploy.yaml -o name\"*) printf 'deployment.apps/api\\nservice/api\\n';; \
+         \"rollout status deployment.apps/api\"*) printf 'deployment \"api\" successfully rolled out\\n';; \
+         \"rollout status deploy/web\"*) printf 'error: timed out waiting for the condition\\n' >&2; exit 1;; \
+         apply*|scale*) printf 'ok\\n';; esac",
+    );
+    s.fake("terraform", "case \"$*\" in plan*-detailed-exitcode*) printf 'No changes.\\n';; *) printf 'ok\\n';; esac");
+    std::fs::write(s.project.join("deploy.yaml"), "kind: Deployment\n").unwrap();
+    let (out, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "careful", "deploy"],
+        vec![
+            bash_reply("kubectl diff -f deploy.yaml"),
+            bash_reply("kubectl apply -f deploy.yaml"),
+            bash_reply("kubectl scale deploy/web --replicas=3"),
+            bash_reply("terraform plan -out=p.tfplan"),
+            bash_reply("terraform apply p.tfplan"),
+            text_reply("done"),
+            text_reply("done"),
+            text_reply("done"),
+        ],
+    );
+    let log = s.calls();
+    assert!(log.contains("kubectl rollout status deployment.apps/api --timeout=180s"), "{log}");
+    assert!(log.contains("kubectl rollout status deploy/web --timeout=180s"), "{log}");
+    assert!(log.contains("terraform plan -detailed-exitcode -input=false -no-color"), "{log}");
+    let result = |i: usize| requests[i]["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(
+        result(2).contains("[verified: deployment.apps/api: deployment \\\"api\\\" successfully rolled out]"),
+        "{}",
+        result(2)
+    );
+    assert!(
+        result(3).contains("verification FAILED: deploy/web: error: timed out") && result(3).contains("NOT healthy"),
+        "{}",
+        result(3)
+    );
+    assert!(result(5).contains("[verified: post-apply plan is empty"), "{}", result(5));
+    assert!(out.contains("✓ verified") && out.contains("✗ not verified"), "{out}");
+    assert!(out.contains("kubectl apply -f deploy.yaml") && out.contains("· verified"), "{out}");
+    assert!(out.contains("kubectl scale deploy/web") && out.contains("NOT verified"), "{out}");
+    // Standard mode does not wait.
+    let s2 = Sandbox::new("verify-standard");
+    s2.fake("kubectl", "printf 'ok\\n'");
+    scripted_run(
+        &s2,
+        &["--yolo", "--mode", "standard", "x"],
+        vec![bash_reply("kubectl scale deploy/web --replicas=3"), text_reply("done")],
+    );
+    assert!(!s2.calls().contains("rollout status"), "{}", s2.calls());
 }
 
 fn find_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {

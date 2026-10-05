@@ -723,6 +723,29 @@ impl Agent {
         let mut out = tools::execute("bash", args)?;
         let (outcome, exit) = infra::outcome(&out);
         self.infra.saw_dry_run(&action, exit);
+        // In careful mode a change is not done until it is seen to be healthy.
+        let mut verified = None;
+        if self.execution_mode == ExecutionMode::Careful
+            && action.mutating
+            && exit == Some(0)
+            && action.verify != infra::Verify::None
+        {
+            d.set_status("verifying the change".into());
+            d.tick();
+            let (ok, what) = self.infra.verify(&action);
+            d.set_status(String::new());
+            verified = Some(ok);
+            if ok {
+                d.line(&format!("  {} {}", ui::ok("✓ verified"), ui::dim(&what)));
+                out.push_str(&format!("\n[verified: {what}]"));
+            } else {
+                d.line(&format!("  {} {}", ui::err("✗ not verified"), ui::dim(&what)));
+                out.push_str(&format!(
+                    "\n[verification FAILED: {what}. The change is NOT healthy; do not report it as done. Look at \
+                     describe, events and logs before deciding whether to fix forward or roll back.]"
+                ));
+            }
+        }
         if let Some(path) = &snapshot {
             out.push_str(&format!(
                 "\n[pre-change snapshot of the previous state: {path}. Rollback: {}]",
@@ -736,6 +759,7 @@ impl Agent {
             exit,
             secs: started.elapsed().as_secs_f32(),
             snapshot,
+            verified,
             note,
             ..infra::empty_record()
         };
