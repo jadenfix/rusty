@@ -1,0 +1,78 @@
+# Design notes
+
+rusty is meant to be the coding agent you'd keep open all day: quick for small
+jobs, dependable over long ones, and honest about what it spends. This page
+explains why it's built the way it is.
+
+## What coding agents are good at today
+
+- **Local edits with fast feedback.** Read a file, change it, run the test,
+  fix the error. When the loop is short and the signal is clear, current
+  models are excellent.
+- **Finding things with terminal tools.** Most of the real progress in agents
+  came from treating the shell as the interface: `grep`, `rg`, `find`, `git`,
+  the build, the tests. These tools are fast and precise, and every model
+  already knows them.
+- **Reading unfamiliar code.** Given the right ten files, a model can explain a
+  system faster than most people.
+
+## Where they fall apart on long tasks
+
+| Failure | What it looks like | What rusty does |
+|---|---|---|
+| **Context rot** | After an hour the agent forgets a constraint you set at the start, or redoes finished work. | A fixed token budget per section. Old tool output gets trimmed first, since it can be re-read, and only then are older turns summarised. Your messages are carried through every compaction **word for word**, and the plan and goal are pinned outside history. |
+| **Lossy compaction** | The summary drops the task itself, and the agent asks "what would you like to do next?" | The same verbatim carry-over, plus compaction can cut mid-turn, so a single long autonomous turn can still be compacted (that bug is covered by a test). |
+| **Premature "done"** | It says it's finished without running anything. | Goal mode only ends through `goal_done`, which requires evidence. Every other ending means "keep going", up to a turn cap. |
+| **Doom loops** | The same failing command, eight times. | Repeated identical calls in one turn get a note telling the model to step back and change approach. |
+| **Amnesia** | Every session relearns how to run the tests. | Typed memories ranked by BM25 against each request and injected within a budget. Compaction also pulls lasting facts out of the turns it summarises. |
+| **Memory junk drawers** | A notes file that grows forever and gets pasted into every prompt. | Records, not a file. Near-duplicates merge, stale entries can be forgotten, and only the relevant few are injected. |
+| **Permission fatigue** | Prompts for `ls` train people to approve everything, and then something risky slips through. | A classifier: reads and normal build/test commands just run, and anything that deletes, leaves the project, rewrites history or touches the network asks. |
+| **Exploration flooding context** | Fifty file reads to answer one question. | `outline` and `glob` show structure without file bodies, and subagents and swarms explore in their own context and return only a report. |
+| **Invisible cost** | You find out what it spent when the bill arrives. | Per-turn recaps, `/tokens` broken down by model and by tool, per-request traces on disk, and tips based on what each turn actually spent. |
+| **Hard to interrupt** | Ctrl-C kills the process or does nothing until the stream ends. | Requests run on a background thread, so Ctrl-C stops a turn mid-stream (about 1 ms in tests). The transcript stays valid and the next turn works. |
+
+## First principles for tools
+
+An agent's tools should be the ones a strong engineer reaches for in a
+terminal, shaped so each call returns as little as possible while still
+answering the question.
+
+1. **Locate before you read.** `search` (ripgrep, smart case, per-file caps,
+   optional context lines and globs) answers "where", `glob` answers "which
+   files", and `outline` answers "what's in here" with signatures and line
+   numbers. Only then `read_file`, for a range.
+2. **Exact edits.** `edit_file` replaces one unique string. It fails loudly
+   when the match is ambiguous and never guesses.
+3. **The shell for everything else.** `bash` runs builds, tests, git and
+   one-off scripts, with a timeout, interrupt support and output capped
+   head-and-tail so the error at the end is never lost.
+4. **Every output is bounded.** Long results are capped and marked as
+   truncated, and old results shrink as the conversation grows.
+
+## Token allocation
+
+The window is split into allowances: system and project instructions,
+memory (3k chars), pinned plan and goal, a 16k reply reserve, and history.
+When history passes 60% of its share, old tool output shrinks. Past 80%, older
+turns are summarised. Measured token counts from the API are shown after every
+turn, so you always know where you stand.
+
+Delegation is also a token decision. A subagent spends its own context on
+exploration and hands back a page. A swarm does the same in parallel, with a
+fixed report budget split across its workers so a big swarm can't flood the
+main context. Both are off by default; `/agents auto` lets rusty pick the
+lightest option that works.
+
+## Things rusty deliberately doesn't do
+
+No telemetry. No auto-commits or pushes. No attribution trailers. No flattery.
+No giant system prompt. No silent truncation. No surprise token burn. No
+lock-in: any OpenAI-compatible endpoint works.
+
+## Next
+
+- Parallel tool calls within a single turn
+- Checkpoints and `/undo` built on git
+- MCP client support
+- A sandbox mode (container or seatbelt) for unattended runs
+- Retrieval over the repo for very large codebases
