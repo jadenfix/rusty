@@ -1548,3 +1548,28 @@ fn an_error_after_text_has_streamed_is_not_retried() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("overloaded"));
     assert_eq!(server.join().unwrap().len(), 1, "a retry would repeat text the user already saw");
 }
+
+#[test]
+fn announcing_completion_through_echo_is_redirected_then_stopped() {
+    let s = Sandbox::new("echo-wrapup");
+    let replies = (1..=5).map(|i| bash_reply(&format!("echo \"Task completed ({i}).\" && exit 0"))).collect();
+    let (url, server) = scripted_endpoint(replies);
+    let child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "fix it"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait(child, Duration::from_secs(30));
+    let requests = server.join().unwrap();
+    let last_tool = |r: &serde_json::Value| {
+        r["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"].to_string()
+    };
+    assert!(last_tool(&requests[1]).contains("plain reply with no tool call"), "{}", last_tool(&requests[1]));
+    assert_eq!(requests.len(), 5, "the fifth announcement ends the turn");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("five commands that only printed text"));
+}
