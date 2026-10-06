@@ -97,6 +97,18 @@ open(out, "a").write(json.dumps(row) + "\n")
 mark = {"pass": "✓", "fail": "✗", "timeout": "⧗", "infra": "⚠"}[verdict]
 print(f"{mark} {name:<18} {model[-24:]:<24} {verdict:<8} {int(secs):>4}s  {len(runs)} session(s)  {(tot['prompt'] + tot['completion']) / 1000:>5.0f}k tok  {' '.join(reason)[:80]}")
 PY
+  # A miss explains itself in the log: the end of the agent's transcript, what it
+  # changed, and the check's output (artifacts aren't always easy to fetch).
+  if [[ ${EVAL_TRANSCRIPTS:-1} == 1 && ( $verdict == fail || $verdict == timeout ) ]]; then
+    {
+      printf '::group::%s %s #%s: %s\n' "$name" "$model" "$rep" "$verdict"
+      echo "--- agent (last 60 lines)"; tail -n 60 "$home/stdout"
+      echo "--- changes"; diff -ruN --exclude='__pycache__' --exclude=target --exclude='*.json' "$dir/files" "$work" 2>/dev/null | head -n 120
+      echo "--- check"; tail -n 20 "$home/check"
+      echo "::endgroup::"
+    } > "$home/miss.txt" 2>&1
+    cat "$home/miss.txt"
+  fi
   rm -rf "$work" "$home"
 }
 
