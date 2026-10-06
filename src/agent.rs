@@ -326,6 +326,11 @@ impl Agent {
              Read a file before editing it.\n\
              - Make the smallest change that fully solves the task, in the project's existing style.\n\
              - Verify with a build, the tests, or by running the code. Never claim something works without evidence.\n\
+             - The tests you were given, or wrote, rarely cover everything the task states. Before you finish, \
+             check each stated rule directly with a quick run on inputs that hit its edges: boundaries and \
+             off-by-one counts, ties and ordering, empty input, every invariant the task says must always or \
+             never hold, and exact results (integer or decimal arithmetic when the answer must be exact, not \
+             floats).\n\
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n\
              - Save durable lessons with remember: build and test commands, conventions, traps, user preferences.\n\
              - If a tool call is denied, don't retry it. Find another way or ask.\n\
