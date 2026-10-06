@@ -12,11 +12,13 @@ RUN cargo build --release --locked && strip target/release/rusty target/release/
 FROM scratch AS bin
 COPY --from=build /src/target/release/rusty /rusty
 COPY --from=build /src/target/release/rusty-memoryd /rusty-memoryd
+COPY LICENSE THIRD_PARTY_NOTICES.txt /
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ripgrep ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/rusty /usr/local/bin/rusty
 COPY --from=build /src/target/release/rusty-memoryd /usr/local/bin/rusty-memoryd
+COPY LICENSE THIRD_PARTY_NOTICES.txt /usr/share/doc/rusty/
 WORKDIR /work
 ENTRYPOINT ["rusty"]
