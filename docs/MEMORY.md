@@ -179,8 +179,9 @@ The easy smoke defaults to NVIDIA-hosted Nemotron Super in `vibe` mode;
 use `--model` to qualify another model. This is
 separate from the normal CLI default and the deep advisor model.
 
-GitHub's `memory-live.yml` runs the six easy cases on pushes to main and this
-feature branch, or manually, using the repository `NVIDIA_API_KEY` secret. It
+GitHub's `memory-live.yml` runs the six easy cases only when manually dispatched,
+using the repository `NVIDIA_API_KEY` secret. Pushes and merges never start model
+calls automatically. It
 does not expose a secret to forked PRs. Deterministic checks run separately in
 `ci.yml`. This checks regression and overhead on small tasks, not FullStack-Bench
 performance or evidence that memory improves hard-task success. Establish that

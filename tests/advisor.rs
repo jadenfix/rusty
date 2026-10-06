@@ -239,3 +239,18 @@ fn terminal_interrupt_does_not_kill_autostarted_memory() {
         Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).arg("stop").output().unwrap();
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
 }
+
+#[test]
+fn failed_database_initialization_never_publishes_ready_socket() {
+    let root = PathBuf::from("/tmp").join(format!(
+        "rm-invalid-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    std::fs::write(root.join("memory/memory.sqlite"), b"invalid SQLite fixture").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&root).output().unwrap();
+    assert!(!result.status.success());
+    assert!(!root.join("memory/advisor.sock").exists(), "failed initialization published a readiness socket");
+    std::fs::remove_dir_all(root).unwrap();
+}
