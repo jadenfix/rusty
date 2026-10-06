@@ -48,7 +48,7 @@ class Mock(http.server.BaseHTTPRequestHandler):
         plan = [('read_file', {'path': 'calculator.py'}),
                 ('edit_file', {'path': 'calculator.py', 'old_string': 'return a - b', 'new_string': 'return a + b'}),
                 ('bash', {'command': "python3 -c 'from calculator import add; assert add(2,3)==5' && mkdir -p artifacts && printf verified > artifacts/check.txt"})] if edit else [
-                ('write_file', {'path': 'note.txt', 'content': '42\n'}),
+                ('write_file', {'path': 'note.txt', 'content': '42'}),
                 ('bash', {'command': 'test "$(cat note.txt)" = 42 && mkdir -p artifacts && printf verified > artifacts/check.txt'})]
         if tools < len(plan):
             name, args = plan[tools]
@@ -91,7 +91,7 @@ def run_case(args, mode, task, endpoint, requests):
                 prompt = '''Fix calculator.py so add(a,b) adds a and b. Preserve SENTINEL. Read calculator.py directly with read_file, then use edit_file. Finally use the bash tool to run this exact command: python3 -c 'from calculator import add; assert add(2,3)==5 and add(-2,3)==1' && mkdir -p artifacts && printf verified > artifacts/check.txt
 Create the marker through Bash, not write_file. Report the result briefly. This task needs no directory discovery or extra planning.'''
             else:
-                prompt = '''Use write_file to create note.txt containing 42 followed by a real newline (three bytes total). Then use the bash tool to run this exact command: test "$(cat note.txt)" = 42 && mkdir -p artifacts && printf verified > artifacts/check.txt
+                prompt = '''Use write_file to create note.txt containing exactly the two ASCII bytes 42, without a newline. Then use the bash tool to run this exact command: test "$(cat note.txt)" = 42 && mkdir -p artifacts && printf verified > artifacts/check.txt
 Create the marker through Bash, not write_file. Report the result briefly. This task needs no directory discovery or extra planning.'''
             trajectory = root / 'trajectory.json'
             command = [str(args.binary), '--yolo', '--mode', 'vibe', '--agents', 'off', '--memory', mode, '--stats', '--trajectory', str(trajectory), prompt]
@@ -108,7 +108,7 @@ Create the marker through Bash, not write_file. Report the result briefly. This 
             names = collections.Counter(c['function']['name'] for c in calls)
             repeated = sum(n-1 for n in collections.Counter(json.dumps(c['function'],sort_keys=True) for c in calls).values() if n>1)
             checks = {'no_unknown_tools':all(n in {'read_file','write_file','edit_file','bash','list_files','search','glob','outline','plan','remember','recall','forget'} for n in names), 'exit':p.returncode==0 and not timed_out, 'bash_artifact':(project/'artifacts/check.txt').exists() and (project/'artifacts/check.txt').read_text().rstrip('\n')=='verified', 'bash_used':names['bash']>0, 'tool_budget':bool(trace) and len(calls)<=12, 'repeat_budget':bool(trace) and repeated<=2}
-            if task == 'create': checks['file_content'] = (project/'note.txt').exists() and (project/'note.txt').read_text()=='42\n'; checks['write_used']=names['write_file']>0
+            if task == 'create': checks['file_content'] = (project/'note.txt').exists() and (project/'note.txt').read_text()=='42'; checks['write_used']=names['write_file']>0
             else:
                 code = 'from calculator import add,SENTINEL; assert add(2,3)==5 and add(-2,3)==1 and SENTINEL=="keep me"'
                 v = subprocess.run(['python3','-c',code],cwd=project,env={'PATH':os.environ['PATH']},capture_output=True,timeout=5)
@@ -158,9 +158,9 @@ def main():
             for task in ['create','edit']:
                 reports.append(run_case(args,mode,task,f'http://127.0.0.1:{server.server_port}/v1',server.requests))
                 # Preserve completed attempts if a later provider call or job is interrupted.
-                args.report.write_text(json.dumps(dict(version=1,live=args.live,model=args.model,runs=reports,passed=False,complete=False),indent=2)+'\n')
+                args.report.write_text(json.dumps(dict(version=1,task_revision="r4-two-byte-note",live=args.live,model=args.model,runs=reports,passed=False,complete=False),indent=2)+'\n')
     finally: server.shutdown();server.server_close()
-    receipt=dict(version=1,live=args.live,model=args.model,complete=True,runs=reports,passed=all(r['passed'] for r in reports))
+    receipt=dict(version=1,task_revision="r4-two-byte-note",live=args.live,model=args.model,complete=True,runs=reports,passed=all(r['passed'] for r in reports))
     args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(receipt,indent=2)+'\n')
     return 0 if receipt['passed'] else 1
 

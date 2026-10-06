@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -142,6 +143,7 @@ impl Hooks {
             let mut child = Command::new(bin)
                 .arg("--home")
                 .arg(home)
+                .process_group(0)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -799,6 +801,9 @@ impl Engine {
                 self.prepared.lock().unwrap().clear();
                 reply.text = "imported scoped lessons; local feedback policy preserved".into();
             }
+            "shutdown" => {
+                reply.text = "memory daemon stopped".into();
+            }
             "status" => {
                 let lessons = self.store.lessons(&r.scope)?.len();
                 let bytes: i64 =
@@ -840,6 +845,7 @@ pub fn serve(home: &Path) -> Result<()> {
         if BufReader::new((&stream).take(TRANSFER as u64)).read_line(&mut s).is_err() || !s.ends_with('\n') {
             continue;
         }
+        let shutdown = serde_json::from_str::<Request>(&s).is_ok_and(|r| r.op == "shutdown");
         let response = serde_json::from_str::<Request>(&s)
             .map_err(anyhow::Error::from)
             .and_then(|r| engine.handle(r))
@@ -854,6 +860,9 @@ pub fn serve(home: &Path) -> Result<()> {
             }
             body.push(b'\n');
             let _ = stream.write_all(&body);
+        }
+        if shutdown && !response.error {
+            break;
         }
     }
     Ok(())

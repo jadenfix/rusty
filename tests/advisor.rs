@@ -136,3 +136,41 @@ fn export_larger_than_hook_frame_roundtrips_and_invalid_import_rolls_back() {
     assert!(s.call("import", "a", 0, snapshot).error);
     assert_eq!(s.call("status", "a", 0, Value::Null).data["lessons"], 40);
 }
+
+#[test]
+fn terminal_interrupt_does_not_kill_autostarted_memory() {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    let root =
+        PathBuf::from("/tmp").join(format!("rm-auto-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&root).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_rusty"))
+        .args(["--memory", "on", "--mode", "vibe"])
+        .current_dir(&root)
+        .env("RUSTY_HOME", &root)
+        .env("HOME", &root)
+        .env("RUSTY_NO_DOTENV", "1")
+        .env("RUSTY_INFRA", "off")
+        .env("NVIDIA_API_KEY", "offline-test-key")
+        .env_remove("RUSTY_API_KEY")
+        .env("PATH", "/usr/bin:/bin")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut s = Service { root, child };
+    s.ready();
+    assert!(!s.call("status", "test", 0, Value::Null).error);
+    unsafe {
+        assert_eq!(libc::kill(-(s.child.id() as i32), libc::SIGINT), 0);
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(!s.call("status", "test", 0, Value::Null).error, "Ctrl-C killed the memory service");
+    writeln!(s.child.stdin.take().unwrap(), "/exit").unwrap();
+    s.child.wait().unwrap();
+    let stopped =
+        Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).arg("stop").output().unwrap();
+    assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+}

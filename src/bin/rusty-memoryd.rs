@@ -18,6 +18,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Control {
     Status,
+    Stop,
     Remember {
         #[arg(long, default_value = "fact")]
         kind: String,
@@ -37,8 +38,32 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config/rusty")))
         .ok_or_else(|| anyhow::anyhow!("set RUSTY_HOME or --home"))?;
     let Some(command) = args.command else { return rusty::advisor::serve(&home) };
+    if matches!(command, Control::Stop) {
+        let socket = home.join("memory/advisor.sock");
+        if !socket.exists() {
+            println!("memory daemon is not running");
+            return Ok(());
+        }
+        let r = rusty::advisor::rpc(
+            &socket,
+            &rusty::advisor::Request {
+                op: "shutdown".into(),
+                scope: "admin".into(),
+                session: "admin".into(),
+                seq: 0,
+                mode: Mode::On,
+                data: json!(null),
+            },
+        )?;
+        if r.error {
+            bail!("{}", r.text);
+        }
+        println!("{}", r.text);
+        return Ok(());
+    }
     let mut h = Hooks::connect(&home, &std::env::current_dir()?, Mode::On)?;
     let (op, data) = match &command {
+        Control::Stop => unreachable!(),
         Control::Status => ("status", json!(null)),
         Control::Remember { kind, text } => ("remember", json!({"kind":kind,"text":text})),
         Control::Export { .. } => ("export", json!(null)),
