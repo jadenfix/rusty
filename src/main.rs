@@ -1,4 +1,5 @@
 mod agent;
+mod anthropic;
 mod backend;
 mod config;
 mod context;
@@ -154,12 +155,9 @@ fn run() -> Result<i32> {
         ),
         None => settings.execution_mode,
     };
-    let model = cli
-        .model
-        .clone()
-        .or_else(|| chosen.and_then(ExecutionMode::model))
-        .unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
-    let client = Arc::new(Client::new(config::base_url(), config::api_keys())?);
+    let model =
+        cli.model.clone().or_else(|| chosen.and_then(ExecutionMode::model)).unwrap_or_else(config::default_model);
+    let client = Arc::new(Client::from_env()?);
     if cli.list_models {
         for m in client.list_models()? {
             println!("{m}");

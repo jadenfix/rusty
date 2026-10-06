@@ -4,6 +4,122 @@ use std::path::PathBuf;
 
 pub const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 pub const DEFAULT_MODEL: &str = "nvidia/nemotron-3-super-120b-a12b";
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const OPENAI_MODEL: &str = "gpt-5";
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const ANTHROPIC_MODEL: &str = "claude-opus-5-5";
+
+/// Who serves a model. Each has its own endpoint and keys; rusty picks one per
+/// request from the model id, so one session can mix them (say, Claude as the
+/// lead and a small open model for swarm workers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    /// Any OpenAI-compatible endpoint: NVIDIA by default, or `RUSTY_BASE_URL`.
+    Compatible,
+    OpenAi,
+    Anthropic,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::OpenAi, Provider::Anthropic];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// The provider a model id belongs to. Bare `claude-*` ids are Anthropic's
+    /// and bare `gpt-*` / `o1`-style ids are OpenAI's; anything with a slash
+    /// (`openai/gpt-oss-20b` on NVIDIA, `anthropic/claude-…` on a router) or
+    /// any other name goes to the compatible endpoint. `RUSTY_PROVIDER`
+    /// overrides the guess.
+    pub fn for_model(model: &str) -> Provider {
+        if let Some(p) = std::env::var("RUSTY_PROVIDER").ok().and_then(|v| Provider::parse(&v)) {
+            return p;
+        }
+        let m = model.trim().to_ascii_lowercase();
+        if m.contains('/') {
+            return Provider::Compatible;
+        }
+        if m.starts_with("claude-") {
+            return Provider::Anthropic;
+        }
+        let o_series = m.len() >= 2 && m.starts_with('o') && m.as_bytes()[1].is_ascii_digit();
+        if m.starts_with("gpt-") || m.starts_with("chatgpt-") || m.starts_with("codex-") || o_series {
+            return Provider::OpenAi;
+        }
+        Provider::Compatible
+    }
+
+    pub fn parse(s: &str) -> Option<Provider> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compatible" | "nvidia" | "openai-compatible" => Some(Self::Compatible),
+            "openai" => Some(Self::OpenAi),
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+
+    /// Environment variables that hold this provider's keys, in rotation order.
+    pub fn key_vars(self) -> Vec<String> {
+        let (first, base): (&[&str], &str) = match self {
+            Self::Compatible => (&["RUSTY_API_KEY", "NVIDIA_API_KEY"], "NVIDIA_API_KEY"),
+            Self::OpenAi => (&["OPENAI_API_KEY"], "OPENAI_API_KEY"),
+            Self::Anthropic => (&["ANTHROPIC_API_KEY"], "ANTHROPIC_API_KEY"),
+        };
+        let mut names: Vec<String> = first.iter().map(|s| s.to_string()).collect();
+        names.extend((2..=9).map(|i| format!("{base}_{i}")));
+        names
+    }
+
+    pub fn keys(self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for name in self.key_vars() {
+            if let Ok(k) = std::env::var(&name) {
+                let k = k.trim().to_string();
+                if !k.is_empty() && !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys
+    }
+
+    pub fn base_url(self) -> String {
+        let url = match self {
+            Self::Compatible => return base_url(),
+            Self::OpenAi => std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| OPENAI_BASE_URL.to_string()),
+            Self::Anthropic => std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| ANTHROPIC_BASE_URL.to_string()),
+        };
+        url.trim_end_matches('/').to_string()
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Compatible => DEFAULT_MODEL,
+            Self::OpenAi => OPENAI_MODEL,
+            Self::Anthropic => ANTHROPIC_MODEL,
+        }
+    }
+}
+
+/// The model to use when none was chosen: the default of the first provider
+/// with a key, in the order compatible (NVIDIA), Anthropic, OpenAI, so an
+/// existing NVIDIA setup behaves exactly as before.
+pub fn default_model() -> String {
+    if let Some(p) = std::env::var("RUSTY_PROVIDER").ok().and_then(|v| Provider::parse(&v)) {
+        return p.default_model().to_string();
+    }
+    [Provider::Compatible, Provider::Anthropic, Provider::OpenAi]
+        .into_iter()
+        .find(|p| !p.keys().is_empty())
+        .unwrap_or(Provider::Compatible)
+        .default_model()
+        .to_string()
+}
 
 /// Loads `.env` files without overriding variables already set in the shell.
 /// Order: `~/.config/rusty/.env`, then the `.env` next to this crate's sources
@@ -24,22 +140,6 @@ pub fn config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(h));
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("rusty"))
-}
-
-/// All configured API keys, in rotation order.
-pub fn api_keys() -> Vec<String> {
-    let mut names = vec!["RUSTY_API_KEY".to_string(), "NVIDIA_API_KEY".to_string()];
-    names.extend((2..=9).map(|i| format!("NVIDIA_API_KEY_{i}")));
-    let mut keys: Vec<String> = Vec::new();
-    for name in names {
-        if let Ok(k) = std::env::var(&name) {
-            let k = k.trim().to_string();
-            if !k.is_empty() && !keys.contains(&k) {
-                keys.push(k);
-            }
-        }
-    }
-    keys
 }
 
 pub fn base_url() -> String {
@@ -156,5 +256,38 @@ impl Settings {
                 let _ = rusty::privacy::write_json(&p, value);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Provider;
+
+    #[test]
+    fn models_route_to_their_provider() {
+        for (model, provider) in [
+            ("claude-opus-5-5", Provider::Anthropic),
+            ("claude-haiku-4-5", Provider::Anthropic),
+            ("gpt-5", Provider::OpenAi),
+            ("gpt-4.1-mini", Provider::OpenAi),
+            ("o4-mini", Provider::OpenAi),
+            ("openai/gpt-oss-20b", Provider::Compatible),
+            ("anthropic/claude-opus-5-5", Provider::Compatible),
+            ("nvidia/nemotron-3-super-120b-a12b", Provider::Compatible),
+            ("z-ai/glm-5.3", Provider::Compatible),
+            ("llama3.2", Provider::Compatible),
+            ("orca-mini", Provider::Compatible),
+        ] {
+            assert_eq!(Provider::for_model(model), provider, "{model}");
+        }
+    }
+
+    #[test]
+    fn provider_names_parse() {
+        assert_eq!(Provider::parse("Claude"), Some(Provider::Anthropic));
+        assert_eq!(Provider::parse("nvidia"), Some(Provider::Compatible));
+        assert_eq!(Provider::parse("openai"), Some(Provider::OpenAi));
+        assert_eq!(Provider::parse("bedrock"), None);
+        assert_eq!(Provider::OpenAi.key_vars()[1], "OPENAI_API_KEY_2");
     }
 }

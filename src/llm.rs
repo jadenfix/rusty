@@ -1,4 +1,6 @@
-//! OpenAI-compatible chat client with SSE streaming, tool calls and key rotation.
+//! Chat client with SSE streaming, tool calls and key rotation, for
+//! OpenAI-compatible endpoints (NVIDIA, OpenAI, local servers) and Anthropic's
+//! Messages API. Each request goes to the provider its model belongs to.
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
@@ -9,6 +11,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::anthropic;
+use crate::config::Provider;
 use crate::execution::ExecutionMode;
 use crate::ui::truncate;
 
@@ -43,32 +47,81 @@ pub struct Reply {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
+    /// Anthropic's content blocks for this turn, kept so thinking goes back
+    /// to the API unchanged. None for other providers.
+    pub raw: Option<Value>,
 }
 
-pub struct Client {
-    http: reqwest::blocking::Client,
-    base_url: String,
+/// One provider's endpoint and its keys.
+pub struct Endpoint {
+    pub provider: Provider,
+    pub base_url: String,
     keys: Vec<String>,
     key_idx: AtomicUsize,
 }
 
+impl Endpoint {
+    pub fn new(provider: Provider, base_url: String, keys: Vec<String>) -> Self {
+        Self { provider, base_url: base_url.trim_end_matches('/').to_string(), keys, key_idx: AtomicUsize::new(0) }
+    }
+}
+
+pub struct Client {
+    http: reqwest::blocking::Client,
+    endpoints: Vec<Endpoint>,
+}
+
 impl Client {
-    pub fn new(base_url: String, keys: Vec<String>) -> Result<Self> {
-        if keys.is_empty() {
+    /// Every provider with at least one key in the environment.
+    pub fn from_env() -> Result<Self> {
+        let endpoints = Provider::ALL
+            .into_iter()
+            .map(|p| Endpoint::new(p, p.base_url(), p.keys()))
+            .filter(|e| !e.keys.is_empty())
+            .collect();
+        Self::new(endpoints)
+    }
+
+    pub fn new(endpoints: Vec<Endpoint>) -> Result<Self> {
+        if endpoints.iter().all(|e| e.keys.is_empty()) {
             bail!(
-                "no API key found. Set NVIDIA_API_KEY in your shell, in ~/.config/rusty/.env, \
-                 or in the .env next to rusty's Cargo.toml"
+                "no API key found. Set NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY in your shell, \
+                 in ~/.config/rusty/.env, or in the .env next to rusty's Cargo.toml"
             );
         }
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(600))
             .build()?;
-        Ok(Self { http, base_url, keys, key_idx: AtomicUsize::new(0) })
+        Ok(Self { http, endpoints })
     }
 
     pub fn key_count(&self) -> usize {
-        self.keys.len()
+        self.endpoints.iter().map(|e| e.keys.len()).sum()
+    }
+
+    /// The endpoint that serves `model`. A model whose provider has no key
+    /// goes to a custom compatible endpoint (`RUSTY_BASE_URL`, say a local
+    /// router) when there is one, since that is where it was meant to go.
+    pub fn endpoint_for(&self, model: &str) -> Result<&Endpoint> {
+        let want = Provider::for_model(model);
+        if let Some(e) = self.endpoints.iter().find(|e| e.provider == want) {
+            return Ok(e);
+        }
+        if let Some(e) = self
+            .endpoints
+            .iter()
+            .find(|e| e.provider == Provider::Compatible && e.base_url != crate::config::DEFAULT_BASE_URL)
+        {
+            return Ok(e);
+        }
+        let vars = want.key_vars();
+        bail!(
+            "`{model}` is served by {}, but {} is not set. Add it to your shell or ~/.config/rusty/.env, \
+             or pick another model with /model",
+            want.name(),
+            vars.iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or(&vars[0])
+        )
     }
 
     /// Runs a chat request on a background thread and streams events back, so
@@ -109,52 +162,90 @@ impl Client {
         execution_mode: ExecutionMode,
         on: &mut dyn FnMut(Delta) -> bool,
     ) -> Result<Reply> {
+        let ep = self.endpoint_for(model)?;
+        if ep.provider == Provider::Anthropic {
+            let first_party = ep.base_url == crate::config::ANTHROPIC_BASE_URL;
+            let (body, beta) = anthropic::request(model, messages, tools, execution_mode, first_party);
+            let resp = self.send(ep, &format!("{}/v1/messages", ep.base_url), Some(&body), beta.as_deref())?;
+            return anthropic::parse_stream(resp, on);
+        }
         let mut body = json!({
             "model": model,
-            "messages": messages,
+            "messages": anthropic::strip_private(messages),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": 16384,
             "temperature": temperature,
         });
-        execution_mode.apply_inference(&mut body, &self.base_url, model);
+        if ep.provider == Provider::OpenAi {
+            openai_inference(&mut body, model, execution_mode);
+        } else {
+            execution_mode.apply_inference(&mut body, &ep.base_url, model);
+        }
         if tools.as_array().is_some_and(|t| !t.is_empty()) {
             body["tools"] = tools.clone();
             body["tool_choice"] = json!("auto");
         }
-        let resp = self.send(&format!("{}/chat/completions", self.base_url), Some(&body))?;
+        let resp = self.send(ep, &format!("{}/chat/completions", ep.base_url), Some(&body), None)?;
         parse_stream(resp, on)
     }
 
+    /// Model ids from every configured provider, tagged `provider` for the
+    /// non-default ones. A provider that fails to answer is skipped unless
+    /// none answer.
     pub fn list_models(&self) -> Result<Vec<String>> {
-        let resp = self.send(&format!("{}/models", self.base_url), None)?;
-        let v: Value = resp.json().context("bad /models response")?;
-        let mut ids: Vec<String> = v["data"]
-            .as_array()
-            .ok_or_else(|| anyhow!("unexpected /models response"))?
-            .iter()
-            .filter_map(|m| m["id"].as_str().map(String::from))
-            .collect();
+        let mut ids = Vec::new();
+        let mut last_err = None;
+        for ep in &self.endpoints {
+            let url = match ep.provider {
+                Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
+                _ => format!("{}/models", ep.base_url),
+            };
+            let listed = self.send(ep, &url, None, None).and_then(|resp| {
+                let v: Value = resp.json().context("bad /models response")?;
+                let data = v["data"].as_array().ok_or_else(|| anyhow!("unexpected /models response"))?;
+                Ok(data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect::<Vec<_>>())
+            });
+            match listed {
+                Ok(found) => ids.extend(found),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if ids.is_empty() {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
         ids.sort();
+        ids.dedup();
         Ok(ids)
     }
 
     /// Sends a request, rotating keys and backing off on 429 / 5xx / auth
     /// errors. Rounds wait 2, 4, 8, 16, then 30 seconds (or what the server
     /// asks for in Retry-After), which rides out about a minute of rate limits.
-    fn send(&self, url: &str, body: Option<&Value>) -> Result<Response> {
+    fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>) -> Result<Response> {
         const ROUNDS: usize = 6;
-        let attempts = self.keys.len() * ROUNDS;
+        let keys = &ep.keys;
+        let attempts = keys.len() * ROUNDS;
         let mut last_err = String::new();
         let mut retry_after: Option<u64> = None;
         for attempt in 0..attempts {
-            let idx = self.key_idx.load(Ordering::Relaxed) % self.keys.len();
-            let key = &self.keys[idx];
-            let req = match body {
+            let idx = ep.key_idx.load(Ordering::Relaxed) % keys.len();
+            let key = &keys[idx];
+            let mut req = match body {
                 Some(b) => self.http.post(url).json(b),
                 None => self.http.get(url),
             };
-            match req.bearer_auth(key).send() {
+            req = if ep.provider == Provider::Anthropic {
+                req.header("x-api-key", key).header("anthropic-version", anthropic::VERSION)
+            } else {
+                req.bearer_auth(key)
+            };
+            if let Some(b) = beta {
+                req = req.header("anthropic-beta", b);
+            }
+            match req.send() {
                 Ok(r) if r.status().is_success() => return Ok(r),
                 Ok(r) => {
                     let status = r.status();
@@ -178,15 +269,40 @@ impl Client {
                 }
                 Err(e) => last_err = format!("request failed: {e}"),
             }
-            self.key_idx.store((idx + 1) % self.keys.len(), Ordering::Relaxed);
+            ep.key_idx.store((idx + 1) % keys.len(), Ordering::Relaxed);
             // Back off once every key has been tried in this round.
-            if (attempt + 1) % self.keys.len() == 0 && attempt + 1 < attempts {
-                let round = (attempt + 1) / self.keys.len();
+            if (attempt + 1) % keys.len() == 0 && attempt + 1 < attempts {
+                let round = (attempt + 1) / keys.len();
                 let wait = retry_after.take().unwrap_or_else(|| 2u64.pow(round as u32).min(30));
                 std::thread::sleep(Duration::from_secs(wait));
             }
         }
         bail!("giving up after {attempts} attempts: {last_err}")
+    }
+}
+
+/// OpenAI's own API: reasoning models (gpt-5, o-series) take
+/// `max_completion_tokens` and `reasoning_effort` and reject a temperature.
+fn openai_inference(body: &mut Value, model: &str, mode: ExecutionMode) {
+    let m = model.to_ascii_lowercase();
+    let reasoning = m.starts_with("gpt-5")
+        || m.starts_with("codex-")
+        || (m.starts_with('o') && m[1..].starts_with(|c: char| c.is_ascii_digit()));
+    if let Some(o) = body.as_object_mut() {
+        let cap = o.remove("max_tokens").unwrap_or(json!(16384));
+        o.insert(
+            "max_completion_tokens".into(),
+            json!(u64::from(mode.max_tokens()).max(cap.as_u64().unwrap_or(16384))),
+        );
+        if reasoning {
+            o.remove("temperature");
+            let effort = match mode {
+                ExecutionMode::Careful => "high",
+                ExecutionMode::Standard => "medium",
+                ExecutionMode::Vibe => "low",
+            };
+            o.insert("reasoning_effort".into(), json!(effort));
+        }
     }
 }
 
@@ -306,6 +422,40 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, tc: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn openai_reasoning_models_get_their_own_parameters() {
+        let mut body = json!({"max_tokens": 16384, "temperature": 0.3});
+        openai_inference(&mut body, "gpt-5", ExecutionMode::Careful);
+        assert!(body.get("temperature").is_none() && body.get("max_tokens").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body["max_completion_tokens"].as_u64().unwrap() >= 16384);
+        let mut body = json!({"max_tokens": 16384, "temperature": 0.3});
+        openai_inference(&mut body, "gpt-4.1", ExecutionMode::Vibe);
+        assert_eq!(body["temperature"], 0.3);
+        assert!(body.get("reasoning_effort").is_none());
+        let mut body = json!({"max_tokens": 16384});
+        openai_inference(&mut body, "o4-mini", ExecutionMode::Vibe);
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn routes_each_model_to_its_provider() {
+        let ep = |p: Provider, url: &str| Endpoint::new(p, url.into(), vec!["k".into()]);
+        let c = Client::new(vec![
+            ep(Provider::Compatible, crate::config::DEFAULT_BASE_URL),
+            ep(Provider::Anthropic, crate::config::ANTHROPIC_BASE_URL),
+        ])
+        .unwrap();
+        assert_eq!(c.endpoint_for("claude-opus-5-5").unwrap().provider, Provider::Anthropic);
+        assert_eq!(c.endpoint_for("openai/gpt-oss-20b").unwrap().provider, Provider::Compatible);
+        let err = c.endpoint_for("gpt-5").err().unwrap().to_string();
+        assert!(err.contains("OPENAI_API_KEY"), "{err}");
+        // A custom compatible endpoint takes models whose own provider has no key.
+        let c = Client::new(vec![ep(Provider::Compatible, "http://localhost:4000/v1")]).unwrap();
+        assert_eq!(c.endpoint_for("claude-opus-5-5").unwrap().provider, Provider::Compatible);
+        assert!(Client::new(vec![]).is_err());
+    }
 
     #[test]
     fn merges_streamed_tool_call_fragments() {
