@@ -141,7 +141,7 @@ pub fn poll_keys() {
 }
 
 pub fn take_draft() -> Option<crate::input::Draft> {
-    DRAFT.lock().ok()?.take().filter(|d| !d.text.is_empty())
+    DRAFT.lock().ok()?.take().filter(|d| d.quit || !d.text.is_empty())
 }
 pub fn composer(cells: usize) -> Option<(String, usize, String)> {
     DRAFT.lock().ok()?.as_ref().filter(|d| d.active).map(|d| d.preview(cells))

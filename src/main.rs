@@ -326,7 +326,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         target: &target_line(agent),
     });
     use rustyline::{CompletionType, Config, Editor, EventHandler, KeyEvent};
-    let editor_config = Config::builder().completion_type(CompletionType::List).max_history_size(100)?.build();
+    let editor_config = Config::builder().completion_type(CompletionType::Circular).max_history_size(100)?.build();
     let mut rl = Editor::<input::PromptHelper, rustyline::history::DefaultHistory>::with_config(editor_config)?;
     rl.set_helper(Some(input::PromptHelper::new(cwd)));
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(Box::new(input::PromptKeys)));
@@ -347,6 +347,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         let prompt = format!("{} ", ui::primary("›"));
         let draft = signal::take_draft();
         let entered = match draft {
+            Some(d) if d.quit => break,
             Some(d) if d.submitted => {
                 println!("{} {}", ui::primary("›"), d.text);
                 Ok(d.text)
@@ -629,7 +630,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 }
             }
         }
-        "/settings" => print_settings(agent),
+        "/settings" => print_settings(agent, settings),
         "/permissions" | "/perms" => permissions_cmd(agent, rest),
         "/yolo" => {
             agent.policy.mode = Mode::Yolo;
@@ -826,7 +827,7 @@ fn print_mode(agent: &Agent) {
     );
 }
 
-fn print_settings(agent: &Agent) {
+fn print_settings(agent: &Agent, settings: &Settings) {
     let a = &agent.agents;
     let rows = [
         ("model", agent.model.clone()),
@@ -844,6 +845,7 @@ fn print_settings(agent: &Agent) {
         ("swarm models", if a.swarm_models.is_empty() { "(subagent model)".into() } else { a.swarm_models.join(", ") }),
         ("swarm spread", format!("{:.1}", a.spread)),
         ("tips", if agent.tips { "on".into() } else { "off".into() }),
+        ("suggestions", on_off(settings.suggestions && std::env::var_os("RUSTY_NO_SUGGEST").is_none())),
         ("target", if agent.infra.target.is_empty() { "-".into() } else { agent.infra.target.summary() }),
         ("context window", context::window().to_string()),
     ];
@@ -1062,12 +1064,14 @@ fn print_help(cwd: &Path) {
                 ("/target", "the kube context, cloud account, workspace and branch commands will hit"),
                 ("/changes · /audit [n]", "what this session changed in infrastructure · the audit log"),
                 ("/model [id] · /models", "switch or list models"),
+                ("/tools local|daytona", "set next session placement; current tools stay attached"),
                 ("/view default|verbose|adhd", "how much you see"),
                 (
                     "/theme · /font",
                     "themes calm rust neon matrix amber ice mono · banners minimal rust block thin classic",
                 ),
                 ("/suggestions on|off", "local command and history hints; Tab accepts"),
+                ("Tab · Shift-Tab · Esc", "cycle completions, go back, cancel completion"),
                 ("Ctrl-J · Alt-Enter · backslash + Enter", "new line; Ctrl-C clears draft; Esc stops work"),
                 ("/tips · /settings · /exit", ""),
             ],

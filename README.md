@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-111%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-112%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -420,7 +420,9 @@ Rusty does not change the terminal's global settings or install fonts.
 
 The interactive prompt supports local slash-command and argument hints, recent
 history hints, and filename completion (including `@path`). Tab accepts a hint or
-completes a path; Up/Down and Ctrl-R use the line editor's history. Suggestions do
+completes a path. For command or path alternatives, Tab cycles forward and
+Shift-Tab cycles back; Esc restores the original input. Completion stays in the
+prompt instead of opening a blocking pager. Up/Down and Ctrl-R use the line editor's history. Suggestions do
 not call a model. `/suggestions off` disables ghost hints and `RUSTY_NO_SUGGEST=1`
 disables them for a run; explicit Tab completion remains available.
 
@@ -436,7 +438,10 @@ viewport keeps the caret visible and displays newlines as `↵`.
 
 Use Ctrl-J or Alt-Enter for a newline, or backslash + Enter to continue a prompt.
 Bracketed multiline paste waits for Enter. Canceling a multiline prompt clears it
-without sending any partial message. At an empty idle prompt, Ctrl-C twice quits.
+without sending any partial message. Ctrl-D quits from an empty idle or busy
+prompt; with a draft present it deletes the next character. At an empty idle
+prompt, Ctrl-C twice quits. Settings commands print their values into scrollback
+and return directly to the editor; there is no settings screen to exit.
 With `NO_COLOR`, the busy composer is disabled: interrupt first, then edit at the
 ordinary prompt. The line editor and command completion still work.
 
@@ -447,6 +452,8 @@ python3 tests/tty/capture.py --binary target/debug/rusty --output /tmp/rusty-tty
 python3 tests/tty/inspect.py /tmp/rusty-tty
 python3 tests/tty/input.py --binary target/debug/rusty --output /tmp/rusty-input
 python3 tests/tty/input_screen.py /tmp/rusty-input
+python3 tests/tty/navigation.py --binary target/debug/rusty --output /tmp/rusty-navigation
+python3 tests/tty/navigation_screen.py /tmp/rusty-navigation
 python3 tests/tty/demo.py --binary target/debug/rusty --output /tmp/rusty-demo
 python3 tests/tty/modes.py --binary target/debug/rusty --output /tmp/rusty-modes
 python3 tests/tty/modes.py --binary target/debug/rusty --reduced-only --output /tmp/rusty-modes-static
@@ -454,6 +461,11 @@ python3 tests/tty/modes.py --binary target/debug/rusty --reduced-only --output /
 
 The captures exercise real file writes, Bash results, streamed replies, and
 interactive Ctrl-C recovery through an `expect` PTY at 24/40/80/120 columns.
+Navigation checks additionally cover 8/12/24-row terminals, every theme and banner,
+completion cycling and cancellation, saved and malformed settings, approval
+cancellation, and idle/busy exits. They compare the PTY terminal flags before
+and after exit and replay clean-prompt checkpoints for panel overlap. The
+input and navigation journeys also run in Linux CI without model credentials.
 
 ## License
 

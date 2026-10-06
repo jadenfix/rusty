@@ -22,6 +22,7 @@ pub const COMMANDS: &[&str] = &[
     "/new",
     "/model",
     "/models",
+    "/tools",
     "/mode",
     "/compact",
     "/context",
@@ -82,9 +83,12 @@ impl PromptHelper {
             match command {
                 "/mode" => vec!["auto", "careful", "standard", "vibe"],
                 "/view" => vec!["default", "verbose", "adhd"],
+                "/tools" => vec!["local", "daytona"],
                 "/agents" | "/subagents" => vec!["off", "sub", "swarm", "auto", "default", "model"],
-                "/swarm" => vec!["size", "models", "spread"],
-                "/permissions" | "/perms" => vec!["read-only", "ask", "auto", "yolo", "allow", "deny", "check"],
+                "/swarm" => vec!["on", "off", "size", "models", "spread"],
+                "/permissions" | "/perms" => {
+                    vec!["read-only", "ask", "auto", "yolo", "allow", "deny", "remove", "reset", "check"]
+                }
                 "/goal" => vec!["status", "resume", "clear"],
                 "/memory" | "/mem" => vec!["list", "search", "forget", "status", "helpful", "harmful"],
                 "/tips" | "/suggestions" => vec!["on", "off"],
@@ -175,7 +179,11 @@ impl ConditionalEventHandler for PromptKeys {
         if *event == Event::from(rustyline::KeyEvent::ctrl('C')) {
             Some(if ctx.line().is_empty() { Cmd::Interrupt } else { Cmd::Kill(Movement::WholeBuffer) })
         } else {
-            Some(if ctx.has_hint() && ctx.pos() == ctx.line().len() { Cmd::CompleteHint } else { Cmd::Complete })
+            Some(if !ctx.line().starts_with('/') && ctx.has_hint() && ctx.pos() == ctx.line().len() {
+                Cmd::CompleteHint
+            } else {
+                Cmd::Complete
+            })
         }
     }
 }
@@ -187,6 +195,7 @@ pub struct Draft {
     pub text: String,
     pub cursor: usize,
     pub submitted: bool,
+    pub quit: bool,
     pub active: bool,
     pub truncated: bool,
     pub suggestions: Vec<String>,
@@ -382,6 +391,12 @@ impl Draft {
                     2 => self.cursor = self.previous(),
                     6 => self.cursor = self.next(),
                     8 | 127 => self.delete(self.previous(), self.cursor),
+                    4 if self.text.is_empty() => {
+                        self.quit = true;
+                        self.submitted = true;
+                        stop = true;
+                        break;
+                    }
                     4 => self.delete(self.cursor, self.next()),
                     21 => self.delete(0, self.cursor),
                     11 => self.delete(self.cursor, self.text.len()),
@@ -511,6 +526,22 @@ mod tests {
         assert_eq!(d.text, "draft");
         assert!(!d.submitted);
     }
+    #[test]
+    fn eof_quits_only_an_empty_busy_editor() {
+        let mut d = Draft::default();
+        d.feed(b"draft\x01\x04");
+        assert_eq!(d.text, "raft");
+        assert!(!d.quit && !d.submitted);
+        d.feed(b"\x05\x15");
+        assert!(d.text.is_empty());
+        assert!(d.feed(b"\x04"));
+        assert!(d.quit && d.submitted);
+        // An EOF control byte inside paste is data, never a quit request.
+        let mut pasted = Draft::default();
+        assert!(!pasted.feed(b"\x1b[200~\x04\x1b[201~"));
+        assert!(!pasted.quit && !pasted.submitted);
+    }
+
     #[test]
     fn suggestions_only_append_at_the_end() {
         let mut d = Draft { suggestions: vec!["/mode careful".into()], ..Default::default() };
