@@ -108,6 +108,8 @@ impl Default for AgentsConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Tool location for future sessions; a bridge is required for daytona.
+    pub tools: String,
     pub theme: String,
     pub font: String,
     pub view: String,
@@ -121,6 +123,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            tools: "local".into(),
             theme: "rust".into(),
             font: "rust".into(),
             view: "default".into(),

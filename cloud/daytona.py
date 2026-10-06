@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import shlex
 import sys
 import time
@@ -151,7 +152,8 @@ def load(run_id: str) -> dict:
 
 
 def model_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k.startswith(KEY_PREFIXES) and k != "RUSTY_HOME"}
+    local_only = {"RUSTY_HOME", "RUSTY_TOOLS", "RUSTY_TOOL_BRIDGE_URL", "RUSTY_TOOL_BRIDGE_TOKEN"}
+    return {k: v for k, v in os.environ.items() if k.startswith(KEY_PREFIXES) and k not in local_only}
 
 
 # ------------------------------------------------------------- environment
@@ -545,6 +547,54 @@ def cmd_list(args) -> int:
     return 0
 
 
+def hybrid_command(args):
+    """All reasoning and memory stay local; only filesystem/shell tools move."""
+    binary = Path(args.local_binary).expanduser().resolve()
+    if not binary.is_file():
+        raise ValueError(f"local Rusty binary not found: {binary}; run cargo build --bins")
+    words = [str(binary), "--tools", "daytona", "--mode", args.mode,
+             "--agents", args.agents, "--memory", args.memory_mode, "--permissions", args.permissions]
+    words.extend(["--swarm-max", str(args.swarm_max)])
+    if args.model:
+        words.extend(["--model", args.model])
+    if args.stats:
+        words.append("--stats")
+    if getattr(args, "resume", False):
+        words.append("--continue")
+    if args.trajectory:
+        words.extend(["--trajectory", str(Path(args.trajectory).resolve())])
+    if args.goal:
+        words.extend(["--goal", args.goal])
+    elif args.prompt:
+        words.extend(["--", args.prompt])
+    return words
+
+
+def cmd_hybrid(args) -> int:
+    from cloud.tools_bridge import bridge
+
+    command = hybrid_command(args)  # Validate before any API call.
+    d = daytona_client()
+    sandbox = d.get(args.sandbox)
+    state = getattr(sandbox.state, "value", sandbox.state)
+    if str(state).lower() != "started":
+        raise RuntimeError("hybrid attaches only to a started sandbox; it never creates or wakes one. Start it explicitly if you intend to consume compute credits.")
+    remote = Remote(sandbox)
+    print(f"☾ local reasoning + memory · tools in {sandbox.id}:{args.workspace} · workers share this workspace", file=sys.stderr)
+    print("☾ attached sandbox stays running after exit; this command never creates, stops or deletes it", file=sys.stderr)
+    with bridge(remote, args.workspace) as env:
+        if getattr(args, "project_id", None):
+            env["RUSTY_PROJECT_ID"] = args.project_id
+        # The terminal sends Ctrl-C to both processes. Let Rusty stop its turn
+        # without Python tearing down the bridge. A caught handler resets at
+        # exec, so the child still receives SIGINT and installs its own handler.
+        previous = signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            return subprocess.call(command, env={**os.environ, **env})
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+
 def main(argv=None) -> int:
     try:
         from dotenv import load_dotenv
@@ -574,6 +624,23 @@ def main(argv=None) -> int:
     p.add_argument("--memory-input", help="scoped gzip export from rusty-memoryd")
     p.add_argument("--project-id", help="same RUSTY_PROJECT_ID used locally; defaults to repo URL")
     p.add_argument("--keep", action="store_true", help="keep the sandbox after exporting")
+    p = sub.add_parser("hybrid", help="local reasoning/memory + Daytona tools; attach only, no new sandbox")
+    p.add_argument("--sandbox", required=True, help="ID/name of an already started sandbox (never auto-created or woken)")
+    p.add_argument("--workspace", required=True, help="absolute project directory inside the sandbox")
+    p.add_argument("--local-binary", default="target/debug/rusty", help="local macOS/Linux Rusty binary")
+    task = p.add_mutually_exclusive_group()
+    task.add_argument("--goal")
+    task.add_argument("--prompt", help="omit for interactive mode")
+    p.add_argument("--mode", default="auto", choices=["auto", "careful", "standard", "vibe"])
+    p.add_argument("--agents", default="auto", choices=["off", "sub", "swarm", "auto"])
+    p.add_argument("--swarm-max", type=int, default=3, choices=range(1, 9))
+    p.add_argument("--model")
+    p.add_argument("--memory-mode", default="on", choices=["legacy", "off", "on", "deep"])
+    p.add_argument("--permissions", default="auto", choices=["read-only", "ask", "auto", "yolo"])
+    p.add_argument("--stats", action="store_true")
+    p.add_argument("--trajectory", help="local path for the session receipt")
+    p.add_argument("--continue", dest="resume", action="store_true", help="resume the latest local session for this sandbox/workspace")
+    p.add_argument("--project-id", help="stable local advisor identity across replacement sandboxes (on/deep memory)")
     for name, help_ in [
         ("status", "is it still working?"),
         ("logs", "follow the output, then export"),
@@ -591,6 +658,7 @@ def main(argv=None) -> int:
     return {
         "prepare": cmd_prepare,
         "run": cmd_run,
+        "hybrid": cmd_hybrid,
         "status": cmd_status,
         "logs": cmd_logs,
         "export": cmd_export,
@@ -604,4 +672,5 @@ if __name__ == "__main__":
     # This file's name otherwise shadows the installed `daytona` SDK.
     here = Path(__file__).resolve().parent
     sys.path = [p for p in sys.path if Path(p or ".").resolve() != here]
+    sys.path.insert(0, str(here.parent))
     sys.exit(main())
