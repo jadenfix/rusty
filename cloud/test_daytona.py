@@ -59,7 +59,8 @@ class FakeRemote:
         (bin_dir / "rusty").chmod(0o755)
         (bin_dir / "rusty-memoryd").write_text('#!/bin/bash\nif [ "$1" = export ]; then printf compressed-snapshot > "$2"; fi\n')
         (bin_dir / "rusty-memoryd").chmod(0o755)
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        # Removing a stand-in must not fall through to a real installed Rusty.
+        self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bin_dir}:/usr/bin:/bin"}
         self.sandbox = FakeSandbox(run_id)
         self.id = self.sandbox.id
         self.started = []

@@ -42,6 +42,10 @@ jobs:
           sudo apt-get install -y expect
           python3 tests/tty/capture.py --binary target/debug/rusty --output target/tty-quality
           python3 tests/tty/inspect.py target/tty-quality
+      - name: interactive resize, navigation, timeout and memory contention
+        run: |
+          python3 scripts/session_bench.py --trials 3 --report session-quality.json
+          python3 scripts/memory_stress.py --rounds 25 --report memory-stress.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -49,6 +53,8 @@ jobs:
           path: |
             memory-quality.json
             mode-quality.json
+            session-quality.json
+            memory-stress.json
             fullstack-quality.json
             target/tty-quality/alignment.json
       - name: cloud launcher, offline

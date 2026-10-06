@@ -1,0 +1,74 @@
+# Real interactive REPL: repeated approval -> resize -> next turn, then
+# approval interruption and stream interruption. The provider is local/offline.
+set timeout 15
+set bin [lindex $argv 0]
+set env(RUSTY_BASE_URL) [lindex $argv 1]
+set dest [lindex $argv 2]
+set env(RUSTY_HOME) "$dest/config"
+set env(NVIDIA_API_KEY) offline-test-key
+set env(RUSTY_NO_DOTENV) 1
+set env(TERM) xterm-256color
+unset -nocomplain env(NO_COLOR)
+log_user 0
+log_file -a -noappend "$dest/session.ansi"
+spawn -noecho $bin --tools local --permissions ask --mode auto --agents off --memory [lindex $argv 3]
+proc ready {} {
+    expect {
+        -ex "\x1b\[?2004h" {}
+        timeout { puts "FAIL: editable prompt missing"; exit 1 }
+        eof { puts "FAIL: REPL exited unexpectedly"; exit 1 }
+    }
+}
+ready
+for {set i 0} {$i < 8} {incr i} {
+    send -- "approval $i\r"
+    expect {
+        -ex {[y]es} {}
+        timeout { puts "FAIL: approval missing"; exit 1 }
+    }
+    # Canonical terminal editing must still handle a backspace.
+    send -- "xy\x7fy\r"
+    # This is feedback, not a yes: confirm it did not write the file.
+    expect -ex "BENCH_DONE"
+    ready
+    send -- "approval accepted-$i\r"
+    expect -ex {[y]es}
+    send -- "y\r"
+    expect -ex "APPROVAL_RESIZE_READY"
+    set width [lindex {24 40 80 120} [expr {$i % 4}]]
+    stty rows [expr {20 + $i}] columns $width < $spawn_out(slave,name)
+    exec kill -WINCH [exp_pid]
+    expect {
+        -ex "BENCH_DONE" {}
+        eof { puts "FAIL: crash after approval + resize"; exit 1 }
+        timeout { puts "FAIL: stalled after approval + resize"; exit 1 }
+    }
+    ready
+}
+send -- "approval interrupt\r"
+expect -ex {[y]es}
+set t0 [clock milliseconds]
+send -- "\x03"
+expect {
+    -ex "stopped" {}
+    timeout { puts "FAIL: Ctrl-C at approval stalled"; exit 1 }
+}
+set approval_ms [expr {[clock milliseconds] - $t0}]
+if {$approval_ms > 2000} { puts "FAIL: slow approval interruption"; exit 1 }
+ready
+send -- "stream interrupt\r"
+expect -ex "STREAM_READY"
+set t0 [clock milliseconds]
+send -- "\x03"
+expect -ex "stopped"
+set stream_ms [expr {[clock milliseconds] - $t0}]
+if {$stream_ms > 2000} { puts "FAIL: slow stream interruption"; exit 1 }
+ready
+send -- "pong\r"
+expect -ex "BENCH_DONE"
+ready
+send -- "/exit\r"
+expect eof
+set result [wait]
+if {[lindex $result 3] != 0} { puts "FAIL: exit $result"; exit 1 }
+puts "PASS: 16 approvals, 8 resizes, recovery; approval_ms=$approval_ms stream_ms=$stream_ms"

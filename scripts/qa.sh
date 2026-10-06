@@ -26,6 +26,10 @@ tty_work=$(mktemp -d)
 trap 'rm -rf "$tty_work"' EXIT
 python3 tests/tty/capture.py --binary target/debug/rusty --output "$tty_work"
 python3 tests/tty/inspect.py "$tty_work"
+step "interactive approvals, live resize, directory and timeout regressions"
+python3 scripts/session_bench.py --trials 3 --report "${TMPDIR:-/tmp}/rusty-sessions-$$.json"
+step "eight-client memory contention"
+python3 scripts/memory_stress.py --rounds 25 --report "${TMPDIR:-/tmp}/rusty-memory-stress-$$.json"
 
 step "cloud launcher (offline)"
 python3 -m unittest cloud/test_daytona.py
