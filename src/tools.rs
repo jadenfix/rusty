@@ -80,7 +80,14 @@ pub fn summary(name: &str, args: &Value) -> String {
                 .iter()
                 .find_map(|p| cmd.strip_prefix(&p.replace("{cwd}", &cwd)).map(str::to_string))
                 .unwrap_or(cmd);
-            cmd.lines().next().unwrap_or("").to_string()
+            // A script shows its first command and how much follows, so a run of
+            // multi-line scripts doesn't read as the same bare `cd` over and over.
+            let mut lines = cmd.lines().map(str::trim).filter(|l| !l.is_empty());
+            let first = lines.next().unwrap_or("").to_string();
+            match lines.count() {
+                0 => first,
+                n => format!("{}  (+{n} line{})", truncate(&first, 100), if n == 1 { "" } else { "s" }),
+            }
         }
         "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".")),
         "glob" => s("pattern"),
@@ -524,6 +531,15 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_header_says_how_much_follows_its_first_line() {
+        let bash = |c: &str| summary("bash", &serde_json::json!({ "command": c }));
+        assert_eq!(bash("cargo test"), "cargo test");
+        assert_eq!(bash("cd /tmp/x\nrm -f todo.json\n\npython3 todo.py add a"), "cd /tmp/x  (+2 lines)");
+        assert_eq!(bash("cd /tmp/x\nls\n"), "cd /tmp/x  (+1 line)");
+        assert!(bash(&format!("{}\nls", "x".repeat(300))).ends_with("(+1 line)"));
+    }
 
     #[test]
     fn wildcard_matching() {
