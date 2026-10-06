@@ -279,9 +279,14 @@ fn search(args: &Value) -> Result<String> {
 }
 
 fn bash(args: &Value) -> Result<String> {
+    bash_with_tick(args, &mut || {})
+}
+
+/// Reuse the shell wait loop to keep the UI alive without an animation thread.
+pub fn bash_with_tick(args: &Value, tick: &mut impl FnMut()) -> Result<String> {
     let command = arg(args, "command")?;
     let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
-    let (status, stdout, stderr) = run(command, timeout)?;
+    let (status, stdout, stderr) = run_with_tick(command, timeout, tick)?;
     let mut out = match status {
         Some(code) => format!("exit code: {}\n", code.map_or("signal".into(), |c| c.to_string())),
         None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
@@ -301,7 +306,17 @@ fn bash(args: &Value) -> Result<String> {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
+    run_with_tick(command, timeout, &mut || {})
+}
+
+fn run_with_tick(
+    command: &str,
+    timeout: Duration,
+    tick: &mut impl FnMut(),
+) -> Result<(Option<Option<i32>>, String, String)> {
+    use std::os::unix::process::CommandExt;
     let mut child = Command::new("bash")
+        .process_group(0)
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
@@ -330,7 +345,13 @@ pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, Str
             break Some(s.code());
         }
         signal::poll_keys();
+        tick();
         if start.elapsed() > timeout || signal::interrupted() {
+            // Descendants inherit the output pipes. Kill the command's group,
+            // otherwise joining the readers can block until a child finishes.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -524,6 +545,24 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_closes_descendant_pipes() {
+        let start = Instant::now();
+        let (status, _, _) = run("sleep 15 & wait", Duration::from_secs(1)).unwrap();
+        assert_eq!(status, None);
+        assert!(start.elapsed() < Duration::from_secs(3), "descendant kept output pipes open");
+    }
+
+    #[test]
+    fn shell_wait_ticks_and_preserves_exit_status() {
+        let mut ticks = 0;
+        let result =
+            bash_with_tick(&json!({"command": "sleep 0.2; printf checked; exit 2"}), &mut || ticks += 1).unwrap();
+        assert!(ticks >= 2);
+        assert!(result.starts_with("exit code: 2\n"));
+        assert!(result.contains("checked"));
+    }
 
     #[test]
     fn wildcard_matching() {

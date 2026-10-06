@@ -143,15 +143,24 @@ impl Backend {
         }
     }
 
-    pub fn execute(&self, name: &str, args: &Value, policy: &Policy, approval: &Verdict) -> Result<String> {
+    pub fn execute_with_tick(
+        &self,
+        name: &str,
+        args: &Value,
+        policy: &Policy,
+        approval: &Verdict,
+        tick: &mut impl FnMut(),
+    ) -> Result<String> {
         match self {
+            Self::Local if name == "bash" => tools::bash_with_tick(args, tick),
             Self::Local => tools::execute(name, args),
             Self::Daytona(b) => {
                 let timeout =
                     if name == "bash" { args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600) } else { 120 };
-                let data = b.rpc(
+                let data = b.rpc_with_tick(
                     json!({"op":"execute","name":name,"args":args,"policy":policy,"approval":approval}),
                     timeout + 20,
+                    tick,
                 )?;
                 Ok(data.as_str().context("invalid remote tool result")?.to_string())
             }
@@ -200,6 +209,10 @@ impl Backend {
 
 impl Bridge {
     fn rpc(&self, request: Value, timeout: u64) -> Result<Value> {
+        self.rpc_with_tick(request, timeout, &mut || {})
+    }
+
+    fn rpc_with_tick(&self, request: Value, timeout: u64, tick: &mut impl FnMut()) -> Result<Value> {
         let bytes = serde_json::to_vec(&request)?;
         if bytes.len() as u64 > MAX_RPC {
             bail!("remote tool request exceeds 1 MiB");
@@ -242,6 +255,7 @@ impl Bridge {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => bail!("tool bridge connection closed"),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     crate::signal::poll_keys();
+                    tick();
                     if crate::signal::interrupted() {
                         bail!("interrupted: remote tool outcome is unknown; inspect the sandbox before retrying");
                     }

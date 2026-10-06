@@ -23,6 +23,16 @@ pub struct Theme {
 
 pub const THEMES: &[Theme] = &[
     Theme {
+        name: "calm",
+        primary: (218, 143, 115),
+        accent: (230, 172, 137),
+        info: (226, 220, 211),
+        warn: (218, 186, 125),
+        muted: (126, 122, 117),
+        from: (218, 143, 115),
+        to: (226, 220, 211),
+    },
+    Theme {
         name: "rust",
         primary: (236, 122, 52),
         accent: (222, 64, 42),
@@ -196,7 +206,7 @@ pub fn height() -> usize {
 
 // ------------------------------------------------------------------ banner
 
-pub const FONTS: &[&str] = &["rust", "block", "thin", "classic"];
+pub const FONTS: &[&str] = &["minimal", "rust", "block", "thin", "classic"];
 
 pub fn set_font(name: &str) -> bool {
     match FONTS.iter().position(|f| *f == name) {
@@ -214,6 +224,7 @@ pub fn font() -> &'static str {
 
 fn art_for(font: &str) -> &'static [&'static str] {
     match font {
+        "minimal" => &["◇ rusty"],
         "thin" => &["┬─┐┬ ┬┌─┐┌┬┐┬ ┬", "├┬┘│ │└─┐ │ └┬┘", "┴└─└─┘└─┘ ┴  ┴ "],
         "classic" => &[
             " ___ _   _ ___ _______   __",
@@ -451,14 +462,19 @@ pub fn banner(b: &BannerInfo) {
     };
     let art_w = if slats { 76 } else { art_for(font()).iter().map(|l| l.chars().count()).max().unwrap_or(40) };
     println!();
-    println!("  {}", dim(&starfield(art_w)));
+    if font() != "minimal" {
+        println!("  {}", dim(&starfield(art_w)));
+    }
     for line in &art {
         println!("  {line}");
         pause(24);
     }
-    println!("  {}", dim(&starfield(art_w).chars().rev().collect::<String>()));
-    let (mission_line, dispatch) = mission();
-    println!("  {}  {}", primary(&mission_line), dim(&format!("// {dispatch}")));
+    if font() != "minimal" {
+        println!("  {}", dim(&starfield(art_w).chars().rev().collect::<String>()));
+        let (mission_line, dispatch) = mission();
+        println!("  {}  {}", primary(&mission_line), dim(&format!("// {dispatch}")));
+    }
+    let art_w = if font() == "minimal" { width().saturating_sub(4).min(84) } else { art_w };
     let rule = "─".repeat(art_w.min(width().saturating_sub(4)));
     let sep = dim(" · ");
     println!("  {}", dim(&rule));

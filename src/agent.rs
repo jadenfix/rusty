@@ -227,6 +227,7 @@ impl Agent {
     }
 
     fn show_pick(&self, d: &mut Display) {
+        d.mode(self.execution_mode);
         let name = self.execution_mode.name();
         d.line(&format!("  {} {}", ui::accent(&format!("◇ {name}")), ui::dim(&format!("auto · {}", self.mode_reason))));
     }
@@ -248,6 +249,7 @@ impl Agent {
         }
         self.apply_profile(ExecutionMode::Careful, why.to_string());
         self.checker_owed = !self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active && g.checker_used);
+        d.mode(self.execution_mode);
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("auto · switched up: {why}"))));
     }
 
@@ -289,7 +291,7 @@ impl Agent {
              Recent steps and the proposed completion:\n{}",
             ui::truncate(&recent, 24_000)
         );
-        let report = self.run_workers(vec![("careful check".into(), prompt)], d);
+        let report = self.run_workers(vec![("careful check".into(), prompt)], d, true);
         self.history.push(json!({"role": "user", "content": format!(
             "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
              There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
@@ -515,6 +517,7 @@ impl Agent {
         if !in_goal {
             self.checker_owed = !self.is_worker && self.execution_mode == ExecutionMode::Careful;
         }
+        d.mode(self.execution_mode);
         // The checker only reviews turns that changed something.
         let mut changed = false;
         let mut failures_in_a_row = 0;
@@ -742,6 +745,7 @@ impl Agent {
                 return Ok(Reply { content, finish_reason: Some("interrupted".into()), ..Default::default() });
             }
             signal::poll_keys();
+            d.tick();
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
@@ -790,13 +794,13 @@ impl Agent {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
                 Ok("plan updated".into())
             }
-            "task" => Ok(self.run_workers(vec![job(&args)], d)),
+            "task" => Ok(self.run_workers(vec![job(&args)], d, false)),
             "swarm" => {
                 let jobs: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten().map(job).collect();
                 if jobs.is_empty() {
                     Err(anyhow::anyhow!("swarm needs at least one task"))
                 } else {
-                    Ok(self.run_workers(jobs, d))
+                    Ok(self.run_workers(jobs, d, false))
                 }
             }
             "goal_done" => Ok(self.finish_goal(&args)),
@@ -894,7 +898,7 @@ impl Agent {
         if name == "bash" {
             return self.run_bash(args, &approval, d);
         }
-        self.backend.execute(name, args, &self.policy, &approval)
+        self.backend.execute_with_tick(name, args, &self.policy, &approval, &mut || d.tick())
     }
 
     /// A shell command that never ran still gets its audit line.
@@ -911,7 +915,7 @@ impl Agent {
     fn run_bash(&mut self, args: &Value, approval: &Verdict, d: &mut Display) -> Result<String> {
         let cmd = args["command"].as_str().unwrap_or("").to_string();
         let Some(action) = infra::inspect(&cmd) else {
-            return self.backend.execute("bash", args, &self.policy, approval);
+            return self.backend.execute_with_tick("bash", args, &self.policy, approval, &mut || d.tick());
         };
         if self.execution_mode == ExecutionMode::Careful {
             if let Some(refusal) = self.infra.gate(&action) {
@@ -937,7 +941,7 @@ impl Agent {
             d.set_status(String::new());
         }
         let started = Instant::now();
-        let mut out = self.backend.execute("bash", args, &self.policy, approval)?;
+        let mut out = self.backend.execute_with_tick("bash", args, &self.policy, approval, &mut || d.tick())?;
         let (outcome, exit) = infra::outcome(&out);
         self.infra.saw_dry_run(&action, exit);
         // In careful mode a change is not done until it is seen to be healthy.
@@ -1013,10 +1017,11 @@ impl Agent {
 
     /// Runs read-only workers in parallel threads and collects their reports.
     /// One job is a subagent; several are a swarm.
-    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display) -> String {
+    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display, review: bool) -> String {
         let cfg = self.agents.clone();
         let n = jobs.len().min(self.swarm_cap().max(1));
         let label = if n == 1 { "subagent" } else { "swarm" };
+        d.workers_start(n, review);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut counters = Vec::new();
         for (i, (desc, prompt)) in jobs.into_iter().take(n).enumerate() {
@@ -1051,6 +1056,7 @@ impl Agent {
                     .to_string();
                 let report = match result {
                     Err(e) => format!("failed: {e:#}"),
+                    Ok(false) => "failed: interrupted".to_string(),
                     Ok(_) if answer.is_empty() => "returned nothing".to_string(),
                     Ok(_) => answer,
                 };
@@ -1067,7 +1073,9 @@ impl Agent {
                     done += 1;
                     self.totals.merge(&totals);
                     let calls = counters[i].load(Ordering::Relaxed);
-                    let failed = report.starts_with("failed:");
+                    let failed = report.starts_with("failed:") || report == "returned nothing";
+                    let all_calls = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+                    d.worker_done(i, failed, all_calls);
                     if display::view() != View::Adhd {
                         let mark = if failed { ui::err("✗") } else { ui::ok("✓") };
                         let short_model = model.rsplit('/').next().unwrap_or(&model).to_string();
@@ -1085,13 +1093,12 @@ impl Agent {
                         break;
                     }
                     let calls: usize = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-                    d.set_status(format!("{label} {done}/{n} · {calls} tool calls"));
-                    d.tick();
+                    d.worker_progress(calls);
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        d.set_status(String::new());
+        d.workers_end();
         if done < n {
             return format!("{label} interrupted after {done} of {n} workers finished.\n\n{}", reports.join("\n\n"));
         }
@@ -1224,7 +1231,15 @@ impl Agent {
             }
             let delay = interval.or(ctl.next_delay).unwrap_or(300);
             println!("{}", ui::dim(&format!("  next run in {delay}s · ctrl-c to stop")));
-            signal::sleep(delay);
+            let mut wait = Display::new(false);
+            wait.set_status(format!("next run in {delay}s · Enter to steer"));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(delay);
+            while std::time::Instant::now() < end && !signal::interrupted() {
+                signal::poll_keys();
+                wait.tick();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(wait);
             if signal::interrupted() {
                 break Ok(());
             }
@@ -1302,7 +1317,7 @@ impl Agent {
             Some(f) if !f.trim().is_empty() => format!("compacting · focus: {}", ui::truncate(f.trim(), 40)),
             _ => "compacting".into(),
         });
-        let reply = self.ask(&mut Display::new(true), messages, json!([]));
+        let reply = self.ask(d, messages, json!([]));
         d.set_status(String::new());
         let reply = reply?;
         if let Some(u) = reply.usage {
@@ -1433,6 +1448,10 @@ enum Answer {
 /// once, by typing `yes` in full, and never in a session nobody is watching.
 fn ask_user(why: &str, destructive: bool) -> Answer {
     use std::io::IsTerminal;
+    let _input = signal::suspend_input();
+    if signal::interrupted() {
+        return Answer::No(Some("the user stopped the turn".into()));
+    }
     if !std::io::stdin().is_terminal() {
         return Answer::No(Some(if destructive {
             format!(
@@ -1480,9 +1499,9 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         Err(_) => return Answer::No(None),
     };
     match line.trim() {
-        "" | "y" | "Y" | "yes" => Answer::Yes,
+        "y" | "Y" | "yes" => Answer::Yes,
         "a" | "A" | "always" => Answer::Always,
-        "n" | "N" | "no" => Answer::No(None),
+        "" | "n" | "N" | "no" => Answer::No(None),
         other => Answer::No(Some(other.to_string())),
     }
 }

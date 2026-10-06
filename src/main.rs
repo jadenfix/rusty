@@ -6,6 +6,7 @@ mod display;
 mod execution;
 mod footer;
 mod infra;
+mod input;
 mod llm;
 mod markdown;
 mod memory;
@@ -324,29 +325,43 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         keys: client.key_count(),
         target: &target_line(agent),
     });
-    let mut rl = rustyline::DefaultEditor::new()?;
+    use rustyline::{CompletionType, Config, Editor, EventHandler, KeyEvent};
+    let editor_config = Config::builder().completion_type(CompletionType::List).max_history_size(100)?.build();
+    let mut rl = Editor::<input::PromptHelper, rustyline::history::DefaultHistory>::with_config(editor_config)?;
+    rl.set_helper(Some(input::PromptHelper::new(cwd)));
+    rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(Box::new(input::PromptKeys)));
+    rl.bind_sequence(KeyEvent::from('\t'), EventHandler::Conditional(Box::new(input::PromptKeys)));
+    rl.bind_sequence(KeyEvent::ctrl('J'), rustyline::Cmd::Insert(1, "\n".into()));
+    rl.bind_sequence(
+        KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::ALT),
+        rustyline::Cmd::Insert(1, "\n".into()),
+    );
     let history_file = config::config_dir().map(|d| d.join("history"));
     if let Some(h) = &history_file {
         let _ = rl.load_history(h);
     }
-    let prompt = format!("{} ", ui::primary("›"));
     let mut armed_quit = false;
 
     loop {
-        // Something typed while the last turn ran goes next, as if just entered.
-        if let Some(queued) = signal::take_queued() {
-            println!("{} {}", ui::primary("›"), queued);
-            println!("{}", ui::dim("  (typed while rusty was working)"));
-            signal::restore_terminal();
-            signal::reset();
-            let _ = rl.add_history_entry(rusty::privacy::redact(&queued).0);
-            if let Err(e) = agent.run_turn(&queued) {
-                println!("{} {e:#}\n", ui::err("error:"));
+        rl.helper_mut().unwrap().enabled = settings.suggestions && std::env::var_os("RUSTY_NO_SUGGEST").is_none();
+        let prompt = format!("{} ", ui::primary("›"));
+        let draft = signal::take_draft();
+        let entered = match draft {
+            Some(d) if d.submitted => {
+                println!("{} {}", ui::primary("›"), d.text);
+                Ok(d.text)
             }
-            agent.save_session();
-            continue;
-        }
-        let mut input = match rl.readline(&prompt) {
+            Some(d) => {
+                armed_quit = false;
+                if d.truncated {
+                    println!("  draft reached 64KiB; check it before sending");
+                }
+                println!("{}", ui::dim("  draft kept · Enter to send, Ctrl-C to clear"));
+                rl.readline_with_initial(&prompt, (&d.text[..d.cursor], &d.text[d.cursor..]))
+            }
+            None => rl.readline(&prompt),
+        };
+        let input = match entered {
             Ok(l) => {
                 armed_quit = false;
                 l
@@ -362,16 +377,8 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             Err(ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
-        // A trailing backslash continues the message on the next line.
-        while input.ends_with('\\') {
-            input.pop();
-            input.push('\n');
-            match rl.readline("  ") {
-                Ok(l) => input.push_str(&l),
-                Err(_) => break,
-            }
-        }
-        let input = input.trim().to_string();
+        // Native multiline editing owns cancellation as well as continuation.
+        let input = input.replace("\\\n", "\n").trim().to_string();
         if input.is_empty() {
             continue;
         }
@@ -379,6 +386,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         signal::restore_terminal();
         signal::reset();
 
+        let busy = signal::begin_busy(rl.helper().unwrap().busy_suggestions(rl.history().iter()));
         let result = if input.starts_with('/') {
             match command(agent, client, cwd, settings, &input) {
                 Ok(true) => break,
@@ -391,6 +399,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if let Err(e) = result {
             println!("{} {e:#}\n", ui::err("error:"));
         }
+        drop(busy);
         agent.save_session();
     }
     if let Some(h) = &history_file {
@@ -469,8 +478,32 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!("  current tools {} · reasoning and memory in this process", agent.backend.summary());
         }
         "/models" => {
-            for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
-                println!("  {m}");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let c = Arc::clone(client);
+            std::thread::spawn(move || {
+                let _ = tx.send(c.list_models());
+            });
+            let mut d = display::Display::new(false);
+            d.set_status("listing models".into());
+            loop {
+                signal::poll_keys();
+                d.tick();
+                if signal::interrupted() {
+                    d.pause();
+                    println!("  stopped");
+                    break;
+                }
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(models) => {
+                        d.pause();
+                        for m in models?.into_iter().filter(|m| m.contains(rest)) {
+                            println!("  {m}");
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         "/compact" => agent.compact(Some(rest).filter(|r| !r.is_empty()))?,
@@ -507,7 +540,8 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         }
         "/font" => {
             if rest.is_empty() || !ui::set_font(rest) {
-                println!("  font {} {}", ui::bold(ui::font()), ui::dim(&format!("({})", ui::FONTS.join(" · "))));
+                println!("  banner {} {}", ui::bold(ui::font()), ui::dim(&format!("({})", ui::FONTS.join(" · "))));
+                println!("  {}", ui::dim("Text font and size come from your terminal's profile settings."));
             } else {
                 settings.font = rest.to_string();
                 settings.save();
@@ -549,6 +583,15 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 settings.agents = agent.agents.clone();
                 settings.save();
             }
+        }
+        "/suggestions" => {
+            settings.suggestions = match rest {
+                "on" => true,
+                "off" => false,
+                _ => !settings.suggestions,
+            };
+            settings.save();
+            println!("  suggestions {} · Tab completes commands and paths", on_off(settings.suggestions));
         }
         "/tips" => {
             agent.tips = match rest {
@@ -1020,7 +1063,12 @@ fn print_help(cwd: &Path) {
                 ("/changes · /audit [n]", "what this session changed in infrastructure · the audit log"),
                 ("/model [id] · /models", "switch or list models"),
                 ("/view default|verbose|adhd", "how much you see"),
-                ("/theme · /font", "themes rust neon matrix amber ice mono · fonts rust block thin classic"),
+                (
+                    "/theme · /font",
+                    "themes calm rust neon matrix amber ice mono · banners minimal rust block thin classic",
+                ),
+                ("/suggestions on|off", "local command and history hints; Tab accepts"),
+                ("Ctrl-J · Alt-Enter · backslash + Enter", "new line; Ctrl-C clears draft; Esc stops work"),
                 ("/tips · /settings · /exit", ""),
             ],
         ),

@@ -9,7 +9,8 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub fn install() {
     let _ = ctrlc::set_handler(|| {
         if INTERRUPTED.swap(true, Ordering::SeqCst) {
-            eprintln!("\nbye");
+            restore_terminal();
+            eprint!("\x1b[?2004l\x1b[?25h\nbye\n");
             std::process::exit(130);
         }
     });
@@ -23,59 +24,127 @@ pub fn reset() {
     INTERRUPTED.store(false, Ordering::SeqCst);
 }
 
-/// Sleeps for `secs`, waking early if the user presses Ctrl-C.
-pub fn sleep(secs: u64) {
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < end && !interrupted() {
-        poll_keys();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-}
-
 /// Marks the current turn as interrupted (e.g. Ctrl-C at an approval prompt).
 pub fn trip() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-static QUEUED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static DRAFT: std::sync::Mutex<Option<crate::input::Draft>> = std::sync::Mutex::new(None);
 
-/// Called while a turn runs. Ctrl-C normally arrives as SIGINT, but if the
-/// terminal ever hands it over as a raw byte this catches it too. Anything
-/// else typed during a turn is queued and becomes the next message.
-pub fn poll_keys() {
-    unsafe {
-        if libc::isatty(0) != 1 {
-            return;
-        }
-        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
-        if libc::poll(&mut p, 1, 0) <= 0 || p.revents & libc::POLLIN == 0 {
-            return;
-        }
-        let mut buf = [0u8; 512];
-        let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
-        if n <= 0 {
-            return;
-        }
-        let bytes = &buf[..n as usize];
-        if bytes.contains(&3) {
-            if INTERRUPTED.swap(true, Ordering::SeqCst) {
-                eprintln!("\nbye");
-                std::process::exit(130);
+/// Only the interactive REPL owns a composer. Headless callers never read stdin.
+pub struct BusyInput(bool);
+impl Drop for BusyInput {
+    fn drop(&mut self) {
+        if self.0 {
+            poll_keys();
+            if let Ok(mut draft) = DRAFT.lock() {
+                if let Some(d) = draft.as_mut() {
+                    d.active = false;
+                }
             }
-            return;
-        }
-        if let Ok(mut q) = QUEUED.lock() {
-            q.push_str(&String::from_utf8_lossy(bytes));
+            restore_terminal();
+            print!("\x1b[?2004l\x1b[?25h");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }
 }
 
-/// A message typed while the last turn was running, if any.
-pub fn take_queued() -> Option<String> {
-    let mut q = QUEUED.lock().ok()?;
-    let text = std::mem::take(&mut *q);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+fn raw_busy() {
+    if let Some(Some(cooked)) = COOKED.get() {
+        let mut t = *cooked;
+        t.c_lflag &= !(libc::ICANON | libc::ECHO);
+        t.c_lflag |= libc::NOFLSH | libc::ISIG;
+        t.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IGNCR | libc::IXON);
+        // ISIG stays enabled: Ctrl-C still interrupts child commands.
+        t.c_cc[libc::VMIN] = 0;
+        t.c_cc[libc::VTIME] = 0;
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+        print!("\x1b[?2004h\x1b[?25h");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+pub fn begin_busy(suggestions: Vec<String>) -> BusyInput {
+    let enabled = crate::ui::tty() && crate::ui::height() >= 2 && unsafe { libc::isatty(0) == 1 };
+    if enabled {
+        if let Ok(mut draft) = DRAFT.lock() {
+            let mut d = crate::input::Draft::default();
+            d.active = true;
+            d.suggestions = suggestions;
+            *draft = Some(d);
+        }
+        raw_busy();
+    }
+    BusyInput(enabled)
+}
+
+/// Approval editors have exclusive ownership of stdin. A busy draft is kept in
+/// memory and cannot be used as an answer to the approval question.
+pub struct SuspendedInput(bool);
+impl Drop for SuspendedInput {
+    fn drop(&mut self) {
+        if self.0 {
+            if let Ok(mut draft) = DRAFT.lock() {
+                if let Some(d) = draft.as_mut() {
+                    d.active = true;
+                }
+            }
+            raw_busy();
+        }
+    }
+}
+pub fn suspend_input() -> SuspendedInput {
+    poll_keys();
+    let active = DRAFT
+        .lock()
+        .ok()
+        .and_then(|mut draft| {
+            draft.as_mut().map(|d| {
+                let active = d.active;
+                d.active = false;
+                active
+            })
+        })
+        .unwrap_or(false);
+    if active {
+        restore_terminal();
+        print!("\x1b[?2004l\x1b[?25h");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    SuspendedInput(active)
+}
+
+/// Polling fits the existing model/tool event loops; no second render thread.
+pub fn poll_keys() {
+    let Ok(mut draft) = DRAFT.lock() else {
+        return;
+    };
+    let Some(d) = draft.as_mut().filter(|d| d.active && !d.submitted) else {
+        return;
+    };
+    if d.escape_expired() {
+        trip();
+    }
+    unsafe {
+        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        if libc::poll(&mut p, 1, 0) <= 0 || p.revents & libc::POLLIN == 0 {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
+        if n > 0 && d.feed(&buf[..n as usize]) {
+            trip();
+        }
+    }
+}
+
+pub fn take_draft() -> Option<crate::input::Draft> {
+    DRAFT.lock().ok()?.take().filter(|d| !d.text.is_empty())
+}
+pub fn composer(cells: usize) -> Option<(String, usize, String)> {
+    DRAFT.lock().ok()?.as_ref().filter(|d| d.active).map(|d| d.preview(cells))
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).
@@ -94,7 +163,16 @@ pub fn save_terminal() {
 pub fn restore_terminal() {
     if let Some(Some(t)) = COOKED.get() {
         unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, t);
+            let mut normal = *t;
+            // Some PTY launchers start with ISIG off. Plain-output turns have
+            // no key composer, so Ctrl-C must still reach the signal handler.
+            normal.c_lflag |= libc::ISIG;
+            libc::tcsetattr(0, libc::TCSANOW, &normal);
         }
     }
+}
+
+/// A bounded draft must never silently submit a truncated paste.
+pub fn draft_limited() -> bool {
+    DRAFT.lock().ok().and_then(|draft| draft.as_ref().map(|d| d.truncated)).unwrap_or(false)
 }
