@@ -38,13 +38,14 @@ How hard rusty works and what it's allowed to touch are separate settings.
 never quietly means "go unguarded".
 
 Careful mode doesn't trust the first "done". When a turn that changed
-something ends, or a goal calls `goal_done`, rusty asks the model for two
-more passes over the actual result. They're a second and third look, with
-tools available, not an independent grader. A plain question gets no
-extra passes, and a goal gets two in total, however many turns it takes,
-because extra passes on every turn cost far more than they find.
-rusty marks these prompts as its own, so compaction never carries them
-over as something you said.
+something ends, or a goal calls `goal_done`, one read-only worker gets the
+task, your messages, the working set and the last few steps, and reviews
+the result with fresh context. The main agent fixes what it finds and
+verifies the fix. There's no second review, because a reviewer reviewing
+the reviewer costs more than it finds. A plain question isn't reviewed,
+and a goal is reviewed once however many turns it takes. The review comes
+back marked as rusty's own, so compaction never carries it over as
+something you said.
 
 ## First principles for tools
 
