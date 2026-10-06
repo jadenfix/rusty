@@ -16,8 +16,35 @@ use crate::config::Provider;
 use crate::execution::ExecutionMode;
 use crate::ui::truncate;
 
-/// Rounds of retries across every key before a request gives up.
-const ROUNDS: usize = 6;
+/// How long a request keeps retrying rate limits and server errors before it
+/// gives up, unless `RUSTY_RETRY_SECS` says otherwise. Long enough to ride out
+/// a free tier's per-minute limit with several agents sharing one key.
+const RETRY_SECS: u64 = 300;
+/// The longest single wait, whatever a Retry-After header asks for.
+const MAX_WAIT_SECS: u64 = 120;
+
+/// How hard a request tries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Retry {
+    /// One pass over the keys: for checks that should answer quickly.
+    Once,
+    /// Keep backing off within the retry budget.
+    Patient,
+}
+
+fn retry_budget() -> Duration {
+    let secs = std::env::var("RUSTY_RETRY_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(RETRY_SECS);
+    Duration::from_secs(secs.min(3600))
+}
+
+/// The wait before retry round `round` (1-based): the server's Retry-After
+/// when it gave one, else 2, 4, 8, 16, then 30 seconds, each with up to 25%
+/// jitter so agents sharing a key don't all come back at the same moment.
+fn backoff(round: u32, retry_after: Option<u64>) -> Duration {
+    let base = retry_after.unwrap_or_else(|| 2u64.saturating_pow(round).min(30)).min(MAX_WAIT_SECS);
+    let jitter = base * 250 * crate::ui::rand(1000) as u64 / 1_000_000;
+    Duration::from_millis(base * 1000 + jitter)
+}
 
 /// What a background request sends back to the UI thread.
 pub enum Event {
@@ -203,7 +230,7 @@ impl Client {
         let mut ids = Vec::new();
         let mut last_err = None;
         for ep in &self.endpoints {
-            match self.models_of(ep, ROUNDS) {
+            match self.models_of(ep, Retry::Patient) {
                 Ok(found) => ids.extend(found),
                 Err(e) => last_err = Some(e),
             }
@@ -218,88 +245,106 @@ impl Client {
         Ok(ids)
     }
 
-    /// One provider's model ids. `rounds` bounds the retries: the doctor
-    /// asks once, so a bad key answers in a second instead of a minute.
-    pub fn models_of(&self, ep: &Endpoint, rounds: usize) -> Result<Vec<String>> {
+    /// One provider's model ids. The doctor asks with `Retry::Once`, so a bad
+    /// key answers in a second instead of after the whole retry budget.
+    pub fn models_of(&self, ep: &Endpoint, retry: Retry) -> Result<Vec<String>> {
         let url = match ep.provider {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
             _ => format!("{}/models", ep.base_url),
         };
-        let v: Value = self.send_rounds(ep, &url, None, None, rounds)?.json().context("bad /models response")?;
+        let v: Value = self.send_with(ep, &url, None, None, retry)?.json().context("bad /models response")?;
         let data = v["data"].as_array().ok_or_else(|| anyhow!("unexpected /models response"))?;
         let mut ids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
         ids.sort();
         Ok(ids)
     }
 
-    /// Sends a request, rotating keys and backing off on 429 / 5xx / auth
-    /// errors. Rounds wait 2, 4, 8, 16, then 30 seconds (or what the server
-    /// asks for in Retry-After), which rides out about a minute of rate limits.
+    /// Sends a request, rotating keys and backing off on rate limits, server
+    /// errors and dropped connections until the retry budget runs out
+    /// (`RUSTY_RETRY_SECS`, default five minutes). A key that is refused (401
+    /// or 403) twice is not worth waiting on, so auth failures give up once
+    /// every key has been refused twice. Ctrl-C ends a wait at once.
     fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>) -> Result<Response> {
-        self.send_rounds(ep, url, body, beta, ROUNDS)
+        self.send_with(ep, url, body, beta, Retry::Patient)
     }
 
-    fn send_rounds(
+    fn send_with(
         &self,
         ep: &Endpoint,
         url: &str,
         body: Option<&Value>,
         beta: Option<&str>,
-        rounds: usize,
+        retry: Retry,
     ) -> Result<Response> {
         let keys = &ep.keys;
-        let attempts = keys.len() * rounds.max(1);
+        let started = std::time::Instant::now();
+        let budget = if retry == Retry::Once { Duration::ZERO } else { retry_budget() };
+        let mut refused = vec![0u32; keys.len()];
         let mut last_err = String::new();
         let mut retry_after: Option<u64> = None;
-        for attempt in 0..attempts {
-            let idx = ep.key_idx.load(Ordering::Relaxed) % keys.len();
-            let key = &keys[idx];
-            let mut req = match body {
-                Some(b) => self.http.post(url).json(b),
-                None => self.http.get(url),
-            };
-            req = if ep.provider == Provider::Anthropic {
-                req.header("x-api-key", key).header("anthropic-version", anthropic::VERSION)
-            } else {
-                req.bearer_auth(key)
-            };
-            if let Some(b) = beta {
-                req = req.header("anthropic-beta", b);
-            }
-            match req.send() {
-                Ok(r) if r.status().is_success() => return Ok(r),
-                Ok(r) => {
-                    let status = r.status();
-                    if let Some(secs) = r
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                    {
-                        retry_after = Some(retry_after.unwrap_or(0).max(secs.min(60)));
-                    }
-                    let text = r.text().unwrap_or_default();
-                    last_err = format!("HTTP {status}: {}", truncate(text.trim(), 400));
-                    let retryable = status.as_u16() == 429
-                        || status.is_server_error()
-                        || status.as_u16() == 401
-                        || status.as_u16() == 403;
-                    if !retryable {
-                        bail!(last_err);
-                    }
+        let mut attempts = 0usize;
+        let mut round = 0u32;
+        loop {
+            for _ in 0..keys.len() {
+                let idx = ep.key_idx.load(Ordering::Relaxed) % keys.len();
+                let key = &keys[idx];
+                let mut req = match body {
+                    Some(b) => self.http.post(url).json(b),
+                    None => self.http.get(url),
+                };
+                req = if ep.provider == Provider::Anthropic {
+                    req.header("x-api-key", key).header("anthropic-version", anthropic::VERSION)
+                } else {
+                    req.bearer_auth(key)
+                };
+                if let Some(b) = beta {
+                    req = req.header("anthropic-beta", b);
                 }
-                Err(e) => last_err = format!("request failed: {e}"),
+                attempts += 1;
+                match req.send() {
+                    Ok(r) if r.status().is_success() => return Ok(r),
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        if let Some(secs) = r
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                        {
+                            retry_after = Some(retry_after.unwrap_or(0).max(secs));
+                        }
+                        let text = r.text().unwrap_or_default();
+                        last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
+                        match status {
+                            401 | 403 => refused[idx] += 1,
+                            429 | 500..=599 => {}
+                            _ => bail!(last_err),
+                        }
+                    }
+                    Err(e) => last_err = format!("request failed: {e}"),
+                }
+                ep.key_idx.store((idx + 1) % keys.len(), Ordering::Relaxed);
             }
-            ep.key_idx.store((idx + 1) % keys.len(), Ordering::Relaxed);
-            // Back off once every key has been tried in this round.
-            if (attempt + 1) % keys.len() == 0 && attempt + 1 < attempts {
-                let round = (attempt + 1) / keys.len();
-                let wait = retry_after.take().unwrap_or_else(|| 2u64.pow(round as u32).min(30));
-                std::thread::sleep(Duration::from_secs(wait));
+            round += 1;
+            let wait = backoff(round, retry_after.take());
+            let all_refused = refused.iter().all(|n| *n >= 2);
+            if all_refused || started.elapsed() + wait > budget {
+                bail!("giving up after {attempts} attempts in {}s: {last_err}", started.elapsed().as_secs());
+            }
+            let until = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < until {
+                if crate::signal::interrupted() {
+                    bail!("interrupted while waiting to retry: {last_err}");
+                }
+                std::thread::sleep(Duration::from_millis(100).min(until - std::time::Instant::now()));
             }
         }
-        bail!("giving up after {attempts} attempts: {last_err}")
     }
+}
+
+/// "429 Too Many Requests" style, as reqwest prints a status.
+fn r_status(code: u16) -> String {
+    reqwest::StatusCode::from_u16(code).map(|s| s.to_string()).unwrap_or_else(|_| code.to_string())
 }
 
 /// OpenAI's own API: reasoning models (gpt-5, o-series) take
@@ -443,6 +488,18 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, tc: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn backoff_grows_then_caps_and_honours_retry_after() {
+        for round in 1..8 {
+            let d = backoff(round, None).as_millis() as u64;
+            let base = 2u64.pow(round).min(30) * 1000;
+            assert!(d >= base && d <= base + base / 4, "round {round}: {d}");
+        }
+        assert!(backoff(1, Some(90)).as_secs() >= 90);
+        assert!(backoff(1, Some(10_000)).as_secs() <= MAX_WAIT_SECS + MAX_WAIT_SECS / 4);
+        assert_eq!(backoff(3, Some(0)), Duration::ZERO);
+    }
 
     #[test]
     fn openai_reasoning_models_get_their_own_parameters() {

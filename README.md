@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-123%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-127%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-NVIDIA%20%C2%B7%20Anthropic%20%C2%B7%20OpenAI%20%C2%B7%20any%20compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -126,7 +126,10 @@ rusty --doctor                                # which providers are set up and a
 Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
 to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,
-…), rusty rotates through them and backs off politely when rate limited.
+…), rusty rotates through them and backs off politely when rate limited:
+it keeps retrying rate limits and server errors for up to five minutes
+(`RUSTY_RETRY_SECS`), with jitter so parallel agents don't retry in step, and
+gives up quickly on a key that is refused.
 
 ## Commands
 
@@ -247,7 +250,7 @@ scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 123 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 127 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |

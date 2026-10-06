@@ -871,7 +871,9 @@ fn scripted_http(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHan
                 headers,
                 if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap() },
             ));
-            write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
+            // Rate limits ask for no wait, so retry tests run in milliseconds.
+            let retry = if status == 429 { "Retry-After: 0\r\n" } else { "" };
+            write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
         }
         requests
     });
@@ -1474,4 +1476,48 @@ fn switching_to_a_model_without_its_key_warns_at_once() {
     let out = s.repl(&["/model gpt-5", "/model openai/gpt-oss-20b"]);
     assert!(out.contains("model gpt-5 · openai needs OPENAI_API_KEY"), "{out}");
     assert!(out.contains("model openai/gpt-oss-20b · compatible"), "{out}");
+}
+
+#[test]
+fn a_long_rate_limit_is_ridden_out() {
+    let s = Sandbox::new("rate-limit");
+    let mut responses: Vec<(u16, String)> = (0..8).map(|_| (429, r#"{"error":"slow down"}"#.to_string())).collect();
+    responses.push((200, format!("data: {}\n\ndata: [DONE]\n\n", text_reply("made it"))));
+    let (url, server) = scripted_http(responses);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("made it"));
+    assert_eq!(server.join().unwrap().len(), 9, "eight rate limits, then the answer");
+}
+
+#[test]
+fn retries_stop_at_the_budget() {
+    let s = Sandbox::new("retry-budget");
+    let (url, server) = scripted_http(vec![(429, r#"{"error":"slow down"}"#.into())]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_RETRY_SECS", "0")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("giving up after 1 attempts") && err.contains("429"), "{err}");
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn a_refused_key_fails_fast() {
+    let s = Sandbox::new("refused-key");
+    let refused = (401, r#"{"error":"bad key"}"#.to_string());
+    let (url, server) = scripted_http(vec![refused.clone(), refused]);
+    let started = Instant::now();
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("giving up after 2 attempts") && err.contains("401"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
+    assert_eq!(server.join().unwrap().len(), 2);
 }
