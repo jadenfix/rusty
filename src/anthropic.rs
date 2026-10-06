@@ -66,9 +66,11 @@ pub fn request(
 ) -> (Value, Option<String>) {
     let (system, msgs) = convert(messages);
     let caps = caps(model);
+    // Claude 3 models stop at 8,192 output tokens and reject more.
+    let max_tokens = if model.starts_with("claude-3") { 8192 } else { MAX_TOKENS };
     let mut body = json!({
         "model": model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "stream": true,
         "messages": msgs,
         // Caches the longest stable prefix (tools, then system, then history).
@@ -149,10 +151,12 @@ pub fn convert(messages: &[Value]) -> (String, Vec<Value>) {
                 }
             }
             "tool" => {
+                let text = text_of(&m["content"]);
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": m["tool_call_id"].as_str().unwrap_or(""),
-                    "content": text_of(&m["content"]),
+                    // The API rejects an empty result; a silent command still answered.
+                    "content": if text.trim().is_empty() { "(no output)".to_string() } else { text },
                 });
                 push_user(&mut out, block);
             }
@@ -184,7 +188,12 @@ fn text_of(v: &Value) -> String {
 /// from the OpenAI fields.
 fn assistant_blocks(m: &Value) -> Vec<Value> {
     if let Some(raw) = m[BLOCKS_KEY].as_array().filter(|b| !b.is_empty()) {
-        return raw.clone();
+        // A whitespace-only text block is rejected when sent back.
+        return raw
+            .iter()
+            .filter(|b| b["type"] != "text" || b["text"].as_str().is_some_and(|t| !t.trim().is_empty()))
+            .cloned()
+            .collect();
     }
     let mut blocks = Vec::new();
     if let Some(text) = m["content"].as_str().filter(|s| !s.trim().is_empty()) {
@@ -624,6 +633,22 @@ mod tests {
 
         let (body, beta) = request("claude-opus-5-5", &msgs, &json!([]), ExecutionMode::Standard, false);
         assert!(body.get("fallbacks").is_none() && beta.is_none(), "betas only on Anthropic's own API");
+    }
+
+    #[test]
+    fn never_sends_blocks_the_api_rejects() {
+        let history = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": "", "_anthropic": [
+                {"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "\n\n"},
+                {"type": "tool_use", "id": "t", "name": "bash", "input": {}}]}),
+            json!({"role": "tool", "tool_call_id": "t", "content": ""}),
+        ];
+        let (_, msgs) = convert(&history);
+        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2, "whitespace text dropped");
+        assert_eq!(msgs[2]["content"][0]["content"], "(no output)");
+        let (body, _) = request("claude-3-5-haiku-latest", &history, &json!([]), ExecutionMode::Careful, true);
+        assert_eq!(body["max_tokens"], 8192);
     }
 
     #[test]
