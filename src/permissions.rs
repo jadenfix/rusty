@@ -228,11 +228,14 @@ struct Ctx<'a> {
     /// somewhere unknown, so relative paths can't be trusted any more.
     here: Option<PathBuf>,
     depth: u8,
+    /// The command has a `case`, so a leading `pat)` is an arm, not the end
+    /// of a subshell.
+    in_case: bool,
 }
 
 impl<'a> Ctx<'a> {
     fn new(root: &'a Path) -> Self {
-        Self { root, here: Some(root.to_path_buf()), depth: 0 }
+        Self { root, here: Some(root.to_path_buf()), depth: 0, in_case: false }
     }
 
     fn deeper(&self) -> Self {
@@ -361,6 +364,7 @@ fn classify_in(cmd: &str, ctx: &mut Ctx) -> Class {
         worst = worst.max(risky("pipes a download into a shell"));
     }
     let segments = split_segments(&main);
+    ctx.in_case = segments.iter().any(|s| s.split_whitespace().next() == Some("case"));
     for (i, seg) in segments.iter().enumerate() {
         worst = worst.max(classify_segment(seg, ctx));
         // `... | sh` runs whatever the previous command printed, unless that
@@ -564,7 +568,17 @@ fn is_assignment(w: &str) -> bool {
 }
 
 fn classify_segment(seg: &str, ctx: &mut Ctx) -> Class {
-    let owned = shell_words(seg);
+    let mut owned = shell_words(seg);
+    // A `case` arm runs what follows its pattern: `a) cmd` or `case $x in a) cmd`.
+    let arm = owned.iter().position(|w| !w.starts_with('\'') && w.ends_with(')') && !w.contains('('));
+    if owned.first().is_some_and(|w| w == "case") {
+        match arm {
+            Some(i) => drop(owned.drain(..=i)),
+            None => return Class::ReadOnly,
+        }
+    } else if arm == Some(0) && ctx.in_case {
+        owned.remove(0);
+    }
     let words: Vec<&str> = owned
         .iter()
         .map(|w| {
@@ -757,6 +771,13 @@ fn classify_words(w: &[&str], ctx: &mut Ctx) -> Class {
             let start = inner.iter().position(|a| !is_assignment(unq(a))).unwrap_or(inner.len());
             classify_words(&inner[start..], ctx)
         }
+        // Shell grammar: a keyword runs the command after it, if any.
+        "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "fi" | "done" | "esac" => {
+            classify_words(args, ctx)
+        }
+        // `for x in a b c` only names values; anything it runs is a `$(...)`,
+        // checked on its own.
+        "for" | "select" => Class::ReadOnly,
         "nice" | "nohup" | "stdbuf" | "caffeinate" | "unbuffer" | "chronic" | "ionice" | "exec" | "builtin" => {
             classify_words(skip_options(args, &["-n", "-c", "-i", "-o", "-e"]), ctx)
         }
@@ -2464,6 +2485,38 @@ mod tests {
             |c| matches!(c, Class::Risky(_)),
             "risky",
         );
+    }
+
+    #[test]
+    fn shell_keywords_are_grammar_not_commands() {
+        assert_all(
+            &[
+                "if [ -d x ]; then echo a; fi",
+                "if [ -d x ]\nthen\n  echo a\nelse\n  echo b\nfi",
+                "for f in *.txt; do echo $f; done",
+                "for f in *.txt\ndo\n  cat \"$f\"\ndone",
+                "while read l; do echo $l; done < f",
+                "until grep -q ok log; do sleep 1; done",
+                "case $x in a) echo a;; *) ls;; esac",
+                "case \"$1\" in\n  start) echo go ;;\n  *) echo usage ;;\nesac",
+            ],
+            |c| *c == Class::ReadOnly,
+            "read-only",
+        );
+        // What runs inside them is still checked.
+        for (cmd, want) in [
+            ("for p in a b; do cargo test -p $p; done", Class::WorkspaceWrite),
+            ("for f in *.log; do rm \"$f\"; done", Class::Risky(String::new())),
+            ("if true; then rm -rf /; fi", Class::Destructive(String::new())),
+            ("case $x in a) rm -rf ~ ;; esac", Class::Destructive(String::new())),
+            ("while true; do git push --force; done", Class::Destructive(String::new())),
+            ("for f in $(rm -rf /); do :; done", Class::Destructive(String::new())),
+            // Without a `case`, `x)` ends a subshell and x still runs.
+            ("(cd sub; reboot)", Class::Destructive(String::new())),
+        ] {
+            let got = classify_command(cmd, Path::new("/tmp/project"));
+            assert_eq!(std::mem::discriminant(&got), std::mem::discriminant(&want), "{cmd}: {got:?}");
+        }
     }
 
     #[test]
