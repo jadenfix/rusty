@@ -1521,3 +1521,30 @@ fn a_refused_key_fails_fast() {
     assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
     assert_eq!(server.join().unwrap().len(), 2);
 }
+
+#[test]
+fn an_overload_inside_the_stream_is_retried() {
+    let s = Sandbox::new("stream-overload");
+    let overloaded =
+        r#"data: {"error":{"code":503,"message":"Service temporarily overloaded","type":"service_unavailable"}}"#;
+    let (url, server) = scripted_sse(vec![
+        format!("{overloaded}\n\n"),
+        format!("data: {}\n\ndata: [DONE]\n\n", text_reply("reviewed it")),
+    ]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("review this").stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("reviewed it"));
+    assert_eq!(server.join().unwrap().len(), 2, "the overloaded stream was retried once");
+}
+
+#[test]
+fn an_error_after_text_has_streamed_is_not_retried() {
+    let s = Sandbox::new("stream-late-error");
+    let partial = serde_json::json!({"choices": [{"delta": {"content": "half an answer"}, "finish_reason": null}]});
+    let body = format!("data: {partial}\n\ndata: {}\n\n", r#"{"error":{"code":503,"message":"overloaded"}}"#);
+    let (url, server) = scripted_sse(vec![body]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overloaded"));
+    assert_eq!(server.join().unwrap().len(), 1, "a retry would repeat text the user already saw");
+}
