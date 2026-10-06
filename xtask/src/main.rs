@@ -4,8 +4,12 @@
 //!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
+//!     cargo xtask eval [TASKS]         run the evals against a live model (see eval.rs)
+//!     cargo xtask eval-report FILE...  summarise eval runs from target/evals/*.jsonl
 
+mod eval;
 mod message;
+mod report;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -39,8 +43,13 @@ fn run(args: &[String]) -> Result<ExitCode> {
             Ok(verdict(problem))
         }
         Some("install-hooks") => install_hooks().map(|()| ExitCode::SUCCESS),
+        Some("eval") => eval::run(rest.first().map_or("", String::as_str)).map(passed),
+        Some("eval-report") => report::run(rest).map(passed),
         _ => {
-            eprintln!("usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks>");
+            eprintln!(
+                "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks \
+                 | eval [TASKS] | eval-report FILE.jsonl...>"
+            );
             Ok(ExitCode::from(2))
         }
     }
@@ -53,6 +62,14 @@ fn read_arg(path: &str) -> Result<String> {
         Ok(s)
     } else {
         std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
+    }
+}
+
+fn passed(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -118,7 +135,9 @@ fn qa(live: bool) -> Result<()> {
             Err(_) => println!("expect not installed; skipping the terminal check"),
         }
         step("evals");
-        sh("scripts/eval.sh", &[])?;
+        if !eval::run("")? {
+            bail!("the evals failed");
+        }
     }
     println!("\n\x1b[32m✓ qa passed\x1b[0m");
     Ok(())
