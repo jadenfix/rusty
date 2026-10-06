@@ -34,6 +34,10 @@ def main():
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Provider)
     threading.Thread(target=server.serve_forever,daemon=True).start()
     reports=[]
+    expected_journeys=len(args.case or CASES)*4
+    def receipt(passed):
+        (root/'checks.json').write_text(json.dumps({'passed':passed,'expected_journeys':expected_journeys,'journeys':reports},indent=2)+'\n')
+    receipt(False)
     try:
         for case in args.case or CASES:
             for cols,rows in [(24,8),(40,12),(80,24),(120,24)]:
@@ -63,8 +67,10 @@ def main():
                     for line in lines:
                         at,data=line.split('\t');cast.write(json.dumps([(int(at)-first)/1000,'o',bytes.fromhex(data).decode('utf-8')])+'\n')
                 reports.append({'case':case,'width':cols,'height':rows,'passed':True,'terminal_restored':True,'prompts':prompts})
-                (root/'checks.json').write_text(json.dumps({'passed':True,'journeys':reports},indent=2)+'\n')
+                receipt(False)
                 print(proc.stdout.strip(),flush=True)
     finally:server.shutdown();server.server_close()
+    assert len(reports)==expected_journeys
+    receipt(True)
 
 if __name__=='__main__':main()

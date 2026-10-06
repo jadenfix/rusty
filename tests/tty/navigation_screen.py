@@ -88,7 +88,9 @@ def inspect(dest,cols,rows):
 if __name__=='__main__':
     import sys
     root=Path(sys.argv[1]);reports=[]
-    journeys=json.loads((root/'checks.json').read_text())['journeys']
+    manifest=json.loads((root/'checks.json').read_text())
+    journeys=manifest['journeys']
+    assert manifest['passed'] and len(journeys)==manifest['expected_journeys'],'incomplete navigation run'
     for case in journeys:
         dest=root/f"{case['case']}-{case['width']}x{case['height']}"
         result=inspect(dest,case['width'],case['height']);result['case']=case['case'];reports.append(result)

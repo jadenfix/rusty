@@ -72,10 +72,10 @@ switch -- $case {
     mode-navigation {
         local "/mode careful"
         send -- "/models\r"
-        watch {◇ careful/|careful ·}
+        watch {◇ careful/|rusty / careful /|careful ·}
         send -- "\x1b";watch {stopped};ready models-cancelled
         send -- "/loop 30s x2 instant\r";watch {next run in 30s}
-        watch {◇ careful/|careful ·}
+        watch {◇ careful/|rusty / careful /|careful ·}
         send -- "\x1b";watch {loop stopped};ready loop-cancelled
         local "/settings"
         send -- "/exit\r"
