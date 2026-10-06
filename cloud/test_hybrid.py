@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
@@ -248,7 +249,11 @@ class HybridTest(unittest.TestCase):
     def test_launcher_attaches_only_and_never_creates_wakes_or_deletes(self):
         args = argparse.Namespace(local_binary=str(BIN), sandbox="offline-sandbox", workspace=str(self.remote), mode="standard", agents="swarm", swarm_max=3, memory_mode="off", permissions="auto", model=None, stats=False, trajectory=None, goal=None, prompt=None)
         sdk = argparse.Namespace(get=lambda _: self.sandbox)
-        with patch.object(launcher, "daytona_client", return_value=sdk), patch.object(launcher.subprocess, "call", return_value=0) as call:
+        previous = signal.getsignal(signal.SIGINT)
+        def child_wait(*_, **__):
+            os.kill(os.getpid(), signal.SIGINT)
+            return 0
+        with patch.object(launcher, "daytona_client", return_value=sdk), patch.object(launcher.subprocess, "call", side_effect=child_wait) as call:
             self.assertEqual(launcher.cmd_hybrid(args), 0)
             command = call.call_args.args[0]
             self.assertIn("--tools", command)
@@ -259,6 +264,7 @@ class HybridTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "never creates or wakes"):
                 launcher.cmd_hybrid(args)
             self.assertEqual(call.call_count, 1)
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous)
         self.assertEqual(self.process.calls, [])
 
     def test_full_cloud_env_never_copies_the_local_sdk_connection(self):

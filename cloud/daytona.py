@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import shlex
 import sys
 import time
@@ -584,7 +585,14 @@ def cmd_hybrid(args) -> int:
     with bridge(remote, args.workspace) as env:
         if getattr(args, "project_id", None):
             env["RUSTY_PROJECT_ID"] = args.project_id
-        return subprocess.call(command, env={**os.environ, **env})
+        # The terminal sends Ctrl-C to both processes. Let Rusty stop its turn
+        # without Python tearing down the bridge. A caught handler resets at
+        # exec, so the child still receives SIGINT and installs its own handler.
+        previous = signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            return subprocess.call(command, env={**os.environ, **env})
+        finally:
+            signal.signal(signal.SIGINT, previous)
 
 
 def main(argv=None) -> int:
