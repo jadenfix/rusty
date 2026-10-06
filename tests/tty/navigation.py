@@ -27,7 +27,9 @@ def main():
     state_script.write_text("import json,termios\nt=termios.tcgetattr(0)\nt[3]&=~getattr(termios,'PENDIN',0)\nt[6]=[v.hex() if isinstance(v,bytes) else v for v in t[6]]\nprint(json.dumps(t))\n")
     # PENDIN is maintained by the macOS kernel when input is reprocessed; all
     # actual input/output/local flags, control bytes and speeds must match.
-    prefix=prefix.replace('spawn -noecho $bin', 'spawn -noecho /bin/sh -c {stty sane; state=$1; shift; before=$(python3 "$state"); "$@"; code=$?; after=$(python3 "$state"); if [ "$before" = "$after" ]; then printf "\\nTTY_RESTORED\\n"; else printf "\\nTTY_DIRTY %s %s\\n" "$before" "$after"; fi; exit "$code"} rusty-tty [file join [file dirname $dest] tty-state.py] $bin')
+    # Cooked approvals deliver SIGINT to the foreground process group. Keep
+    # this measuring shell alive; Rusty installs its own Ctrl-C handler.
+    prefix=prefix.replace('spawn -noecho $bin', 'spawn -noecho /bin/sh -c {trap "" INT QUIT; stty sane; state=$1; shift; before=$(python3 "$state"); "$@"; code=$?; after=$(python3 "$state"); if [ "$before" = "$after" ]; then printf "\\nTTY_RESTORED\\n"; else printf "\\nTTY_DIRTY %s %s\\n" "$before" "$after"; fi; exit "$code"} rusty-tty [file join [file dirname $dest] tty-state.py] $bin')
     prefix=prefix.replace('spawn -noecho /bin/sh', 'set nav_args [list --permissions $perms --mode $mode --agents $agents --memory off]\nif {$case eq "resume-settings" || $case eq "corrupt-settings"} {set nav_args [list --memory off]}\nspawn -noecho /bin/sh')
     prefix=prefix.replace('$bin --permissions $perms --mode $mode --agents $agents --memory off', '$bin {*}$nav_args')
     driver=root/'navigation.exp';driver.write_text(prefix+(scripts/'navigation.exp').read_text())
