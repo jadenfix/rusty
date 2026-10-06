@@ -102,8 +102,12 @@ pub struct Response {
 
 pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(200)))?;
+    // Hooks still return after HOOK_MS. Explicit management may flush SQLite
+    // or transfer a snapshot, so its transport must honor the control budget.
+    let transport_ms =
+        if matches!(req.op.as_str(), "begin" | "event" | "finish" | "advice" | "prepared") { 200 } else { 1000 };
+    stream.set_read_timeout(Some(Duration::from_millis(transport_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(transport_ms)))?;
     let mut body = serde_json::to_vec(req)?;
     if body.len() > if req.op == "import" { TRANSFER } else { FRAME } {
         bail!("memory frame too large");
