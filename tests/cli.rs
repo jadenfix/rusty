@@ -208,7 +208,12 @@ fn permission_classifier_is_inspectable() {
         "/permissions check touch x",
         "/permissions check kubectl get pods",
     ]);
-    let lines: Vec<&str> = out.lines().map(str::trim_start).filter(|l| l.starts_with(['✓', '?', '‼', '✗'])).collect();
+    let lines: Vec<&str> = out
+        .lines()
+        .map(|l| l.trim_start().trim_start_matches('›').trim_start())
+        .filter(|l| l.starts_with(['✓', '?', '‼', '✗']))
+        .collect();
+    assert_eq!(lines.len(), 7, "{out}");
     assert!(lines[0].contains("needs you every time") && lines[0].contains("destructive"), "{out}");
     assert!(lines[1].contains("✓ runs") && lines[1].contains("changes the project"), "{out}");
     assert!(lines[2].contains("✓ runs"), "an allow rule lets a push to main through: {out}");
@@ -1026,4 +1031,32 @@ fn auto_mode_picks_per_request_and_an_explicit_mode_wins() {
     // Picking a mode never changes permissions.
     let out = s.repl(&["/mode auto", "/permissions check git push origin main", "/mode"]);
     assert!(out.contains("? asks first") && out.contains("execution auto"), "{out}");
+}
+
+#[test]
+fn blank_directory_uses_default_and_one_empty_reply_recovers() {
+    let s = Sandbox::new("empty-recovery");
+    std::fs::write(s.project.join("hello.txt"), "hello").unwrap();
+    let (stdout, _, requests) = scripted_run(
+        &s,
+        &["--mode", "vibe", "inspect files"],
+        vec![tool_reply("list_files", serde_json::json!({"path":""})), text_reply(""), text_reply("Found hello.txt")],
+    );
+    assert!(stdout.contains("Found hello.txt"));
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|s| s.contains("hello.txt"))));
+}
+
+#[test]
+fn two_empty_replies_fail_without_an_unbounded_retry_loop() {
+    let s = Sandbox::new("empty-fail");
+    let (url, server) = scripted_endpoint(vec![text_reply(""), text_reply("")]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).args(["--mode", "vibe", "inspect files"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("two empty replies"));
+    assert_eq!(server.join().unwrap().len(), 2);
 }
