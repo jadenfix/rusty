@@ -218,9 +218,9 @@ impl Agent {
         Ok(())
     }
 
-    /// Auto's pick for a request; a production target is always careful.
+    /// A production target warrants care for work, not every question.
     fn pick_mode(&self, request: &str) -> (ExecutionMode, String) {
-        if self.infra.target.production {
+        if self.infra.target.production && crate::execution::change_intent(request) {
             return (ExecutionMode::Careful, "the target looks like production".into());
         }
         crate::execution::pick(request)

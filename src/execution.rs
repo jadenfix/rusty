@@ -91,6 +91,7 @@ pub fn pick(request: &str) -> (ExecutionMode, String) {
     let word = |w: &[&str]| words.iter().any(|x| w.contains(x));
     let stem = |s: &[&str]| words.iter().any(|x| s.iter().any(|p| x.starts_with(p)));
     let phrase = |p: &[&str]| p.iter().any(|p| lower.contains(p));
+    let change = change_intent(request);
     let careful: [(&str, bool); 9] = [
         ("production", word(&["prod", "production", "live"]) && !phrase(&["live reload", "live preview"])),
         ("a migration", stem(&["migrat", "schema", "backfill"])),
@@ -103,17 +104,19 @@ pub fn pick(request: &str) -> (ExecutionMode, String) {
         ("money", stem(&["payment", "billing", "invoice", "refund", "charge", "stripe", "ledger"])),
         (
             "security",
-            stem(&[
-                "auth",
-                "security",
-                "vulnerab",
-                "secret",
-                "credential",
-                "encrypt",
-                "permission",
-                "password",
-                "token",
-            ]),
+            word(&["auth", "iam"])
+                || (stem(&["token"]) && word(&["rotate", "revoke"]))
+                || stem(&[
+                    "authent",
+                    "authoriz",
+                    "security",
+                    "vulnerab",
+                    "secret",
+                    "credential",
+                    "encrypt",
+                    "permission",
+                    "password",
+                ]),
         ),
         ("infrastructure", stem(&["terraform", "kubernetes", "kubectl", "helm", "infra", "k8s", "dns", "iam"])),
         ("an incident", stem(&["incident", "outage", "rollback", "hotfix", "postmortem"])),
@@ -123,17 +126,96 @@ pub fn pick(request: &str) -> (ExecutionMode, String) {
         ),
     ];
     let hits: Vec<&str> = careful.iter().filter(|(_, hit)| *hit).map(|(why, _)| *why).collect();
-    if !hits.is_empty() {
+    if change && !hits.is_empty() {
         let shown = hits.iter().take(2).copied().collect::<Vec<_>>().join(" and ");
         return (ExecutionMode::Careful, format!("mentions {shown}"));
     }
-    if stem(&["prototyp", "sketch", "spike", "throwaway", "mockup", "playground"])
-        || word(&["quick", "quickly", "rough", "poc", "toy", "scratch", "demo"])
-        || phrase(&["mock up", "proof of concept", "just try"])
+    if change
+        && (stem(&["prototyp", "sketch", "spike", "throwaway", "mockup", "playground"])
+            || word(&["poc"])
+            || phrase(&["mock up", "proof of concept"]))
     {
         return (ExecutionMode::Vibe, "sounds like a quick prototype".into());
     }
     (ExecutionMode::Standard, "nothing unusual".into())
+}
+
+/// Topic names and requests for explanation do not justify extra inference.
+/// This is only the starting profile: actual risky tools still escalate.
+pub fn change_intent(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    let mut intent = lower.trim();
+    for _ in 0..3 {
+        if let Some(prefix) =
+            ["please ", "can you ", "could you ", "would you "].iter().find(|p| intent.starts_with(**p))
+        {
+            intent = intent[prefix.len()..].trim_start();
+        }
+    }
+    let words: Vec<_> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let action = words.iter().enumerate().any(|(i, w)| {
+        let before = &words[i.saturating_sub(2)..i];
+        let negated = before.last().is_some_and(|w| ["not", "never", "avoid"].contains(w)) || before == ["don", "t"];
+        !negated
+            && [
+                "add",
+                "fix",
+                "implement",
+                "build",
+                "create",
+                "change",
+                "update",
+                "remove",
+                "delete",
+                "rotate",
+                "revoke",
+                "deploy",
+                "apply",
+                "migrate",
+                "backfill",
+                "restore",
+                "rollback",
+                "release",
+                "repair",
+                "resolve",
+                "investigate",
+                "triage",
+                "plan",
+                "sketch",
+                "prototype",
+                "hotfix",
+                "enable",
+                "disable",
+                "configure",
+            ]
+            .contains(w)
+    });
+    let informational = [
+        "what is",
+        "what does",
+        "what did",
+        "how does",
+        "how do",
+        "how would",
+        "how can",
+        "why does",
+        "why is",
+        "explain",
+        "describe",
+        "compare",
+        "tell me",
+        "show me",
+        "should we",
+        "could we",
+    ]
+    .iter()
+    .any(|p| intent.starts_with(p))
+        && !["then ", "and fix ", "and deploy ", "and implement "].iter().any(|p| lower.contains(p));
+    let routine = ["typo", "typos", "documentation", "readme", "help text", "button label"]
+        .iter()
+        .any(|p| lower.contains(p))
+        && !words.iter().any(|w| ["deploy", "apply", "migrate", "delete", "rotate", "revoke", "restore"].contains(w));
+    action && !informational && !routine
 }
 
 #[cfg(test)]
@@ -177,5 +259,24 @@ mod tests {
         // Consequential beats quick: a quick prod fix is still prod.
         assert_eq!(p("quick hotfix in production"), ExecutionMode::Careful);
         assert_eq!(pick("deploy the db migration").1, "mentions a migration and a deploy");
+    }
+
+    #[test]
+    fn labeled_routing_corpus_keeps_questions_and_routine_work_standard() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("../tests/fixtures/mode-cases.json")).unwrap();
+        for case in cases {
+            let request = case["request"].as_str().unwrap();
+            assert_eq!(pick(request).0.name(), case["mode"].as_str().unwrap(), "{request}");
+        }
+    }
+
+    #[test]
+    fn negated_actions_and_mixed_requests_do_not_hide_mutations() {
+        assert_eq!(pick("do not deploy to production").0, ExecutionMode::Standard);
+        assert_eq!(pick("don't rotate credentials").0, ExecutionMode::Standard);
+        assert_eq!(pick("update README then deploy to production").0, ExecutionMode::Careful);
+        assert_eq!(pick("do not deploy, fix the auth bypass").0, ExecutionMode::Careful);
+        assert_eq!(pick("can you please explain how to deploy to production?").0, ExecutionMode::Standard);
+        assert_eq!(pick("can you please deploy to production?").0, ExecutionMode::Careful);
     }
 }

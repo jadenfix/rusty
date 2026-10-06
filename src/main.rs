@@ -203,14 +203,12 @@ fn run() -> Result<i32> {
     agent.set_execution_mode(chosen.unwrap_or(ExecutionMode::Standard));
     agent.mode_fixed = chosen.is_some();
     agent.infra.dir = Some(pdir.clone());
-    // A production target makes auto start careful and keep picking it; an
-    // explicit mode still wins. Nothing is saved.
+    // Show the target without spending extra inference on an idle session.
+    // Per-request intent and consequential tools select careful when needed.
     if agent.infra.target.production && !agent.mode_fixed {
-        agent.set_execution_mode(ExecutionMode::Careful);
-        agent.mode_reason = "the target looks like production".into();
         println!(
             "{} {}",
-            ui::warn("◇ careful"),
+            ui::warn("◇ production target"),
             ui::dim(&format!("target looks like production: {}", agent.infra.target.summary()))
         );
     }

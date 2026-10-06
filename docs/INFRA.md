@@ -26,9 +26,11 @@ looks up the AWS account with one `sts get-caller-identity` call), a row in
 target before it changes anything. `RUSTY_INFRA=off` disables the probes and
 everything below.
 
-If any name contains `prod`, `prd` or `live` as a word, the session starts in
-careful mode and says so. `--mode` on the command line wins, and the choice
-is not saved.
+If any name contains `prod`, `prd` or `live` as a word, the session warns
+about the production target. Auto selects careful for change work against
+that target; an idle session or an explanation stays standard. Consequential
+tool proposals still escalate before dispatch. `--mode` on the command line
+wins, and an automatic pick is not saved.
 
 ## Secrets never reach the model
 

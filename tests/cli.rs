@@ -290,7 +290,7 @@ fn unknown_command_and_goal_status() {
 }
 
 #[test]
-fn target_is_detected_shown_and_production_starts_careful() {
+fn target_is_detected_without_escalating_an_idle_session() {
     let s = Sandbox::new("target");
     s.fake("kubectl", "printf 'prod-eu|payments'");
     s.fake("aws", "case \"$*\" in *Account*) printf '123456789012\\n';; *region*) printf 'eu-west-1\\n';; esac");
@@ -300,8 +300,8 @@ fn target_is_detected_shown_and_production_starts_careful() {
     let out = s.repl(&["/mode", "/target", "/settings"]);
     assert!(out.contains("target looks like production: kube prod-eu/payments"), "{out}");
     assert!(
-        out.contains("execution auto") && out.contains("last pick careful (the target looks like production)"),
-        "production must start careful: {out}"
+        out.contains("execution auto") && !out.contains("last pick careful"),
+        "an idle production session must stay auto: {out}"
     );
     assert!(out.contains("terraform staging"), "{out}");
     assert!(!out.contains("aws "), "no aws profile is configured in the sandbox: {out}");
@@ -1056,6 +1056,17 @@ fn auto_mode_picks_per_request_and_an_explicit_mode_wins() {
     // Picking a mode never changes permissions.
     let out = s.repl(&["/mode auto", "/permissions check git push origin main", "/mode"]);
     assert!(out.contains("? asks first") && out.contains("execution auto"), "{out}");
+}
+
+#[test]
+fn auto_keeps_questions_standard_even_with_a_production_target() {
+    let s = Sandbox::new("auto-production-question");
+    s.fake("kubectl", "printf 'prod-eu|default'");
+    let (stdout, _, requests) = scripted_run(&s, &["explain the database migration"], vec![text_reply("explanation")]);
+    assert!(stdout.contains("◇ standard"), "{stdout}");
+    assert_eq!(requests.len(), 1);
+    let (stdout, _, _) = scripted_run(&s, &["update the service configuration"], vec![text_reply("plan")]);
+    assert!(stdout.contains("◇ careful"), "{stdout}");
 }
 
 #[test]
