@@ -137,6 +137,28 @@ fn stalled_service_does_not_hold_coding_hook() {
 }
 
 #[test]
+fn response_style_survives_tools_but_not_the_turn_boundary() {
+    let s = Service::new();
+    let mut h = Hooks::connect(&s.root, &s.root, Mode::On).unwrap();
+    let r = h.control("remember", json!({"kind":"preference","text":"Response style: concise, warm, three bullets."}));
+    assert!(!r.error);
+    h.begin("fix a parser");
+    assert!(h.advice().contains("concise, warm, three bullets"));
+    for n in 0..6 {
+        h.event("bash", "cargo test", &format!("exit code: 0\ncheck {n}"));
+        assert!(h.advice().contains("concise, warm, three bullets"));
+    }
+    assert_eq!(h.metrics.injections, 1, "cached guidance is not a new intervention");
+    h.finish(true);
+    assert!(h.advice().is_empty());
+    h.begin("explain the parser");
+    assert!(h.advice().contains("concise, warm, three bullets"));
+    assert_eq!(h.metrics.injections, 2, "the new turn independently selects the preference");
+    assert!(!h.control("forget", json!({"id":r.id})).error);
+    assert!(h.advice().is_empty(), "forgotten guidance must leave the current prompt immediately");
+}
+
+#[test]
 fn management_transport_honors_its_one_second_budget() {
     use std::io::{BufRead, BufReader, Write};
     let root = PathBuf::from("/tmp").join(format!(

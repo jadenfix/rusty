@@ -21,7 +21,8 @@ rusty --memory off "fix this small bug"
 These are independent of `careful`, `standard`, `vibe`, delegation and tool
 permissions. Careful still uses the existing single read-only checker. Deep
 memory does not add review rounds or authorize commands. A service startup
-failure degrades to memory off. Runtime hook failures return no advice.
+failure degrades to memory off. Runtime hook failures add no new advice; already selected saved lessons remain
+available within the current turn.
 
 ```mermaid
 flowchart LR
@@ -76,7 +77,14 @@ success labels without controlling for task difficulty and credit attribution.
   200 ms timeout so abandoned work also drains. Startup can take up to two
   seconds; explicit memory management has a separate one-second deadline.
 - Advice: at most 800 bytes (`on`) or 1600 (`deep`), at most two/four
-  interventions per turn, respectively. Repeated lessons are suppressed.
+  interventions per turn, respectively. A selected saved lesson remains in
+  the bounded system guidance through the turn; it is not counted again as
+  a new intervention. Begin/finish clear it, and forget removes it immediately.
+  Background predicted steps remain observation-specific, never cached this way.
+  An explicit project preference starting `Response style:` applies across
+  tasks without requiring topic overlap. Other preferences still use relevance.
+  A small coding vocabulary normalizes check/test/verify, repo/repository,
+  source tree, builds and migrations; this is lexical recall, not semantic search.
 - L2: at most 512 active lessons across the local store. Text and evidence
   use gzip when smaller, otherwise bounded raw UTF-8. Existing plain-text
   lesson columns are migrated to packed blobs at service startup. The SQLite
@@ -187,3 +195,17 @@ does not expose a secret to forked PRs. Deterministic checks run separately in
 performance or evidence that memory improves hard-task success. Establish that
 with paired, repeated off/on/deep trials and independently verified outcomes
 before changing the default mode or the inference policy.
+
+## Tone preferences and quality checks
+
+```sh
+rusty --memory on
+# In the CLI:
+/remember preference: Response style: concise, warm, three bullets.
+```
+
+Current instructions take precedence. Tests verify that the guidance reaches
+every model request through a tool-using turn, not that an arbitrary model
+obeys the tone. The labeled full-store recall test reports every miss, irrelevant
+interventions, p50/p95 latency, storage and restart behavior. See
+[QUALITY.md](QUALITY.md) for commands and evidence limits.

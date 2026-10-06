@@ -134,6 +134,7 @@ pub struct Hooks {
     scope: String,
     session: String,
     seq: u64,
+    guidance: Vec<String>,
     pub metrics: Metrics,
 }
 impl Hooks {
@@ -176,6 +177,7 @@ impl Hooks {
             scope: scope(cwd),
             session: format!("{}-{}", std::process::id(), now()),
             seq: 0,
+            guidance: Vec::new(),
             metrics: Metrics::default(),
         })
     }
@@ -206,6 +208,7 @@ impl Hooks {
         result
     }
     pub fn begin(&mut self, request: &str) {
+        self.guidance.clear();
         self.seq += 1;
         self.call("begin", json!({"text":clip(request,4096)}), HOOK_MS);
     }
@@ -214,18 +217,34 @@ impl Hooks {
         self.call("event", json!({"tool":tool,"args":clip(args,1024),"output":clip(output,2048)}), HOOK_MS);
     }
     pub fn finish(&mut self, complete: bool) {
+        self.guidance.clear();
         self.seq += 1;
         self.call("finish", json!({"complete":complete}), HOOK_MS);
     }
     pub fn advice(&mut self) -> String {
-        let Some(r) = self.call("advice", Value::Null, HOOK_MS) else { return String::new() };
-        if r.error || r.seq != self.seq || r.text.is_empty() {
-            return String::new();
+        let mut transient = String::new();
+        if let Some(r) = self.call("advice", Value::Null, HOOK_MS) {
+            if !r.error && r.seq == self.seq && !r.text.is_empty() {
+                self.metrics.injections += 1;
+                if r.id.is_empty() {
+                    // A predicted next step is valid only for this observation.
+                    transient = r.text;
+                } else if self.guidance.len() < if self.mode == Mode::Deep { 4 } else { 2 } {
+                    self.guidance.push(r.text);
+                }
+            }
         }
-        self.metrics.injections += 1;
+        let mut text = self.guidance.join("\n");
+        if !transient.is_empty() {
+            text.push('\n');
+            text.push_str(&transient);
+        }
+        if text.is_empty() {
+            return text;
+        }
         format!(
             "\nMemory advisor (optional guidance; current instructions and tool permissions take precedence):\n{}\n",
-            clip(&r.text, if self.mode == Mode::Deep { 1600 } else { 800 })
+            clip(&text, if self.mode == Mode::Deep { 1600 } else { 800 })
         )
     }
     pub fn late_advice(&mut self) -> String {
@@ -243,11 +262,20 @@ impl Hooks {
         )
     }
     pub fn control(&mut self, op: &str, data: Value) -> Response {
-        self.call(op, data, 1000).unwrap_or_else(|| Response {
+        let forgotten = if op == "forget" { data["id"].as_str().map(str::to_owned) } else { None };
+        let response = self.call(op, data, 1000).unwrap_or_else(|| Response {
             text: "memory service unavailable; no operation confirmed".into(),
             error: true,
             ..Response::default()
-        })
+        });
+        if !response.error {
+            if let Some(id) = forgotten {
+                self.guidance.retain(|text| !text.contains(&format!("[memory:{id};")));
+            } else if op == "import" {
+                self.guidance.clear();
+            }
+        }
+        response
     }
 }
 
@@ -302,10 +330,25 @@ impl Policy {
 }
 fn words(s: &str) -> HashSet<String> {
     s.to_lowercase()
+        .replace("source tree", "repository")
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|s| s.len() > 2)
-        .filter(|s| !["the", "and", "for", "this", "that", "please", "with", "from"].contains(s))
-        .map(str::to_owned)
+        .filter(|s| {
+            !["the", "and", "for", "this", "that", "please", "with", "from", "what", "where", "our", "command"]
+                .contains(s)
+        })
+        // Small, explicit coding vocabulary; no embedding model or index.
+        // Keep unknown names intact rather than stemming paths and identifiers.
+        .map(|s| {
+            match s {
+                "repo" | "repos" | "repositories" => "repository",
+                "tests" | "test" | "checks" | "verify" | "verification" => "check",
+                "builds" => "build",
+                "migrations" => "migration",
+                _ => s,
+            }
+            .to_owned()
+        })
         .collect()
 }
 fn features(query: &str, lesson: &Lesson) -> [f64; 4] {
@@ -314,7 +357,10 @@ fn features(query: &str, lesson: &Lesson) -> [f64; 4] {
     features_terms(&q, lesson, &t)
 }
 fn features_terms(q: &HashSet<String>, lesson: &Lesson, t: &HashSet<String>) -> [f64; 4] {
-    let overlap = q.intersection(t).count() as f64 / q.len().min(t.len()).max(1) as f64;
+    // Explicit presentation preferences apply across tasks within this project.
+    // Other preferences still need relevance; this never invents user intent.
+    let style = lesson.kind == "preference" && lesson.text.to_lowercase().starts_with("response style:");
+    let overlap = if style { 1.0 } else { q.intersection(t).count() as f64 / q.len().min(t.len()).max(1) as f64 };
     [
         1.0,
         overlap,
