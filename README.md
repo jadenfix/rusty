@@ -141,6 +141,7 @@ when rate limited.
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
 | `/mode auto\|careful\|standard\|vibe` | how hard rusty thinks and checks its work |
+| `/tools [local\|daytona]` | show tool placement; save the default for the next session |
 | `/view default\|verbose\|adhd` | how much you see |
 | `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
@@ -278,6 +279,27 @@ Anything your endpoint serves, chosen with `--model`, `RUSTY_MODEL` or `/model`.
 To use another endpoint, set `RUSTY_BASE_URL`, for example `http://localhost:11434/v1`.
 
 ## Run it anywhere
+
+Keep reasoning and memory local while executing the entire swarm's tools in
+Daytona. `hybrid` uses the pinned Daytona SDK and attaches to an already
+started sandbox; it never creates or wakes one. The snapshot must contain
+this version of rusty and the remote workspace must already exist.
+
+```bash
+cargo build --bins
+uv run cloud/daytona.py hybrid --sandbox <id> --workspace /home/daytona/work \
+    --mode standard --agents swarm --swarm-max 3 --memory-mode on \
+    --prompt "Use three workers to inspect the project, then fix and verify the bug."
+```
+
+`--tools local|daytona` (or `RUSTY_TOOLS`) overrides the saved default.
+`/tools` and `/settings` show the current location; `/tools local|daytona`
+changes the next session, so a goal never changes workspaces halfway through.
+The hybrid launcher supplies the ephemeral local SDK connection for
+`--tools daytona`. Swarm workers remain read-only and share the lead's remote
+checkout; only the lead edits. No model credentials are copied to the sandbox.
+Cloud compute and model usage still consume credits. Full setup, lifecycle,
+placement choices and evidence are in [docs/CLOUD.md](docs/CLOUD.md).
 
 The core CLI is one static binary. `docker build --target bin -o out .` produces
 `rusty` and the optional `rusty-memoryd` companion for Linux.

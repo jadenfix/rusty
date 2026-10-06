@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 const PROBE_SECS: u64 = 4;
 
 /// Where the session's commands will land, as far as rusty can tell.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub kube_context: Option<String>,
     pub kube_namespace: Option<String>,
@@ -956,6 +956,15 @@ impl Harness {
     /// fresh directory only the owner can read. Returns the directory, or a
     /// note saying why there is nothing to keep.
     pub fn snapshot(&self, action: &Action, command: &str) -> Result<PathBuf, String> {
+        self.snapshot_with(action, command, crate::tools::run)
+    }
+
+    pub fn snapshot_with(
+        &self,
+        action: &Action,
+        command: &str,
+        run: impl Fn(&str, Duration) -> anyhow::Result<(Option<Option<i32>>, String, String)>,
+    ) -> Result<PathBuf, String> {
         if action.snapshots.is_empty() {
             return Err("nothing to snapshot for this command".into());
         }
@@ -966,7 +975,7 @@ impl Harness {
         let mut errors = Vec::new();
         let mut files = Vec::new();
         for (name, cmd) in &action.snapshots {
-            match crate::tools::run(cmd, Duration::from_secs(SNAPSHOT_SECS)) {
+            match run(cmd, Duration::from_secs(SNAPSHOT_SECS)) {
                 Ok((Some(Some(0)), out, _)) if !out.trim().is_empty() => {
                     if redact(&out).1 > 0 {
                         return Err("snapshot contains secret values; no snapshot was persisted".into());
@@ -1001,9 +1010,17 @@ impl Harness {
     /// out, checks the helm release status, or runs a post-apply plan that
     /// must be empty. Returns (healthy, what was checked).
     pub fn verify(&self, action: &Action) -> (bool, String) {
+        self.verify_with(action, crate::tools::run)
+    }
+
+    pub fn verify_with(
+        &self,
+        action: &Action,
+        execute: impl Fn(&str, Duration) -> anyhow::Result<(Option<Option<i32>>, String, String)>,
+    ) -> (bool, String) {
         let timeout = rollout_timeout();
         let limit = Duration::from_secs(timeout + 30);
-        let run = |cmd: &str| match crate::tools::run(cmd, limit) {
+        let run = |cmd: &str| match execute(cmd, limit) {
             Ok((Some(Some(code)), out, err)) => (Some(code), format!("{out}{err}")),
             Ok((_, out, err)) => (None, format!("{out}{err}timed out after {}s", limit.as_secs())),
             Err(e) => (None, e.to_string()),

@@ -6,6 +6,128 @@ as arguments.
 
 ## Daytona
 
+### Choose what runs where
+
+| Entry point | Reasoning and workers | Memory | Files, search, Bash, infra probes |
+|---|---|---|---|
+| `rusty --tools local` | local | local | local |
+| `uv run cloud/daytona.py hybrid ...` | local | local | one Daytona workspace |
+| `uv run cloud/daytona.py run ...` | Daytona | Daytona | Daytona |
+
+`--memory off|on|deep` on the CLI, or `--memory-mode` on the launcher,
+chooses the memory behavior at the agent's location. `deep` may make extra
+model calls; `on` uses local hooks without background inference. The three
+reasoning modes and permission modes work in each arrangement.
+
+### Local agent, remote swarm tools
+
+Use this when the model endpoint is reachable from your computer but blocked
+by sandbox egress policy. NVIDIA requests originate locally. The sandbox
+needs access only to the services its code/build tools actually use; this
+does not grant it general internet access.
+
+```text
+Local Rusty lead + read-only workers ─── model endpoint
+             │
+      local memory hooks
+             │
+  authenticated localhost SDK bridge
+             │
+     Daytona process API
+             │
+  Rust tool endpoint in one shared checkout
+```
+
+Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+a local Rusty binary and its optional memory companion, `DAYTONA_API_KEY`
+and model credentials in your local environment, and an **already started**
+sandbox with a project checkout and this build of the Linux Rusty binary on
+PATH. The launcher automatically installs its pinned Daytona SDK 0.220.0
+through uv; the core Rust binary adds no SDK crate or Python dependency.
+
+```bash
+cargo build --bins
+# Configure credentials in your shell or private .env; never paste them into flags.
+uv run cloud/daytona.py hybrid \
+    --sandbox <existing-id> --workspace /home/daytona/work \
+    --local-binary target/debug/rusty \
+    --mode standard --agents swarm --swarm-max 3 --memory-mode on
+# Omit --prompt/--goal for the interactive CLI.
+# Headless run with a local receipt:
+uv run cloud/daytona.py hybrid \
+    --sandbox <existing-id> --workspace /home/daytona/work \
+    --agents swarm --swarm-max 3 --memory-mode off \
+    --prompt "Audit the modules with three read-only workers, then fix and verify." \
+    --stats --trajectory hybrid.json
+```
+
+If you need a fresh environment, `prepare --source` below builds the current
+**committed HEAD**. Create/start a sandbox from the printed snapshot with
+Daytona's dashboard or SDK, then clone the project into it. Those operations
+consume cloud credits; `hybrid` performs none of them implicitly. Older Rusty
+snapshots lack tool protocol v1 and must be rebuilt. The bridge handshake
+checks compatibility and resolves the real remote workspace before any model
+request. `DAYTONA_TARGET=eu` selects EU as with the full-cloud launcher.
+
+Placement controls:
+
+- CLI `--tools local|daytona` and `RUSTY_TOOLS` override the saved default.
+  The SDK launcher supplies the localhost connection required by `daytona`.
+- `/tools` and `/settings` show the current backend and remote workspace.
+  `/tools local|daytona` saves the default for the **next** session, without
+  moving active work. Missing bridge settings fail clearly, with no local fallback.
+- `--agents off|sub|swarm|auto` controls delegation; `--swarm-max 1..8` limits
+  concurrency. Hybrid defaults to auto and three workers. Workers share one
+  checkout and cannot edit; their model calls stay local. Creating one sandbox
+  per worker is deliberately omitted: it adds cost and reconciliation work.
+- `--mode` and `--permissions` stay independent. Hybrid defaults to `auto`
+  permissions; it does not inherit the full-cloud launcher's `--yolo` flag.
+
+The bridge binds only to 127.0.0.1 with a random per-session token, bounded
+requests/responses, bounded concurrent RPCs, no HTTP logs, no redirects, and
+no retries of uncertain writes. It reuses one SDK client and the existing
+Rust HTTP client crate. Each RPC starts a small Rust tool process in the
+sandbox, reusing the same filesystem/shell implementations. Permission checks
+inspect **remote** scripts and branch state, and are checked again before
+execution. Infrastructure target detection, dry-run gates, pre-change capture
+and rollout checks use the remote environment; snapshots are retained privately
+on the controller and staged privately outside the sandbox checkout for
+rollback, so ordinary Git commits cannot accidentally include them.
+Repo instructions come from the remote checkout; installed slash-command skills
+stay on the controller. Sessions/memory are scoped by sandbox ID and workspace.
+Model keys and host environment are never exported by hybrid. Use
+`--project-id <stable-name>` to retain on/deep advisor lessons across replacement
+sandboxes, and `--continue` to resume the latest local session for the attached
+sandbox/workspace. These settings contain no credentials.
+
+Hybrid owns only its local bridge. It does not stop, delete, reset or change
+the lifecycle policy of an attached sandbox. Changes stay in that sandbox;
+commit/export them with your normal Git or Daytona workflow. Ctrl-C stops
+waiting locally, but a remote command may continue until its timeout; inspect
+its outcome before retrying. There is no automatic replay or cancellation
+claim. The sandbox can continue consuming compute credits after the CLI exits.
+
+### Hybrid checks without cloud spending
+
+```bash
+scripts/qa.sh
+# Or only the hybrid journey after building both binaries:
+python3 -m unittest cloud/test_hybrid.py
+```
+
+These tests run the real Rust CLI, real Rust tools and HTTP bridge in separate
+local controller/sandbox directories with stand-ins for the SDK transport and
+model. Three workers overlap in each profile; forged edits are denied; all
+eight file/search/Bash tools operate remotely; the lead edits and verifies;
+careful has one checker; memory on runs on the controller without hook timeouts.
+Additional checks cover remote script inspection, changed approvals, unavailable
+transport, missing/invalid placement settings, authentication, request bounds,
+attach-only lifecycle behavior, and remote infra gates/snapshots/verification.
+They establish local integration behavior, **not** fresh hosted or live-model
+qualification. No new sandbox or paid model run was used for this feature.
+
+### Fully cloud agent
+
 [`cloud/daytona.py`](../cloud/daytona.py) runs rusty in a Daytona sandbox
 and brings the results home.
 

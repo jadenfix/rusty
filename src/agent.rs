@@ -98,6 +98,7 @@ impl Totals {
 }
 
 pub struct Agent {
+    pub backend: crate::backend::Backend,
     client: Arc<Client>,
     pub model: String,
     pub temperature: f32,
@@ -161,6 +162,7 @@ impl Agent {
     pub fn new(client: Arc<Client>, model: String, cwd: PathBuf, policy: Policy, memory: Memory) -> Self {
         let project_notes = load_project_notes(&cwd);
         Self {
+            backend: crate::backend::Backend::Local,
             client,
             model,
             temperature: 0.2,
@@ -205,6 +207,17 @@ impl Agent {
         }
     }
 
+    pub fn set_backend(&mut self, backend: crate::backend::Backend) -> Result<()> {
+        if backend.name() == "daytona" {
+            let description = backend.initial_description();
+            self.cwd = backend.cwd(&self.cwd);
+            self.project_notes = description["notes"].as_str().unwrap_or("").to_string();
+            self.infra.target = serde_json::from_value(description["target"].clone())?;
+        }
+        self.backend = backend;
+        Ok(())
+    }
+
     /// Auto's pick for a request; a production target is always careful.
     fn pick_mode(&self, request: &str) -> (ExecutionMode, String) {
         if self.infra.target.production {
@@ -241,10 +254,15 @@ impl Agent {
     /// The most workers one swarm may start. Vibe keeps it small unless the
     /// user chose delegation settings themselves.
     pub fn swarm_cap(&self) -> usize {
-        if self.execution_mode == ExecutionMode::Vibe && !self.delegation_override {
+        let cap = if self.execution_mode == ExecutionMode::Vibe && !self.delegation_override {
             self.agents.swarm_max.min(ExecutionMode::VIBE_WORKERS)
         } else {
             self.agents.swarm_max
+        };
+        if self.backend.name() == "daytona" {
+            cap.min(8)
+        } else {
+            cap
         }
     }
 
@@ -818,7 +836,8 @@ impl Agent {
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
-        match self.policy.decide(name, args, &self.cwd) {
+        let mut approval = self.backend.decide(name, args, &self.policy, &self.cwd)?;
+        match approval.clone() {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.refused(name, args, "denied", &why);
@@ -859,6 +878,7 @@ impl Agent {
                         println!("  {}", ui::dim(&format!("allowing `{rule}` from now on (/permissions to undo)")));
                         self.policy.allow.push(rule);
                         self.policy.save();
+                        approval = Verdict::Allow;
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
@@ -872,9 +892,9 @@ impl Agent {
             }
         }
         if name == "bash" {
-            return self.run_bash(args, d);
+            return self.run_bash(args, &approval, d);
         }
-        tools::execute(name, args)
+        self.backend.execute(name, args, &self.policy, &approval)
     }
 
     /// A shell command that never ran still gets its audit line.
@@ -888,9 +908,11 @@ impl Agent {
     /// Runs a shell command through the infra harness: a change gets a
     /// snapshot of what it is about to touch first, and everything that
     /// touches infrastructure is logged.
-    fn run_bash(&mut self, args: &Value, d: &mut Display) -> Result<String> {
+    fn run_bash(&mut self, args: &Value, approval: &Verdict, d: &mut Display) -> Result<String> {
         let cmd = args["command"].as_str().unwrap_or("").to_string();
-        let Some(action) = infra::inspect(&cmd) else { return tools::execute("bash", args) };
+        let Some(action) = infra::inspect(&cmd) else {
+            return self.backend.execute("bash", args, &self.policy, approval);
+        };
         if self.execution_mode == ExecutionMode::Careful {
             if let Some(refusal) = self.infra.gate(&action) {
                 self.infra.record_refusal("careful", &cmd, "blocked", "needs a dry run first");
@@ -902,7 +924,7 @@ impl Agent {
         if action.mutating && !action.snapshots.is_empty() {
             d.set_status("snapshotting before the change".into());
             d.tick();
-            match self.infra.snapshot(&action, &cmd) {
+            match self.backend.snapshot(&self.infra, &action, &cmd) {
                 Ok(path) => {
                     d.line(&format!("  {} {}", ui::accent("⎘ snapshot"), ui::dim(&path.display().to_string())));
                     snapshot = Some(path.display().to_string());
@@ -915,7 +937,7 @@ impl Agent {
             d.set_status(String::new());
         }
         let started = Instant::now();
-        let mut out = tools::execute("bash", args)?;
+        let mut out = self.backend.execute("bash", args, &self.policy, approval)?;
         let (outcome, exit) = infra::outcome(&out);
         self.infra.saw_dry_run(&action, exit);
         // In careful mode a change is not done until it is seen to be healthy.
@@ -927,7 +949,11 @@ impl Agent {
         {
             d.set_status("verifying the change".into());
             d.tick();
-            let (ok, what) = self.infra.verify(&action);
+            let (ok, what) = if self.backend.name() == "local" {
+                self.infra.verify(&action)
+            } else {
+                self.infra.verify_with(&action, |command, timeout| self.backend.shell(command, timeout))
+            };
             d.set_status(String::new());
             verified = Some(ok);
             if ok {
@@ -1003,10 +1029,12 @@ impl Agent {
             let counter = Arc::new(AtomicUsize::new(0));
             counters.push(counter.clone());
             let execution_mode = self.execution_mode;
+            let backend = self.backend.clone();
             let (client, cwd, deny, tx) = (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), tx.clone());
             std::thread::spawn(move || {
                 let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
                 w.is_worker = true;
+                w.backend = backend;
                 w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
                 w.progress = Some(counter);
@@ -1384,7 +1412,7 @@ fn job(v: &Value) -> (String, String) {
     (v["description"].as_str().unwrap_or("worker").to_string(), v["prompt"].as_str().unwrap_or("").to_string())
 }
 
-fn load_project_notes(cwd: &std::path::Path) -> String {
+pub(crate) fn load_project_notes(cwd: &std::path::Path) -> String {
     let mut out = String::new();
     for name in ["AGENTS.md", "RUSTY.md", "CLAUDE.md"] {
         if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {

@@ -46,7 +46,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum Verdict {
     Allow,
     /// Ask, and offer to remember the answer.
