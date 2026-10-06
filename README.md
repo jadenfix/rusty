@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-93%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-111%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -47,10 +47,28 @@ it runs on open models hosted by NVIDIA.
 
 ## See it work
 
-Every clip below is a real session, recorded with
+The model-backed clips in the following sections are real sessions, recorded with
 [`scripts/record.py`](scripts/record.py) against the toy store in
 [`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
 faster playback. Run them yourself and you'll get the same kind of result.
+
+### The complete terminal UI session
+
+[![Editable drafts, workers and careful review](docs/demo/cli-session.gif)](docs/demo/cli-session.mp4)
+
+**[Watch the full 24-second video](docs/demo/cli-session.mp4)** ·
+[Replay the terminal recording](docs/demo/cli-session.cast)
+
+One continuous terminal session: read a Rust file, observe two failing tests,
+edit the helper, pass both tests, keep an unsent draft, run a read-only worker
+and a three-worker swarm, perform the single careful checker, then interrupt
+and send a new request. The geometric panel shows each stage and partial worker
+failure while the input stays editable beneath it.
+
+This UI recording uses scripted responses from a local SSE provider. File
+editing, Bash, worker execution, review and keyboard input run through the actual
+Rusty binary; it demonstrates terminal behavior, not live model quality or hosted
+Daytona connectivity. Its driver is [`tests/tty/demo.py`](tests/tty/demo.py).
 
 ### A swarm, when one pair of eyes isn't enough
 
@@ -103,7 +121,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
 | **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. |
 | **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
-| **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |
+| **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works; Enter stops and sends, Esc keeps your draft. Press Ctrl-C twice to quit. |
 | **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a steady rotating Braille knot with event pulses, grouped tool lines, rendered markdown. |
 
 ## Quickstart
@@ -428,6 +446,8 @@ To capture and inspect the real CLI without model credentials:
 python3 tests/tty/capture.py --binary target/debug/rusty --output /tmp/rusty-tty
 python3 tests/tty/inspect.py /tmp/rusty-tty
 python3 tests/tty/input.py --binary target/debug/rusty --output /tmp/rusty-input
+python3 tests/tty/input_screen.py /tmp/rusty-input
+python3 tests/tty/demo.py --binary target/debug/rusty --output /tmp/rusty-demo
 python3 tests/tty/modes.py --binary target/debug/rusty --output /tmp/rusty-modes
 python3 tests/tty/modes.py --binary target/debug/rusty --reduced-only --output /tmp/rusty-modes-static
 ```
