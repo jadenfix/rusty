@@ -41,11 +41,12 @@ impl ExecutionMode {
         }
     }
 
-    pub fn review_passes(self) -> usize {
+    /// Careful mode has one read-only checker review the finished work.
+    pub fn checker(self) -> &'static str {
         if self == Self::Careful {
-            2
+            "one read-only check"
         } else {
-            0
+            "off"
         }
     }
 
@@ -82,41 +83,57 @@ impl ExecutionMode {
     }
 }
 
-/// Careful mode takes two extra looks before it accepts "done". The gate lives
-/// on the agent: one per user turn that changed something, one per goal.
-/// It makes the model look again; it does not grade what it finds.
-#[derive(Default)]
-pub struct ReviewGate {
-    remaining: usize,
-}
-
-impl ReviewGate {
-    pub fn new(mode: ExecutionMode) -> Self {
-        Self { remaining: mode.review_passes() }
+/// Picks a starting profile for a request when the user hasn't chosen one,
+/// with a short reason. Only clear signals move it off standard.
+pub fn pick(request: &str) -> (ExecutionMode, String) {
+    let lower = request.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let word = |w: &[&str]| words.iter().any(|x| w.contains(x));
+    let stem = |s: &[&str]| words.iter().any(|x| s.iter().any(|p| x.starts_with(p)));
+    let phrase = |p: &[&str]| p.iter().any(|p| lower.contains(p));
+    let careful: [(&str, bool); 9] = [
+        ("production", word(&["prod", "production", "live"]) && !phrase(&["live reload", "live preview"])),
+        ("a migration", stem(&["migrat", "schema", "backfill"])),
+        ("a deploy", stem(&["deploy", "rollout"]) || word(&["release"])),
+        (
+            "data",
+            word(&["database", "db", "sql", "postgres", "mysql", "redis", "mongo"])
+                || phrase(&["data loss", "user data"]),
+        ),
+        ("money", stem(&["payment", "billing", "invoice", "refund", "charge", "stripe", "ledger"])),
+        (
+            "security",
+            stem(&[
+                "auth",
+                "security",
+                "vulnerab",
+                "secret",
+                "credential",
+                "encrypt",
+                "permission",
+                "password",
+                "token",
+            ]),
+        ),
+        ("infrastructure", stem(&["terraform", "kubernetes", "kubectl", "helm", "infra", "k8s", "dns", "iam"])),
+        ("an incident", stem(&["incident", "outage", "rollback", "hotfix", "postmortem"])),
+        (
+            "you asked for care",
+            stem(&["careful", "critical", "irreversib"]) || phrase(&["don't break", "do not break"]),
+        ),
+    ];
+    let hits: Vec<&str> = careful.iter().filter(|(_, hit)| *hit).map(|(why, _)| *why).collect();
+    if !hits.is_empty() {
+        let shown = hits.iter().take(2).copied().collect::<Vec<_>>().join(" and ");
+        return (ExecutionMode::Careful, format!("mentions {shown}"));
     }
-
-    pub fn next(&mut self) -> Option<String> {
-        let prompt = match self.remaining {
-            2 => {
-                "Second look (1 of 2): assume the work is not done yet. Look at what actually changed and run the \
-                  relevant checks again. Try the edge cases and anything that might have broken nearby. Fix what you \
-                  find. Don't repeat anything that writes outside the project just to check it."
-            }
-            1 => {
-                "Second look (2 of 2): go back over every constraint the user gave and check each one against the \
-                  result, with fresh reads or commands where it helps. Then give your final answer, or call goal_done \
-                  if this is a goal. Say which checks you ran and what you could not check."
-            }
-            _ => return None,
-        };
-        self.remaining -= 1;
-        Some(format!("{}{prompt}", crate::context::NOTE))
+    if stem(&["prototyp", "sketch", "spike", "throwaway", "mockup", "playground"])
+        || word(&["quick", "quickly", "rough", "poc", "toy", "scratch", "demo"])
+        || phrase(&["mock up", "proof of concept", "just try"])
+    {
+        return (ExecutionMode::Vibe, "sounds like a quick prototype".into());
     }
-
-    /// Which look comes next, for the status line.
-    pub fn step(&self) -> usize {
-        3 - self.remaining.min(2)
-    }
+    (ExecutionMode::Standard, "nothing unusual".into())
 }
 
 #[cfg(test)]
@@ -146,12 +163,19 @@ mod tests {
     }
 
     #[test]
-    fn careful_requires_two_separate_rechecks() {
-        let mut gate = ReviewGate::new(ExecutionMode::Careful);
-        assert!(gate.next().unwrap().contains("1 of 2"));
-        assert!(gate.next().unwrap().contains("2 of 2"));
-        assert!(gate.next().is_none());
-        assert!(ReviewGate::new(ExecutionMode::Standard).next().is_none());
-        assert!(ReviewGate::new(ExecutionMode::Vibe).next().is_none());
+    fn picks_a_profile_from_clear_signals_only() {
+        let p = |s: &str| pick(s).0;
+        assert_eq!(p("add a migration for the orders table"), ExecutionMode::Careful);
+        assert_eq!(p("deploy the api to prod"), ExecutionMode::Careful);
+        assert_eq!(p("fix the stripe refund webhook"), ExecutionMode::Careful);
+        assert_eq!(p("rotate the terraform state bucket"), ExecutionMode::Careful);
+        assert_eq!(p("quick prototype of a settings page"), ExecutionMode::Vibe);
+        assert_eq!(p("sketch a landing page"), ExecutionMode::Vibe);
+        assert_eq!(p("fix the failing parser test"), ExecutionMode::Standard);
+        assert_eq!(p("why is this slow?"), ExecutionMode::Standard);
+        assert_eq!(p("add live reload to the dev server"), ExecutionMode::Standard);
+        // Consequential beats quick: a quick prod fix is still prod.
+        assert_eq!(p("quick hotfix in production"), ExecutionMode::Careful);
+        assert_eq!(pick("deploy the db migration").1, "mentions a migration and a deploy");
     }
 }

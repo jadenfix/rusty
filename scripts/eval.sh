@@ -73,7 +73,7 @@ run_task() {
   if [[ $code == 142 ]]; then verdict=timeout
   elif (cd "$work" && EVAL_DIR=$dir RUSTY_HOME=$home bash "$dir/check.sh" >"$home/check" 2>&1); then verdict=pass
   # The endpoint failing is an infrastructure error, not an agent failure.
-  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed" "$home/stdout"; then verdict=infra
+  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed" "$home/stdout" "$home/stderr"; then verdict=infra
   fi
   mkdir -p "$logs/$name" && cp "$home/stdout" "$home/stderr" "$home/check" "$logs/$name/" 2>/dev/null
   python3 - "$name" "$model" "$verdict" "$secs" "$home" "$out" <<'PY'

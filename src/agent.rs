@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::config::{AgentsConfig, AgentsMode};
 use crate::context;
 use crate::display::{self, Display, View};
-use crate::execution::{ExecutionMode, ReviewGate};
+use crate::execution::ExecutionMode;
 use crate::infra;
 use crate::llm::{Client, Event, Reply, ToolCall};
 use crate::memory::{Memory, KINDS};
@@ -98,10 +98,15 @@ pub struct Agent {
     pub model: String,
     pub temperature: f32,
     pub execution_mode: ExecutionMode,
+    /// The user chose the mode; otherwise rusty picks one per request.
+    pub mode_fixed: bool,
+    /// Why the current mode was picked, when rusty picked it.
+    pub mode_reason: String,
     pub model_override: Option<String>,
     pub delegation_override: bool,
     pending_goal: Option<Value>,
-    reviews: ReviewGate,
+    /// Careful mode still owes one checker review for this turn or goal.
+    checker_owed: bool,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     pub policy: Policy,
@@ -130,10 +135,12 @@ impl Agent {
             model,
             temperature: 0.2,
             execution_mode: ExecutionMode::Standard,
+            mode_fixed: false,
+            mode_reason: String::new(),
             model_override: None,
             delegation_override: false,
             pending_goal: None,
-            reviews: ReviewGate::default(),
+            checker_owed: false,
             cwd,
             history: Vec::new(),
             policy,
@@ -166,6 +173,39 @@ impl Agent {
         }
     }
 
+    /// Auto's pick for a request; a production target is always careful.
+    fn pick_mode(&self, request: &str) -> (ExecutionMode, String) {
+        if self.infra.target.production {
+            return (ExecutionMode::Careful, "the target looks like production".into());
+        }
+        crate::execution::pick(request)
+    }
+
+    fn show_pick(&self, d: &mut Display) {
+        let name = self.execution_mode.name();
+        d.line(&format!("  {} {}", ui::accent(&format!("◇ {name}")), ui::dim(&format!("auto · {}", self.mode_reason))));
+    }
+
+    /// Switches profile without touching the model or permissions; used when
+    /// rusty picks the mode itself.
+    fn apply_profile(&mut self, mode: ExecutionMode, reason: String) {
+        self.execution_mode = mode;
+        self.mode_reason = reason;
+        if !self.delegation_override {
+            self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
+        }
+    }
+
+    /// Moves an auto-picked turn up to careful, once, and says why.
+    fn escalate(&mut self, why: &str, d: &mut Display) {
+        if self.mode_fixed || self.is_worker || self.execution_mode == ExecutionMode::Careful {
+            return;
+        }
+        self.apply_profile(ExecutionMode::Careful, why.to_string());
+        self.checker_owed = true;
+        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("auto · switched up: {why}"))));
+    }
+
     /// The most workers one swarm may start. Vibe keeps it small unless the
     /// user chose delegation settings themselves.
     pub fn swarm_cap(&self) -> usize {
@@ -176,12 +216,33 @@ impl Agent {
         }
     }
 
-    /// The next careful-mode review prompt, if any are left, with a status line.
-    fn second_look(&mut self, d: &mut Display) -> Option<String> {
-        let step = self.reviews.step();
-        let prompt = self.reviews.next()?;
-        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("second look {step}/2"))));
-        Some(prompt)
+    /// Careful mode's one review: a read-only worker checks the proposed
+    /// completion against the real files and the user's constraints. The main
+    /// agent owns the fixes; there is no second review.
+    fn review_completion(&mut self, query: &str, d: &mut Display) {
+        self.checker_owed = false;
+        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim("a read-only checker is reviewing the result")));
+        let constraints = context::user_messages(&self.history, 8_000);
+        let working = context::working_set(&self.history);
+        let recent: Vec<Value> = self.history.iter().rev().take(12).rev().cloned().collect();
+        let recent = serde_json::to_string(&recent).unwrap_or_default();
+        let prompt = format!(
+            "Check this proposed completion once, as a read-only reviewer. Look at the actual files or state it \
+             touched, compare the work with everything the user asked for, and judge the test evidence. Look for \
+             concrete bugs, regressions, and security or data-integrity problems where they matter. You may read \
+             and run read-only commands, never change anything. Report actionable findings with file and line \
+             references, or say you found none and name what you could not verify. Keep it short.\n\n\
+             Task: {query}\n\nWhat the user asked for:\n{constraints}\n\nWorking set:\n{working}\n\n\
+             Recent steps and the proposed completion:\n{}",
+            ui::truncate(&recent, 24_000)
+        );
+        let report = self.run_workers(vec![("careful check".into(), prompt)], d);
+        self.history.push(json!({"role": "user", "content": format!(
+            "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
+             There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
+             give your final answer, or call goal_done with evidence.",
+            context::NOTE
+        )}));
     }
 
     pub fn clear(&mut self) {
@@ -384,11 +445,17 @@ impl Agent {
         // Goals keep one review budget across all their turns (set in run_goal);
         // every other turn gets its own.
         let in_goal = self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active);
-        if !in_goal {
-            self.reviews = ReviewGate::new(if self.is_worker { ExecutionMode::Standard } else { self.execution_mode });
+        if !self.mode_fixed && !self.is_worker && !in_goal {
+            let (mode, why) = self.pick_mode(user);
+            self.apply_profile(mode, why);
+            self.show_pick(&mut d);
         }
-        // Careful reviews only follow turns that changed something.
+        if !in_goal {
+            self.checker_owed = !self.is_worker && self.execution_mode == ExecutionMode::Careful;
+        }
+        // The checker only reviews turns that changed something.
         let mut changed = false;
+        let mut failures_in_a_row = 0;
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -442,11 +509,13 @@ impl Agent {
                 if reply.finish_reason.as_deref() == Some("length") {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
-                if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal {
-                    if let Some(prompt) = self.second_look(&mut d) {
-                        self.history.push(json!({"role": "user", "content": prompt}));
-                        continue;
+                if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal && self.checker_owed {
+                    self.review_completion(&query, &mut d);
+                    if signal::interrupted() {
+                        outcome = Ok(false);
+                        break;
                     }
+                    continue;
                 }
                 break;
             }
@@ -458,11 +527,28 @@ impl Agent {
                     *repeats += 1;
                     let n = *repeats;
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    if crate::permissions::classify(&call.name, &args, &self.cwd) != crate::permissions::Class::ReadOnly
+                    let class = crate::permissions::classify(&call.name, &args, &self.cwd);
+                    if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
-                        changed = true;
+                        self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
                     let mut out = self.dispatch(call, &mut d);
+                    // Only a call that actually ran changes anything.
+                    let refused =
+                        ["denied", "the user declined", "blocked by careful mode"].iter().any(|p| out.starts_with(p));
+                    if class != crate::permissions::Class::ReadOnly && !refused {
+                        changed = true;
+                    }
+                    if call.name == "bash" {
+                        let failed = out.starts_with("exit code: ") && !out.starts_with("exit code: 0\n");
+                        failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
+                        if failures_in_a_row == 3 {
+                            self.escalate("three commands failed in a row", &mut d);
+                        }
+                    }
+                    if n == 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                        self.escalate("the same call keeps repeating", &mut d);
+                    }
                     if n >= 3 && !matches!(call.name.as_str(), "plan" | "recall") {
                         out.push_str(&format!(
                             "\n\nnote: this exact call has now run {n} times this turn. Repeating it will not change \
@@ -484,11 +570,14 @@ impl Agent {
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
-                match self.second_look(&mut d) {
-                    Some(prompt) => self.history.push(json!({"role": "user", "content": prompt})),
-                    None => {
-                        self.close_goal(&args);
+                if self.checker_owed {
+                    self.review_completion(&query, &mut d);
+                    if signal::interrupted() {
+                        outcome = Ok(false);
+                        break;
                     }
+                } else {
+                    self.close_goal(&args);
                 }
             }
             if self.goal.as_ref().is_some_and(|g| g.status != GoalStatus::Active) {
@@ -558,6 +647,11 @@ impl Agent {
     }
 
     fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+        if self.is_worker
+            && !matches!(call.name.as_str(), "read_file" | "list_files" | "search" | "glob" | "outline" | "bash")
+        {
+            return "denied: a read-only worker can only inspect files and run read-only commands".into();
+        }
         let raw = if call.arguments.trim().is_empty() { "{}" } else { &call.arguments };
         let args: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
@@ -878,9 +972,9 @@ impl Agent {
     // ------------------------------------------------------------- goal mode
 
     fn finish_goal(&mut self, args: &Value) -> String {
-        if self.execution_mode == ExecutionMode::Careful && !args["blocked"].as_bool().unwrap_or(false) {
+        if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
             self.pending_goal = Some(args.clone());
-            return "completion proposed; careful mode will recheck before closing the goal".into();
+            return "completion proposed; a read-only checker will review it before the goal closes".into();
         }
         self.pending_goal = None;
         self.close_goal(args)
@@ -922,7 +1016,12 @@ impl Agent {
             },
         };
         println!("{} {}", ui::accent("◎ goal"), ui::bold(&self.goal.as_ref().unwrap().objective));
-        self.reviews = ReviewGate::new(self.execution_mode);
+        if !self.mode_fixed {
+            let (mode, why) = self.pick_mode(&self.goal.as_ref().unwrap().objective.clone());
+            self.apply_profile(mode, why);
+            self.show_pick(&mut Display::new(false));
+        }
+        self.checker_owed = self.execution_mode == ExecutionMode::Careful;
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
             let finished = self.run_turn(&prompt)?;
@@ -1155,6 +1254,7 @@ impl Agent {
             "t": crate::memory::now(),
             "model": self.model,
             "execution_mode": self.execution_mode.name(),
+            "mode_reason": if self.mode_fixed { "chosen by the user" } else { self.mode_reason.as_str() },
             "ms": took.as_millis() as u64,
             "prompt": reply.usage.map(|u| u.prompt),
             "completion": reply.usage.map(|u| u.completion),
