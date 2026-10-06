@@ -1203,3 +1203,95 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
     assert!(!s.project.join("forbidden.txt").exists());
     assert_eq!(std::fs::read_to_string(s.project.join("proof.txt")).unwrap(), "verified");
 }
+
+#[test]
+fn unchanged_call_loop_pauses_all_profiles_without_closing_the_goal() {
+    use serde_json::json;
+    for mode in ["careful", "standard", "vibe"] {
+        let s = Sandbox::new(&format!("stalled-{mode}"));
+        s.fake("probe", "printf unchanged");
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let (name, args) = if i < 4 {
+                    ("bash", if i % 2 == 0 { "{\"command\":\"probe\"}" } else { "{ \"command\" : \"probe\" }" })
+                } else if i == 4 {
+                    ("write_file", "{\"path\":\"must-not-write.txt\",\"content\":\"wrong\"}")
+                } else {
+                    ("goal_done", "{\"evidence\":\"done\"}")
+                };
+                json!({"index":i,"id":format!("call-{i}"),"type":"function","function":{"name":name,"arguments":args}})
+            })
+            .collect();
+        let reply = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+        let (url, server) = scripted_endpoint(vec![reply]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "--mode", mode, "--goal", "inspect", "--stats"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(|c| wait(c, Duration::from_secs(20)))
+            .unwrap();
+        assert!(!out.status.success(), "{mode} marked a stalled task successful");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("four consecutive identical") && stderr.contains("\"goal\":\"open\""), "{stderr}");
+        assert_eq!(s.calls().lines().count(), 4, "the guard should stop later tools in the batch");
+        assert!(!s.project.join("must-not-write.txt").exists());
+        assert_eq!(server.join().unwrap().len(), 1, "stopping does not spend another review/request");
+    }
+}
+
+#[test]
+fn repeated_call_with_new_results_is_progress() {
+    use serde_json::json;
+    let s = Sandbox::new("changing-results");
+    s.fake("probe", "wc -l < \"$RUSTY_TEST_CALLS\"");
+    let calls: Vec<_> = (0..6).map(|i| json!({"index":i,"id":format!("call-{i}"),"type":"function","function":{"name":"bash","arguments":"{\"command\":\"probe\"}"}}))
+        .chain(std::iter::once(json!({"index":6,"id":"done","type":"function","function":{"name":"goal_done","arguments":"{\"evidence\":\"six new observations\"}"}}))).collect();
+    let reply = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+    let (stdout, stderr, requests) =
+        scripted_run(&s, &["--yolo", "--mode", "standard", "--goal", "inspect", "--stats"], vec![reply]);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(s.calls().lines().count(), 6);
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
+    assert!(!stdout.contains("returned the same result"), "new observations must not trigger repetition warnings");
+}
+
+#[test]
+fn careful_goal_keeps_its_single_checker_budget_after_resume() {
+    use serde_json::json;
+    let s = Sandbox::new("resumed-checker");
+    let done = tool_reply("goal_done", json!({"evidence":"checked"}));
+    let mut partial = text_reply("fixes still in progress");
+    partial["choices"][0]["finish_reason"] = json!("length");
+    let (url, server) = scripted_endpoint(vec![done.clone(), text_reply("reviewed once; fix edge case"), partial]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|c| wait(c, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+    assert_eq!(server.join().unwrap().len(), 3);
+    let (url, server) = scripted_endpoint(vec![done]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--continue"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("goal done"));
+    assert_eq!(server.join().unwrap().len(), 1, "resume must not purchase a second checker");
+}

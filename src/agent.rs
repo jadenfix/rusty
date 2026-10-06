@@ -4,7 +4,7 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -46,6 +46,9 @@ pub struct Goal {
     pub objective: String,
     pub status: GoalStatus,
     pub turns: u32,
+    /// One checker attempt per goal, including after saving and resuming.
+    #[serde(default)]
+    pub checker_used: bool,
 }
 
 #[derive(Default)]
@@ -231,7 +234,7 @@ impl Agent {
             return;
         }
         self.apply_profile(ExecutionMode::Careful, why.to_string());
-        self.checker_owed = true;
+        self.checker_owed = !self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active && g.checker_used);
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("auto · switched up: {why}"))));
     }
 
@@ -250,6 +253,9 @@ impl Agent {
     /// agent owns the fixes; there is no second review.
     fn review_completion(&mut self, query: &str, d: &mut Display) {
         self.checker_owed = false;
+        if let Some(g) = &mut self.goal {
+            g.checker_used = true;
+        }
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim("a read-only checker is reviewing the result")));
         let constraints = context::user_messages(&self.history, 8_000);
         let working = context::working_set(&self.history);
@@ -474,8 +480,10 @@ impl Agent {
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
         let mut d = Display::new(self.is_worker);
         let before = self.totals.clone();
-        // How often each exact call has been made this turn, to catch doom loops.
-        let mut seen: HashMap<String, u32> = HashMap::new();
+        // Only consecutive unchanged results count: an edit, a different call,
+        // or new output is progress. Retain one call rather than a turn-sized map.
+        let mut previous_call: Option<(String, String)> = None;
+        let mut repeats = 0;
         let mut outcome: Result<bool> = Ok(true);
         self.pending_goal = None;
         // Goals keep one review budget across all their turns (set in run_goal);
@@ -583,11 +591,12 @@ impl Agent {
             for call in &reply.tool_calls {
                 let output = if signal::interrupted() {
                     "skipped: the user interrupted".to_string()
+                } else if outcome.is_err() {
+                    "skipped: the turn stalled; task completion is unconfirmed".to_string()
                 } else {
-                    let repeats = seen.entry(format!("{}{}", call.name, call.arguments)).or_insert(0);
-                    *repeats += 1;
-                    let n = *repeats;
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                    // JSON whitespace/key order must not bypass repeat detection.
+                    let signature = format!("{}:{args}", call.name);
                     let class = crate::permissions::classify(&call.name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
@@ -607,18 +616,39 @@ impl Agent {
                             self.escalate("three commands failed in a row", &mut d);
                         }
                     }
-                    if n == 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                    if matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
+                        previous_call = None;
+                        repeats = 0;
+                    } else {
+                        repeats = if previous_call.as_ref().is_some_and(|(s, o)| s == &signature && o == &out) {
+                            repeats + 1
+                        } else {
+                            1
+                        };
+                        previous_call = Some((signature, out.clone()));
+                    }
+                    if repeats == 3 {
                         self.escalate("the same call keeps repeating", &mut d);
                     }
-                    if n >= 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                    if repeats == 4 {
+                        outcome = Err(anyhow::anyhow!(
+                            "stopped after four consecutive identical tool calls with unchanged results; \
+                             task completion is unconfirmed. Inspect the result and try a different approach."
+                        ));
+                    }
+                    if repeats >= 3 {
                         out.push_str(&format!(
-                            "\n\nnote: this exact call has now run {n} times this turn. Repeating it will not change \
-                             the result. Step back, re-read the error, and try a different approach."
+                            "\n\nnote: this call has returned the same result {repeats} times consecutively. \
+                             Step back, re-read the result, and try a different approach."
                         ));
                     }
                     out
                 };
                 self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
+            }
+            if outcome.is_err() {
+                self.pending_goal = None;
+                break;
             }
             if signal::interrupted() {
                 self.pending_goal = None;
@@ -1068,7 +1098,12 @@ impl Agent {
     pub fn run_goal(&mut self, objective: Option<&str>) -> Result<()> {
         let mut prompt = match objective {
             Some(obj) => {
-                self.goal = Some(Goal { objective: obj.to_string(), status: GoalStatus::Active, turns: 0 });
+                self.goal = Some(Goal {
+                    objective: obj.to_string(),
+                    status: GoalStatus::Active,
+                    turns: 0,
+                    checker_used: false,
+                });
                 format!(
                     "{}New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
                      Verify as you go with builds, tests or by running the code. When the goal is achieved and \
@@ -1094,7 +1129,8 @@ impl Agent {
             self.apply_profile(mode, why);
             self.show_pick(&mut Display::new(false));
         }
-        self.checker_owed = self.execution_mode == ExecutionMode::Careful;
+        self.checker_owed =
+            self.execution_mode == ExecutionMode::Careful && !self.goal.as_ref().is_some_and(|g| g.checker_used);
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
             let finished = self.run_turn(&prompt)?;
