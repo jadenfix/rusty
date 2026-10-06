@@ -49,7 +49,7 @@ endpoint.
 ## See it work
 
 Every clip below is a real session, recorded with
-[`scripts/record.py`](scripts/record.py) against the toy store in
+`cargo xtask record` ([`xtask/src/record.rs`](xtask/src/record.rs)) against the toy store in
 [`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
 faster playback. Run them yourself and you'll get the same kind of result.
 
@@ -424,9 +424,13 @@ uses the same `unicode-width` version already used by rustyline.
 To capture and inspect the real CLI without model credentials:
 
 ```bash
-python3 tests/tty/capture.py --binary target/debug/rusty --output /tmp/rusty-tty
-python3 tests/tty/inspect.py /tmp/rusty-tty
+cargo xtask tty-capture --binary target/debug/rusty --output /tmp/rusty-tty
+cargo xtask tty-inspect /tmp/rusty-tty
 ```
 
 The captures exercise real file writes, Bash results, streamed replies, and
-interactive Ctrl-C recovery through an `expect` PTY at 24/40/80/120 columns.
+interactive Ctrl-C recovery on a real pseudo-terminal at 24/40/80/120 columns,
+against a local stand-in provider. The inspection replays each capture on a
+small terminal screen model and checks every panel frame for complete borders,
+an unused wrap column, colour, a footer that stays on the bottom row, and a
+clean exit. `cargo xtask tty` runs the same checks as a quick pass/fail.
