@@ -97,6 +97,10 @@ pub struct Agent {
     pub model: String,
     pub temperature: f32,
     pub execution_mode: ExecutionMode,
+    /// The user chose the mode; otherwise rusty picks one per request.
+    pub mode_fixed: bool,
+    /// Why the current mode was picked, when rusty picked it.
+    pub mode_reason: String,
     pub model_override: Option<String>,
     pub delegation_override: bool,
     pending_goal: Option<Value>,
@@ -128,6 +132,8 @@ impl Agent {
             model,
             temperature: 0.2,
             execution_mode: ExecutionMode::Standard,
+            mode_fixed: false,
+            mode_reason: String::new(),
             model_override: None,
             delegation_override: false,
             pending_goal: None,
@@ -161,6 +167,31 @@ impl Agent {
         if !self.delegation_override {
             self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
         }
+    }
+
+    fn show_pick(&self, d: &mut Display) {
+        let name = self.execution_mode.name();
+        d.line(&format!("  {} {}", ui::accent(&format!("◇ {name}")), ui::dim(&format!("auto · {}", self.mode_reason))));
+    }
+
+    /// Switches profile without touching the model or permissions; used when
+    /// rusty picks the mode itself.
+    fn apply_profile(&mut self, mode: ExecutionMode, reason: String) {
+        self.execution_mode = mode;
+        self.mode_reason = reason;
+        if !self.delegation_override {
+            self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
+        }
+    }
+
+    /// Moves an auto-picked turn up to careful, once, and says why.
+    fn escalate(&mut self, why: &str, d: &mut Display) {
+        if self.mode_fixed || self.is_worker || self.execution_mode == ExecutionMode::Careful {
+            return;
+        }
+        self.apply_profile(ExecutionMode::Careful, why.to_string());
+        self.checker_owed = true;
+        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("auto · switched up: {why}"))));
     }
 
     /// The most workers one swarm may start. Vibe keeps it small unless the
@@ -401,11 +432,17 @@ impl Agent {
         // Goals keep one review budget across all their turns (set in run_goal);
         // every other turn gets its own.
         let in_goal = self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active);
+        if !self.mode_fixed && !self.is_worker && !in_goal {
+            let (mode, why) = crate::execution::pick(user);
+            self.apply_profile(mode, why);
+            self.show_pick(&mut d);
+        }
         if !in_goal {
             self.checker_owed = !self.is_worker && self.execution_mode == ExecutionMode::Careful;
         }
         // The checker only reviews turns that changed something.
         let mut changed = false;
+        let mut failures_in_a_row = 0;
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -477,11 +514,25 @@ impl Agent {
                     *repeats += 1;
                     let n = *repeats;
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    if crate::permissions::classify(&call.name, &args, &self.cwd) != crate::permissions::Class::ReadOnly
-                    {
+                    let class = crate::permissions::classify(&call.name, &args, &self.cwd);
+                    if class != crate::permissions::Class::ReadOnly {
                         changed = true;
                     }
+                    if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
+                    {
+                        self.escalate(&format!("consequential step ({why})"), &mut d);
+                    }
                     let mut out = self.dispatch(call, &mut d);
+                    if call.name == "bash" {
+                        let failed = out.starts_with("exit code: ") && !out.starts_with("exit code: 0\n");
+                        failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
+                        if failures_in_a_row == 3 {
+                            self.escalate("three commands failed in a row", &mut d);
+                        }
+                    }
+                    if n == 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                        self.escalate("the same call keeps repeating", &mut d);
+                    }
                     if n >= 3 && !matches!(call.name.as_str(), "plan" | "recall") {
                         out.push_str(&format!(
                             "\n\nnote: this exact call has now run {n} times this turn. Repeating it will not change \
@@ -838,6 +889,11 @@ impl Agent {
             },
         };
         println!("{} {}", ui::accent("◎ goal"), ui::bold(&self.goal.as_ref().unwrap().objective));
+        if !self.mode_fixed {
+            let (mode, why) = crate::execution::pick(&self.goal.as_ref().unwrap().objective);
+            self.apply_profile(mode, why);
+            self.show_pick(&mut Display::new(false));
+        }
         self.checker_owed = self.execution_mode == ExecutionMode::Careful;
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
@@ -1067,6 +1123,7 @@ impl Agent {
             "t": crate::memory::now(),
             "model": self.model,
             "execution_mode": self.execution_mode.name(),
+            "mode_reason": if self.mode_fixed { "chosen by the user" } else { self.mode_reason.as_str() },
             "ms": took.as_millis() as u64,
             "prompt": reply.usage.map(|u| u.prompt),
             "completion": reply.usage.map(|u| u.completion),

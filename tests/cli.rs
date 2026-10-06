@@ -585,6 +585,9 @@ fn yolo_still_refuses_a_destructive_command_when_nobody_is_watching() {
     let (url, server) = scripted_endpoint(vec![
         tool_reply("bash", serde_json::json!({"command": "rm -rf ~/precious"})),
         tool_reply("bash", serde_json::json!({"command": "rm -rf build && mkdir build && echo hi > build/x"})),
+        answer.clone(),
+        // The destructive request moved the turn up to careful, so a checker reviews it.
+        serde_json::json!({"choices": [{"delta": {"content": "no findings"}, "finish_reason": "stop"}]}),
         answer,
     ]);
     let out = s
@@ -605,4 +608,23 @@ fn yolo_still_refuses_a_destructive_command_when_nobody_is_watching() {
     assert!(told.contains("refused") && told.contains("needs a person"), "{told}");
     // Routine work in the same session still ran.
     assert!(s.project.join("build/x").exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("switched up") && stdout.contains("careful check"), "{stdout}");
+}
+
+#[test]
+fn auto_mode_picks_per_request_and_an_explicit_mode_wins() {
+    let s = Sandbox::new("auto-mode");
+    let answer = || serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+    let (stdout, stderr, requests) = scripted_run(&s, vec![answer()], &["--stats", "plan the database migration"]);
+    assert!(stdout.contains("◇ careful") && stdout.contains("mentions a migration and data"), "{stdout}");
+    assert!(stderr.contains("\"mode_reason\":\"mentions a migration and data\""), "{stderr}");
+    assert_eq!(requests.len(), 1, "a plan with no changes gets no checker");
+    let (stdout, _, _) = scripted_run(&s, vec![answer()], &["sketch a quick landing page"]);
+    assert!(stdout.contains("◇ vibe"), "{stdout}");
+    let (stdout, _, _) = scripted_run(&s, vec![answer()], &["--mode", "standard", "plan the database migration"]);
+    assert!(!stdout.contains("◇ careful") && !stdout.contains("auto ·"), "{stdout}");
+    // Picking a mode never changes permissions.
+    let out = s.repl(&["/mode auto", "/permissions check git push origin main", "/mode"]);
+    assert!(out.contains("? asks first") && out.contains("execution auto"), "{out}");
 }

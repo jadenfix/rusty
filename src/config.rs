@@ -113,7 +113,8 @@ pub struct Settings {
     pub view: String,
     pub tips: bool,
     pub agents: AgentsConfig,
-    pub execution_mode: crate::execution::ExecutionMode,
+    /// None means rusty picks per request.
+    pub execution_mode: Option<crate::execution::ExecutionMode>,
     pub delegation_override: bool,
 }
 
@@ -125,7 +126,7 @@ impl Default for Settings {
             view: "default".into(),
             tips: true,
             agents: AgentsConfig::default(),
-            execution_mode: crate::execution::ExecutionMode::Standard,
+            execution_mode: None,
             delegation_override: false,
         }
     }
