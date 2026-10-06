@@ -46,7 +46,7 @@ SNAPSHOT_NAME = re.compile(r"^rusty-[0-9a-f]{12}$")
 # Paths inside the sandbox; the shell expands $HOME.
 WORK = "$HOME/work"
 RUN = "$HOME/rusty-run"
-EXPORTS = ["patch.diff", "new-files.txt", "new-files.tgz", "out.log", "stderr.log", "trajectory.json", "session.tgz", "exit"]
+EXPORTS = ["patch.diff", "new-files.txt", "new-files.tgz", "out.log", "stderr.log", "trajectory.json", "session.tgz", "memory.json.gz", "exit"]
 
 
 # ----------------------------------------------------------------- sandbox
@@ -78,6 +78,9 @@ class Remote:
         if self._home is None:
             self._home = self.sh("printf %s $HOME", timeout=30)[1].strip()
         return p.replace("$HOME", self._home)
+
+    def upload(self, local: str, path: str) -> None:
+        self.sandbox.fs.upload_file(local, self.path(path))
 
     def download(self, path: str) -> bytes | None:
         try:
@@ -113,7 +116,7 @@ def load(run_id: str) -> dict:
 
 
 def model_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k.startswith(KEY_PREFIXES)}
+    return {k: v for k, v in os.environ.items() if k.startswith(KEY_PREFIXES) and k != "RUSTY_HOME"}
 
 
 # ------------------------------------------------------------- environment
@@ -124,6 +127,9 @@ def snapshot_name(binary: Path) -> str:
     h.update(BASE_IMAGE.encode())
     h.update(" ".join(PACKAGES).encode())
     h.update(binary.read_bytes())
+    advisor = binary.with_name("rusty-memoryd")
+    if advisor.is_file():
+        h.update(advisor.read_bytes())
     return f"rusty-{h.hexdigest()[:12]}"
 
 
@@ -138,6 +144,9 @@ def cmd_prepare(args) -> int:
     from daytona import CreateSnapshotParams, Image
 
     binary = find_binary(args.binary)
+    advisor = binary.with_name("rusty-memoryd")
+    if not advisor.is_file():
+        sys.exit("rusty-memoryd missing; rebuild both binaries with docker build --target bin -o out .")
     name = snapshot_name(binary)
     d = daytona_client()
     try:
@@ -154,7 +163,8 @@ def cmd_prepare(args) -> int:
             + " && rm -rf /var/lib/apt/lists/*"
         )
         .add_local_file(str(binary), "/usr/local/bin/rusty")
-        .run_commands("chmod 755 /usr/local/bin/rusty && rusty --version")
+        .add_local_file(str(advisor), "/usr/local/bin/rusty-memoryd")
+        .run_commands("chmod 755 /usr/local/bin/rusty /usr/local/bin/rusty-memoryd && rusty --version")
     )
     print(f"☾ preparing {name} from {BASE_IMAGE.split('@')[0]} and {binary}…", file=sys.stderr)
     d.snapshot.create(CreateSnapshotParams(name=name, image=image), on_logs=lambda line: print(line, file=sys.stderr))
@@ -202,11 +212,23 @@ def setup_and_start(remote, state: dict, task: list[str]) -> None:
     if code != 0:
         raise RuntimeError(f"clone failed:\n{out}")
     state["base_commit"] = out.strip().splitlines()[-1]
-    words = ["rusty", "--yolo", "--stats", "--mode", state["mode"], "--agents", state["agents"]]
+    memory = state.get("memory_mode", "legacy")
+    project_id = state.get("project_id") or state["repo"]
+    prefix = f"RUSTY_PROJECT_ID={shlex.quote(project_id)} "
+    if memory in ("on", "deep"):
+        code, _ = remote.sh("command -v rusty-memoryd", timeout=30)
+        if code != 0:
+            raise RuntimeError("snapshot lacks rusty-memoryd; rebuild and prepare it")
+    if state.get("memory_input"):
+        remote.upload(state["memory_input"], f"{RUN}/memory-input.json.gz")
+        code, _ = remote.sh(f"cd {WORK} && {prefix}rusty-memoryd import {RUN}/memory-input.json.gz", timeout=30)
+        if code != 0:
+            raise RuntimeError("memory import failed; check explicit project identity and snapshot scope")
+    words = ["rusty", "--yolo", "--stats", "--mode", state["mode"], "--agents", state["agents"], "--memory", memory]
     rusty = shlex.join([*words, "--trajectory", "TRAJECTORY", *task]).replace("TRAJECTORY", f"{RUN}/trajectory.json")
     state["command"] = rusty
     state["cmd_id"] = remote.start(
-        f"cd {WORK} && NO_COLOR=1 {rusty} </dev/null >{RUN}/out.log 2>{RUN}/stderr.log; echo $? >{RUN}/exit"
+        f"cd {WORK} && {prefix}NO_COLOR=1 {rusty} </dev/null >{RUN}/out.log 2>{RUN}/stderr.log; echo $? >{RUN}/exit"
     )
     state["status"] = "running"
     save(state)
@@ -255,13 +277,18 @@ def follow(remote, state: dict, poll: float = 5.0) -> int | None:
 def export(remote, state: dict) -> bool:
     """Downloads the patch, new files, logs and session state. True if the
     essentials (patch and log) arrived."""
+    memory_ok = True
+    if state.get("memory_mode") in ("on", "deep"):
+        prefix = f"RUSTY_PROJECT_ID={shlex.quote(state.get('project_id') or state['repo'])} "
+        code, _ = remote.sh(f"cd {WORK} && rm -f {RUN}/memory.json.gz && {prefix}rusty-memoryd export {RUN}/memory.json.gz", timeout=30)
+        memory_ok = code == 0
     base = shlex.quote(state["base_commit"])
     code, out = remote.sh(
         f"cd {WORK} && git add -A && git diff --cached --binary {base} >{RUN}/patch.diff && "
         f"git diff --cached --name-only --diff-filter=A {base} >{RUN}/new-files.txt && "
         f"COPYFILE_DISABLE=1 tar czf {RUN}/new-files.tgz -T {RUN}/new-files.txt && "
         # Session state without any key files.
-        f"{{ COPYFILE_DISABLE=1 tar czf {RUN}/session.tgz -C $HOME --exclude='.env' --exclude='*.env' .config/rusty 2>/dev/null || true; }}",
+        f"{{ COPYFILE_DISABLE=1 tar czf {RUN}/session.tgz -C $HOME --exclude='.env' --exclude='*.env' --exclude='.config/rusty/memory' .config/rusty 2>/dev/null || true; }}",
         timeout=600,
     )
     if code != 0:
@@ -277,7 +304,9 @@ def export(remote, state: dict) -> bool:
         (dest / name).write_bytes(data)
         manifest[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    ok = "patch.diff" in manifest and "out.log" in manifest
+    ok = "patch.diff" in manifest and "out.log" in manifest and memory_ok
+    if state.get("memory_mode") in ("on", "deep"):
+        ok = ok and "memory.json.gz" in manifest
     state["exported"] = ok
     state["export_dir"] = str(dest)
     save(state)
@@ -320,6 +349,10 @@ def cmd_run(args) -> int:
     env = model_env()
     if "NVIDIA_API_KEY" not in env and "RUSTY_API_KEY" not in env:
         sys.exit("set NVIDIA_API_KEY (or RUSTY_API_KEY) in the environment or .env")
+    if args.memory_input and args.memory_mode not in ("on", "deep"):
+        sys.exit("--memory-input requires --memory-mode on or deep")
+    if args.memory_input and not Path(args.memory_input).is_file():
+        sys.exit("memory input file not found")
     snapshot = args.snapshot or snapshot_name(find_binary(args.binary))
     d = daytona_client()
     try:
@@ -334,6 +367,9 @@ def cmd_run(args) -> int:
         "snapshot": snapshot,
         "mode": args.mode,
         "agents": args.agents,
+        "memory_mode": args.memory_mode,
+        "memory_input": str(Path(args.memory_input).resolve()) if args.memory_input else None,
+        "project_id": args.project_id or args.repo,
         "task": args.goal or args.prompt,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "status": "creating",
@@ -438,6 +474,9 @@ def main(argv=None) -> int:
     p.add_argument("--binary", help="static Linux rusty binary the snapshot was built from")
     p.add_argument("--cpu", type=int)
     p.add_argument("--memory", type=int, help="GiB")
+    p.add_argument("--memory-mode", default="legacy", choices=["legacy", "off", "on", "deep"])
+    p.add_argument("--memory-input", help="scoped gzip export from rusty-memoryd")
+    p.add_argument("--project-id", help="same RUSTY_PROJECT_ID used locally; defaults to repo URL")
     p.add_argument("--keep", action="store_true", help="keep the sandbox after exporting")
     for name, help_ in [
         ("status", "is it still working?"),

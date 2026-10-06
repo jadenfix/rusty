@@ -264,7 +264,10 @@ To use another endpoint, set `RUSTY_BASE_URL`, for example `http://localhost:114
 
 ## Run it anywhere
 
-One static binary: `docker build --target bin -o out .` produces it for Linux.
+The core CLI is one static binary. `docker build --target bin -o out .` produces
+`rusty` and the optional `rusty-memoryd` companion for Linux.
+[docs/MEMORY.md](docs/MEMORY.md) covers opt-in `--memory off|on|deep`, the
+compressed L1/L2 store, learning from feedback, live checks and cloud transfer.
 [docs/CLOUD.md](docs/CLOUD.md) covers Daytona sandboxes
 (`uv run cloud/daytona.py --repo … --goal …`), AWS, Devbox and Docker.
 rusty also plugs into Harbor benchmarks with `--goal`, `--trajectory` and
