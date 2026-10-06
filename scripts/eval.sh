@@ -78,7 +78,7 @@ run_task() {
   if [[ $code == 142 ]]; then verdict=timeout
   elif (cd "$work" && EVAL_DIR=$dir RUSTY_HOME=$home bash "$dir/check.sh" >"$home/check" 2>&1); then verdict=pass
   # The endpoint failing is an infrastructure error, not an agent failure.
-  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed|API error: .*(overloaded|api_error|rate_limit)" "$home/stdout" "$home/stderr"; then verdict=infra
+  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed|API error: .*(overloaded|api_error|rate_limit)|is served by .* is not set" "$home/stdout" "$home/stderr"; then verdict=infra
   fi
   local where="$logs/${model//\//_}/$name.$rep"
   mkdir -p "$where" && cp "$home/stdout" "$home/stderr" "$home/check" "$where/" 2>/dev/null
