@@ -1,0 +1,25 @@
+set timeout 15
+set bin [lindex $argv 0]
+set env(RUSTY_BASE_URL) [lindex $argv 1]
+set dest [lindex $argv 2]
+set env(NVIDIA_API_KEY) offline-test-key
+set env(RUSTY_NO_DOTENV) 1
+set env(RUSTY_HOME) "$dest/home"
+set env(TERM) xterm-256color
+unset -nocomplain env(NO_COLOR)
+log_user 0
+log_file -a -noappend "$dest/terminal.ansi"
+spawn -noecho $bin --permissions ask --mode standard --agents off --memory off approval
+stty rows 24 columns 80 < $spawn_out(slave,name)
+expect {
+    -ex {[y]es} { send -- "yes\r" }
+    timeout { puts "FAIL: approval prompt missing"; exit 1 }
+}
+expect {
+    -ex "CAPTURE_COMPLETE" {}
+    timeout { puts "FAIL: approval did not resume turn"; exit 1 }
+}
+expect eof
+set result [wait]
+if {[lindex $result 3] != 0} { puts "FAIL: rusty exited $result"; exit 1 }
+puts "PASS: panel paused for approval and turn resumed"

@@ -10,9 +10,8 @@ spawn -noecho $bin --yolo
 proc ready {} { expect -re {\?2004h}; sleep 0.4 }
 ready
 send -- "Write a 1500 word essay on the history of Unix, in plain prose. Do not use any tools.\r"
-# Match the spinner's ellipsis literally: a regex over hundreds of \r-separated
-# frames is slow enough to delay the keypress past the end of the turn.
-expect -ex "…"
+# Wait until the steady panel is visible before sending the interrupt.
+expect -ex "ctrl-c to stop"
 expect -timeout 2 -ex "NEVER_MATCHES"
 set t0 [clock milliseconds]
 send "\x03"

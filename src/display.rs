@@ -2,8 +2,8 @@
 //!
 //! Reads, searches and listings collapse into one "explored" line, so you
 //! see the shape of the work instead of a wall of tool calls. Edits and
-//! commands get their own lines. While the model works, a single status line
-//! animates in place. Every turn ends with a one-line recap.
+//! commands get their own lines. While the model works, a small geometric panel
+//! animates in place beneath the transcript. Every turn ends with a one-line recap.
 //!
 //! Views: `default` (as above), `verbose` (every call, every result, the
 //! reasoning stream) and `adhd` (one status line, short answers, nothing else).
@@ -72,7 +72,7 @@ pub struct Display {
     started: Instant,
     last_draw: Instant,
     frame: usize,
-    spinner_drawn: bool,
+    footer: crate::footer::Footer,
     in_content: bool,
     in_reasoning: bool,
     /// Something was printed this turn, so the answer gets a blank line above it.
@@ -89,6 +89,12 @@ pub struct Display {
     pub stats: TurnStats,
 }
 
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.clear_spinner();
+    }
+}
+
 impl Display {
     pub fn new(quiet: bool) -> Self {
         let now = Instant::now();
@@ -98,7 +104,7 @@ impl Display {
             started: now,
             last_draw: now - Duration::from_secs(1),
             frame: 0,
-            spinner_drawn: false,
+            footer: crate::footer::Footer::default(),
             in_content: false,
             in_reasoning: false,
             printed: false,
@@ -112,48 +118,60 @@ impl Display {
         }
     }
 
-    /// Redraws the status line if it is due. Cheap to call often.
+    /// Advances only the geometric rail; completed output stays in scrollback.
     pub fn tick(&mut self) {
-        if self.quiet || !ui::animate() || self.in_content || self.in_reasoning {
+        if self.quiet || !ui::tty() || self.in_reasoning {
             return;
         }
-        if self.last_draw.elapsed() < Duration::from_millis(80) {
+        let cadence = if ui::animate() { 100 } else { 1000 };
+        if self.last_draw.elapsed() < Duration::from_millis(cadence) {
             return;
         }
         self.last_draw = Instant::now();
-        self.frame += 1;
-        let secs = self.started.elapsed().as_secs();
-        let mut extra = String::new();
-        if !self.status.is_empty() {
-            extra.push_str(" · ");
-            extra.push_str(&self.status);
-        } else if !self.group.is_empty() {
-            extra.push_str(" · ");
-            extra.push_str(&self.group_summary(false));
+        if ui::animate() {
+            self.frame += 1;
         }
-        let room = ui::width().saturating_sub(self.verb.len() + 30);
-        let extra = ui::truncate(&extra, room);
-        let hint = if secs >= 4 { ui::dim("  ctrl-c to stop") } else { String::new() };
-        print!(
-            "{}{} {}{} {}{}{}",
-            ui::clear_line(),
-            ui::spinner_frame(self.frame),
-            ui::shimmer(self.verb, self.frame),
-            ui::dim("…"),
-            ui::dim(&format!("{secs}s")),
-            ui::dim(extra),
-            hint
-        );
-        let _ = std::io::stdout().flush();
-        self.spinner_drawn = true;
+        self.paint();
+    }
+
+    fn paint(&mut self) {
+        if self.quiet || !ui::tty() || self.in_reasoning {
+            return;
+        }
+        let extra = if !self.status.is_empty() {
+            self.status.clone()
+        } else if !self.group.is_empty() {
+            self.group_summary(false)
+        } else {
+            String::new()
+        };
+        let verb = if self.in_content { "Responding" } else { self.verb };
+        let mut buf = Vec::new();
+        self.footer.draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&buf);
+        let _ = out.flush();
     }
 
     fn clear_spinner(&mut self) {
-        if self.spinner_drawn {
-            print!("{}", ui::clear_line());
-            let _ = std::io::stdout().flush();
-            self.spinner_drawn = false;
+        let mut out = std::io::stdout().lock();
+        self.footer.clear(&mut out);
+        let _ = out.flush();
+    }
+
+    /// Clear, append and repaint in one write, so logs flow past a steady panel.
+    fn append(&mut self, s: &str) {
+        let mut buf = Vec::new();
+        self.footer.clear(&mut buf);
+        let _ = writeln!(buf, "{s}");
+        if ui::tty() && !self.in_reasoning {
+            let extra = if self.status.is_empty() { String::new() } else { self.status.clone() };
+            let verb = if self.in_content { "Responding" } else { self.verb };
+            self.footer.draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
         }
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&buf);
+        let _ = out.flush();
     }
 
     pub fn set_status(&mut self, s: String) {
@@ -174,7 +192,7 @@ impl Display {
             return;
         }
         self.pause();
-        println!("{s}");
+        self.append(s);
         self.printed = true;
     }
 
@@ -218,14 +236,16 @@ impl Display {
         self.line_buf.push_str(s);
         while let Some(pos) = self.line_buf.find('\n') {
             let line: String = self.line_buf.drain(..=pos).collect();
-            println!("{}", crate::markdown::line(line.trim_end_matches('\n'), &mut self.in_code));
+            let rendered = crate::markdown::line(line.trim_end_matches('\n'), &mut self.in_code);
+            self.append(&rendered);
         }
         let _ = std::io::stdout().flush();
     }
 
     pub fn end_stream(&mut self) {
         if !self.quiet && !self.line_buf.is_empty() {
-            println!("{}", crate::markdown::line(&self.line_buf, &mut self.in_code));
+            let rendered = crate::markdown::line(&self.line_buf, &mut self.in_code);
+            self.append(&rendered);
         } else if !self.quiet && self.in_reasoning {
             println!();
         }
