@@ -35,7 +35,7 @@ pub fn rows(client: Option<&Client>, model: &str, live: bool) -> Vec<Row> {
             let probe = match (client, ep) {
                 (Some(c), Some(ep)) if live => {
                     let started = Instant::now();
-                    Some(match c.models_of(ep, 1) {
+                    Some(match c.models_of(ep, crate::llm::Retry::Once) {
                         Ok(ids) => {
                             if serving.as_ref().is_some_and(|(sp, sb)| *sp == p && *sb == base) {
                                 lists_model = Some(ids.iter().any(|id| id == model));
