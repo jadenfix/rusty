@@ -80,6 +80,18 @@ facts to memory. The follow-up question is answered correctly **without
 reading a single file again**. Your messages and a list of files changed and
 commands run are carried over verbatim, so the summary can't lose them.
 
+### Switch models mid-session for a second opinion
+
+<img src="docs/demo/models.gif" alt="doctor checks each provider, Nemotron Super fixes the discount bug, then Nemotron Ultra reviews the fix" width="100%">
+
+`/doctor` checks every provider it has a key for and says where the current
+model goes. Nemotron Super finds and fixes the discount bug and runs the tests.
+Then `/model nvidia/nemotron-3-ultra-550b-a55b` switches mid-session, and the
+bigger model reviews the fix with the whole conversation in view. Claude and
+GPT models work the same way: rusty picks the provider from the model id on
+each request.
+<sub>(Sped up 2×.)</sub>
+
 ### Focus mode, memory, permissions and token honesty
 
 <img src="docs/demo/focus.gif" alt="adhd view gives a three-bullet answer; memory, permission check and token breakdown" width="100%">

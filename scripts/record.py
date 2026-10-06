@@ -88,6 +88,24 @@ SCENES = {
         ("wait", r"\?2004h"),
         ("pause", 1.0),
     ],
+    # Run from a copy of demo/shop with an NVIDIA key: one model fixes, a bigger one reviews.
+    "models": [
+        ("wait", r"\?2004h"),
+        ("pause", 1.2),
+        ("type", "/doctor"),
+        ("wait", r"model [^\n]*→"),
+        ("wait", r"\?2004h"),
+        ("pause", 3.0),
+        ("type", "the discount tests are failing. find out why, fix it, and prove it."),
+        ("wait", r"✓ [^\n]*ctx"),
+        ("wait", r"\?2004h"),
+        ("pause", 2.0),
+        ("type", "/model nvidia/nemotron-3-ultra-550b-a55b"),
+        ("wait", r"\?2004h"),
+        ("type", "you're a second pair of eyes now. review the fix that was just made: is there any case it still gets wrong? three bullets."),
+        ("wait", r"✓ [^\n]*ctx"),
+        ("pause", 4.0),
+    ],
 }
 
 

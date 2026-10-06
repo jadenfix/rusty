@@ -3,6 +3,10 @@ name: evals
 on:
   workflow_dispatch:
     inputs:
+      evals:
+        description: run the evals (turn off to only record a demo)
+        type: boolean
+        default: true
       models:
         description: space-separated model ids (each needs its provider's key as a secret)
         default: nvidia/nemotron-3-super-120b-a12b
@@ -15,12 +19,16 @@ on:
       jobs:
         description: tasks run at once (fewer is gentler on a rate-limited key)
         default: "4"
+      demo:
+        description: "record this scripts/record.py scene against demo/shop and commit the GIF to the branch (e.g. models); empty: none"
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   evals:
+    if: inputs.evals
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -47,3 +55,47 @@ jobs:
             target/evals/*.jsonl
             target/evals/*.md
             target/evals/*/
+
+  # A real session for the README, recorded with the repository's keys. The GIF
+  # is committed to the branch the run was started on (never main) for review.
+  demo:
+    if: inputs.demo != '' && github.ref_name != 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: cargo build --release && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
+      - name: record
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SCENE: ${{ inputs.demo }}
+        run: |
+          mkdir -p out
+          work=$(mktemp -d) && cp -R demo/shop/. "$work"
+          (cd "$work" && RUSTY_BIN="$GITHUB_WORKSPACE/target/release/rusty" RUSTY_HOME="$(mktemp -d)" \
+            python3 "$GITHUB_WORKSPACE/scripts/record.py" "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
+          agg --theme monokai --speed 2 --idle-time-limit 2 "out/$SCENE.cast" "out/$SCENE.gif"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo
+          path: out/
+      - name: commit the GIF to the branch
+        env:
+          SCENE: ${{ inputs.demo }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          cp "out/$SCENE.gif" "docs/demo/$SCENE.gif"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "docs/demo/$SCENE.gif"
+          git commit -m "docs(demo): record the $SCENE scene"
+          git push origin "HEAD:$BRANCH"
