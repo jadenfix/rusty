@@ -29,6 +29,13 @@ COLS, ROWS = 104, 34
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 SCENES = {
+    "fullstack": [
+        ("wait", r"\?2004h"),
+        ("type", "Fix the local task board API and UI. Check whitespace validation, item rendering and persistence; run the tests. Keep the answer short."),
+        ("wait", r"FULLSTACK_COMPLETE"),
+        ("wait", r"\?2004h"),
+        ("pause", 2.0),
+    ],
     "hero": [
         ("wait", r"\?2004h"),
         ("pause", 2.0),
@@ -125,25 +132,30 @@ def main() -> int:
             screen += text
 
     since = 0  # waits match output produced after the last Enter
+    failed = False
     for kind, arg in steps:
         if kind == "wait":
             # Match output produced since the last Enter or the last match.
-            deadline = time.time() + 300
+            deadline = time.time() + float(os.environ.get("RUSTY_RECORD_TIMEOUT", "60"))
             while True:
                 raw = re.search(arg, screen[since:])
                 if raw or re.search(arg, ANSI.sub("", screen[since:])):
                     break
                 if time.time() > deadline:
                     print(f"timed out waiting for {arg!r}", file=sys.stderr)
+                    failed = True
                     break
                 pump(0.2)
             if raw:
                 since += raw.end()
             pump(0.3)
+            if failed:
+                break
         elif kind == "type":
             for ch in arg:
                 os.write(fd, ch.encode())
-                pump(random.uniform(0.025, 0.07))
+                delay = os.environ.get("RUSTY_RECORD_TYPE_DELAY")
+                pump(float(delay) if delay else random.uniform(0.025, 0.07))
             pump(0.35)
             since = len(screen)
             os.write(fd, b"\r")
@@ -159,13 +171,14 @@ def main() -> int:
         os.kill(pid, 9)
     except OSError:
         pass
+    os.waitpid(pid, 0)
     header = {"version": 2, "width": COLS, "height": ROWS, "timestamp": int(start), "env": {"TERM": "xterm-256color"}}
     with open(out, "w") as f:
         f.write(json.dumps(header) + "\n")
         for e in events:
             f.write(json.dumps(e) + "\n")
     print(f"{out}: {len(events)} events, {events[-1][0]:.0f}s" if events else f"{out}: empty", file=sys.stderr)
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

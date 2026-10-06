@@ -30,6 +30,27 @@ jobs:
         run: |
           cargo build --bins --locked
           python3 scripts/memory_smoke.py --report memory-offline.json
+      - name: memory quality and conservative Auto routing, offline
+        run: |
+          python3 scripts/behavior_check.py --report memory-quality.json
+          python3 scripts/mode_smoke.py --report mode-quality.json
+      - name: local full-stack execution, offline provider
+        run: python3 scripts/fullstack_smoke.py --report fullstack-quality.json
+      - name: steady footer, approval and interruption in real PTYs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y expect
+          python3 tests/tty/capture.py --binary target/debug/rusty --output target/tty-quality
+          python3 tests/tty/inspect.py target/tty-quality
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-quality-receipts
+          path: |
+            memory-quality.json
+            mode-quality.json
+            fullstack-quality.json
+            target/tty-quality/alignment.json
       - name: cloud launcher, offline
         run: python3 -m unittest cloud/test_daytona.py
       - name: hybrid tools and parallel swarms, offline SDK and model

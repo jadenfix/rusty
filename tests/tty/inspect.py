@@ -56,6 +56,7 @@ def inspect(path, cols):
     final=[''.join(row) for row in grid]
     assert not any('╭' in line or '╯' in line for line in final),'transient panel left at exit'
     assert 'CAPTURE_COMPLETE' in text
+    assert frames, 'no complete footer frames captured'
     if frames:
         assert scrolled>0
         first=next((i for i,a in enumerate(anchors) if a==23),None)

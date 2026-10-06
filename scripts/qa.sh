@@ -16,6 +16,16 @@ cargo test
 step "memory hooks (real CLI, offline provider)"
 cargo build --bins
 python3 scripts/memory_smoke.py --report "${TMPDIR:-/tmp}/rusty-memory-offline-$$.json"
+step "memory recall, silence, tone and full-store latency"
+python3 scripts/behavior_check.py --report "${TMPDIR:-/tmp}/rusty-memory-quality-$$.json"
+step "Auto routing and local full-stack execution"
+python3 scripts/mode_smoke.py --report "${TMPDIR:-/tmp}/rusty-modes-$$.json"
+python3 scripts/fullstack_smoke.py --report "${TMPDIR:-/tmp}/rusty-fullstack-$$.json"
+step "steady footer, approval and interruption in real terminals"
+tty_work=$(mktemp -d)
+trap 'rm -rf "$tty_work"' EXIT
+python3 tests/tty/capture.py --binary target/debug/rusty --output "$tty_work"
+python3 tests/tty/inspect.py "$tty_work"
 
 step "cloud launcher (offline)"
 python3 -m unittest cloud/test_daytona.py

@@ -47,7 +47,7 @@ it runs on open models hosted by NVIDIA.
 
 ## See it work
 
-Every clip below is a real session, recorded with
+The model-backed clips in the following sections are real sessions, recorded with
 [`scripts/record.py`](scripts/record.py) against the toy store in
 [`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
 faster playback. Run them yourself and you'll get the same kind of result.
@@ -88,15 +88,36 @@ commands run are carried over verbatim, so the summary can't lose them.
 classifier at work: `rm -rf` asks first while `cargo test` just runs.
 `/tokens` shows where every token went.
 
+### A local full-stack repair, with repeatable checks
+
+![Offline quality CI](https://github.com/jadenfix/rusty/actions/workflows/ci.yml/badge.svg)
+
+<img src="docs/demo/fullstack.gif" alt="Rusty repairs a task board API and UI, then runs the API tests" width="100%">
+
+This new clip uses a **scripted local provider** and the real Rust CLI, file
+editing and Bash tools. It repairs three intentional bugs in a task board,
+runs its API tests, and passes separate API, persistence and JavaScript checks.
+The repaired app was also exercised in a real browser: submit, reload, reject
+blank titles, and render an untrusted title as text. This proves the execution
+path; it does not measure a live model's bug-finding ability or tone quality.
+
+<img src="docs/demo/steady.gif" alt="Sampled real PTY frames show output scrolling above the fixed geometric panel" width="100%">
+
+The steady clip replays sampled complete frames from a real terminal capture.
+The raw captures are checked at 24, 40, 80 and 120 columns: completed output
+scrolls above the panel, the panel stays at the bottom once it reaches it,
+no line uses the wrap column, and the panel clears on exit. Approval and
+Ctrl-C recovery are exercised too. [Reproduce the checks](docs/QUALITY.md).
+
 ## Everything else
 
 | | |
 |---|---|
 | **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
-| **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. |
+| **Real memory** | Typed records, bounded recall and optional L1/L2 hooks. Saved guidance stays available through the current turn; explicit response-style preferences survive tool use. See [docs/MEMORY.md](docs/MEMORY.md). |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
 | **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
-| **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
+| **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and work against a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
 | **Secrets stay out of the transcript** | Tool output is redacted before the model, the screen or a session file sees it. |
 | **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
 | **Subagents and swarms** | `/agents sub\|swarm\|auto`. Swarm workers can rotate models and spread their temperatures. Off by default, so you never pay for tokens you didn't ask for. |
@@ -154,7 +175,7 @@ That's separate from what it's allowed to do.
 
 | | |
 |---|---|
-| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
+| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful for clear consequential work involving production, migrations, deploys, data, money, security, infrastructure or incidents; vibe for an explicit prototype or sketch; standard for questions, routine work and uncertainty. Topic words, “quick,” and an idle production target alone do not escalate it. Auto remains saved as Auto and selects again on the next request. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
 | `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal gets one checker attempt, including after saving and resuming. |
 | `standard` | Normal effort, and it checks what it changed. |
 | `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
