@@ -412,6 +412,32 @@ fn scripted_run(
     (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string(), requests)
 }
 
+#[test]
+fn shell_directory_variables_are_visible_but_passwords_stay_redacted() {
+    let s = Sandbox::new("pwd-redaction");
+    let pwd = s.project.canonicalize().unwrap();
+    let oldpwd = s.home.canonicalize().unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        bash_reply(&format!("pwd; printf '%s\\n' '{}' \"$DB_PWD\"", oldpwd.display())),
+        text_reply("verified"),
+    ]);
+    let output = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("PWD", &pwd)
+        .env("OLDPWD", &oldpwd)
+        .env("DB_PWD", "password-canary-12345")
+        .args(["--mode", "standard", "--yolo", "inspect the working directory"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let requests = server.join().unwrap();
+    let tool = requests[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+    let content = tool["content"].as_str().unwrap();
+    assert!(content.contains(pwd.to_str().unwrap()) && content.contains(oldpwd.to_str().unwrap()), "{content}");
+    assert!(!content.contains("password-canary-12345") && content.contains("[redacted]"), "{content}");
+}
+
 fn text_reply(text: &str) -> serde_json::Value {
     serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]})
 }

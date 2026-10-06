@@ -117,7 +117,9 @@ pub fn redact(text: &str) -> (String, usize) {
         std::env::vars_os()
             .filter_map(|(k, v)| {
                 let (k, v) = (k.to_str()?, v.to_str()?);
-                (secret_key(k) && v.len() >= 8).then(|| v.to_owned())
+                // Shell directory variables are paths, not password fields.
+                // Keep DB_PWD and explicit pwd=value records protected.
+                (!matches!(k, "PWD" | "OLDPWD") && secret_key(k) && v.len() >= 8).then(|| v.to_owned())
             })
             .collect()
     }) {
