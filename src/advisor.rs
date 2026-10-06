@@ -102,8 +102,12 @@ pub struct Response {
 
 pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(200)))?;
+    // Hooks still return after HOOK_MS. Explicit management may flush SQLite
+    // or transfer a snapshot, so its transport must honor the control budget.
+    let transport_ms =
+        if matches!(req.op.as_str(), "begin" | "event" | "finish" | "advice" | "prepared") { 200 } else { 1000 };
+    stream.set_read_timeout(Some(Duration::from_millis(transport_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(transport_ms)))?;
     let mut body = serde_json::to_vec(req)?;
     if body.len() > if req.op == "import" { TRANSFER } else { FRAME } {
         bail!("memory frame too large");
@@ -941,11 +945,13 @@ pub fn serve(home: &Path) -> Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("memory daemon already running");
     }
+    // A connectable socket must mean initialization is complete. Cold overlay
+    // filesystems can take longer than the hook deadline to initialize SQLite.
+    let mut engine = Engine::new(home)?;
     let path = dir.join("advisor.sock");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let mut engine = Engine::new(home)?;
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
             continue;

@@ -1,7 +1,5 @@
 name: memory live smoke
 on:
-  push:
-    branches: [main, feat/proactive-memory]
   workflow_dispatch:
 permissions:
   contents: read

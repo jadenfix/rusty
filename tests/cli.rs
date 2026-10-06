@@ -1085,3 +1085,213 @@ fn two_empty_replies_fail_without_an_unbounded_retry_loop() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("two empty replies"));
     assert_eq!(server.join().unwrap().len(), 2);
 }
+
+#[test]
+fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    let s = Sandbox::new("parallel-swarm");
+    for i in 0..3 {
+        std::fs::write(s.project.join(format!("file{i}.txt")), format!("FACT-{i}")).unwrap();
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate_server = gate.clone();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_server = requests.clone();
+    let server = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut handlers = Vec::new();
+        // Four lead requests and three requests per worker.
+        while requests_server.load(Ordering::SeqCst) < 13 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(15), "missing swarm request");
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let gate = gate_server.clone();
+            let requests = requests_server.clone();
+            handlers.push(std::thread::spawn(move || {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut size = 0;
+                let mut headers = 0;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        // A client may open a speculative idle connection.
+                        Ok(0) if headers == 0 => return,
+                        Err(e) if headers == 0 && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return,
+                        Ok(0) => panic!("incomplete request headers"),
+                        Err(e) => panic!("{e}"),
+                        Ok(_) => headers += 1,
+                    }
+                    if line == "\r\n" { break; }
+                    if let Some((key, val)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") { size = val.trim().parse().unwrap(); }
+                    }
+                }
+                let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                requests.fetch_add(1, Ordering::SeqCst);
+                let messages = body["messages"].as_array().unwrap();
+                let prompt = messages.iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap();
+                let steps = messages.iter().filter(|m| m["role"] == "tool").count();
+                let reply = if let Some(i) = prompt.strip_prefix("WORKER-").and_then(|p| p.chars().next()).and_then(|c| c.to_digit(10)) {
+                    assert!(!body["tools"].to_string().contains("\"write_file\""), "write tool exposed to worker");
+                    match steps {
+                        0 => {
+                            let (lock, cv) = &*gate;
+                            let mut entered = lock.lock().unwrap(); *entered += 1; cv.notify_all();
+                            let (entered, _) = cv.wait_timeout_while(entered, Duration::from_secs(5), |n| *n < 3).unwrap();
+                            assert_eq!(*entered, 3, "workers did not overlap");
+                            // Even a forged write tool call must be denied by policy.
+                            tool_reply("write_file", json!({"path":"forbidden.txt","content":"worker wrote"}))
+                        }
+                        1 => {
+                            assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("denied"));
+                            tool_reply("read_file", json!({"path":format!("file{i}.txt")}))
+                        }
+                        _ => {
+                            assert!(messages.last().unwrap()["content"].as_str().unwrap().contains(&format!("FACT-{i}")));
+                            text_reply(&format!("FACT-{i}"))
+                        }
+                    }
+                } else {
+                    match steps {
+                        0 => tool_reply("swarm", json!({"tasks": (0..3).map(|i| json!({"description":format!("slice-{i}"),"prompt":format!("WORKER-{i}: inspect file{i}.txt")})).collect::<Vec<_>>()})),
+                        1 => {
+                            let report = messages.last().unwrap()["content"].as_str().unwrap();
+                            assert_eq!(report.matches("(done)").count(), 3);
+                            assert!((0..3).all(|i| report.contains(&format!("FACT-{i}"))));
+                            tool_reply("write_file", json!({"path":"report.md","content":report}))
+                        }
+                        2 => tool_reply("bash", json!({"command":"test -s report.md && printf verified > proof.txt"})),
+                        _ => text_reply("Done and verified."),
+                    }
+                };
+                let data = format!("data: {reply}\n\ndata: [DONE]\n\n");
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",data.len(),data).unwrap();
+            }));
+        }
+        for h in handlers {
+            h.join().unwrap();
+        }
+    });
+    let child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", endpoint)
+        .args(["--yolo", "--mode", "standard", "--agents", "swarm", "inspect three slices with a swarm"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    server.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(*gate.0.lock().unwrap(), 3);
+    assert_eq!(requests.load(Ordering::SeqCst), 13);
+    assert!(!s.project.join("forbidden.txt").exists());
+    assert_eq!(std::fs::read_to_string(s.project.join("proof.txt")).unwrap(), "verified");
+}
+
+#[test]
+fn unchanged_call_loop_pauses_all_profiles_without_closing_the_goal() {
+    use serde_json::json;
+    for mode in ["careful", "standard", "vibe"] {
+        let s = Sandbox::new(&format!("stalled-{mode}"));
+        s.fake("probe", "printf unchanged");
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let (name, args) = if i < 4 {
+                    ("bash", if i % 2 == 0 { "{\"command\":\"probe\"}" } else { "{ \"command\" : \"probe\" }" })
+                } else if i == 4 {
+                    ("write_file", "{\"path\":\"must-not-write.txt\",\"content\":\"wrong\"}")
+                } else {
+                    ("goal_done", "{\"evidence\":\"done\"}")
+                };
+                json!({"index":i,"id":format!("call-{i}"),"type":"function","function":{"name":name,"arguments":args}})
+            })
+            .collect();
+        let reply = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+        let (url, server) = scripted_endpoint(vec![reply]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "--mode", mode, "--goal", "inspect", "--stats"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(|c| wait(c, Duration::from_secs(20)))
+            .unwrap();
+        assert!(!out.status.success(), "{mode} marked a stalled task successful");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("four consecutive identical") && stderr.contains("\"goal\":\"open\""), "{stderr}");
+        assert_eq!(s.calls().lines().count(), 4, "the guard should stop later tools in the batch");
+        assert!(!s.project.join("must-not-write.txt").exists());
+        assert_eq!(server.join().unwrap().len(), 1, "stopping does not spend another review/request");
+    }
+}
+
+#[test]
+fn repeated_call_with_new_results_is_progress() {
+    use serde_json::json;
+    let s = Sandbox::new("changing-results");
+    s.fake("probe", "wc -l < \"$RUSTY_TEST_CALLS\"");
+    let calls: Vec<_> = (0..6).map(|i| json!({"index":i,"id":format!("call-{i}"),"type":"function","function":{"name":"bash","arguments":"{\"command\":\"probe\"}"}}))
+        .chain(std::iter::once(json!({"index":6,"id":"done","type":"function","function":{"name":"goal_done","arguments":"{\"evidence\":\"six new observations\"}"}}))).collect();
+    let reply = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+    let (stdout, stderr, requests) =
+        scripted_run(&s, &["--yolo", "--mode", "standard", "--goal", "inspect", "--stats"], vec![reply]);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(s.calls().lines().count(), 6);
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
+    assert!(!stdout.contains("returned the same result"), "new observations must not trigger repetition warnings");
+}
+
+#[test]
+fn careful_goal_keeps_its_single_checker_budget_after_resume() {
+    use serde_json::json;
+    let s = Sandbox::new("resumed-checker");
+    let done = tool_reply("goal_done", json!({"evidence":"checked"}));
+    let mut partial = text_reply("fixes still in progress");
+    partial["choices"][0]["finish_reason"] = json!("length");
+    let (url, server) = scripted_endpoint(vec![done.clone(), text_reply("reviewed once; fix edge case"), partial]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|c| wait(c, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+    assert_eq!(server.join().unwrap().len(), 3);
+    let (url, server) = scripted_endpoint(vec![done]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--continue"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("goal done"));
+    assert_eq!(server.join().unwrap().len(), 1, "resume must not purchase a second checker");
+}

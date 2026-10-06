@@ -166,8 +166,30 @@ class LauncherTest(unittest.TestCase):
         self.assertTrue(self.run_quietly(launcher.export, self.remote, self.state)[0])
         dest = Path("cloud-runs/run-1")
         self.assertEqual((dest / "memory.json.gz").read_bytes(), b"compressed-snapshot")
+        self.assertEqual(dest.stat().st_mode & 0o777, 0o700)
+        for item in dest.iterdir():
+            self.assertEqual(item.stat().st_mode & 0o777, 0o600, str(item))
         with tarfile.open(dest / "session.tgz") as t:
             self.assertFalse(any("/memory/" in n for n in t.getnames()))
+
+    def test_missing_trajectory_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=.05)
+        (self.remote.home / "rusty-run/trajectory.json").unlink()
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertFalse(self.state["exported"])
+
+    def test_unknown_exit_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        self.remote.env["FAKE_RUSTY_SLEEP"] = "1"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertEqual(self.state["status"], "running")
 
     def test_missing_memory_export_preserves_cloud_sandbox(self):
         self.state["memory_mode"] = "on"
@@ -230,6 +252,51 @@ class LauncherTest(unittest.TestCase):
         (a.parent / "rusty-memoryd").write_bytes(b"advisor-v2")
         self.assertNotEqual(old, launcher.snapshot_name(a))
         self.assertIn("@sha256:", launcher.BASE_IMAGE, "the base image must stay pinned by digest")
+
+class SafetyAndCompatibilityTest(unittest.TestCase):
+    setUp = LauncherTest.setUp
+    tearDown = LauncherTest.tearDown
+    run_quietly = LauncherTest.run_quietly
+    def test_direct_cli_does_not_shadow_the_sdk(self):
+        sdk = self.root / 'sdk'
+        sdk.mkdir()
+        (sdk / 'daytona.py').write_text('class CreateSnapshotParams: pass\nclass Image: pass\nclass Resources: pass\nclass DaytonaNotFoundError(Exception): pass\n')
+        script = Path(launcher.__file__).resolve()
+        p = subprocess.run([sys.executable, str(script), 'prepare', '--binary', str(self.root/'missing')], env={**os.environ, 'PYTHONPATH': str(sdk)}, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('not found. Build the static Linux binary', p.stderr)
+        self.assertNotIn('ImportError', p.stderr)
+
+    def test_snapshot_resources_change_identity(self):
+        binary = self.root / 'rusty'
+        binary.write_bytes(b'runtime')
+        self.assertNotEqual(launcher.snapshot_name(binary, 2, 4), launcher.snapshot_name(binary, 4, 8))
+
+    def test_missing_trajectory_preserves_sandbox(self):
+        launcher.setup_and_start(self.remote, self.state, ['x'])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=.05)
+        (self.remote.home / 'rusty-run/trajectory.json').unlink()
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertFalse(self.state['exported'])
+
+    def test_local_exports_are_private(self):
+        launcher.setup_and_start(self.remote, self.state, ['x'])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=.05)
+        self.run_quietly(launcher.export, self.remote, self.state)
+        dest = Path('cloud-runs/run-1')
+        self.assertEqual(dest.stat().st_mode & 0o777, 0o700)
+        for p in dest.iterdir():
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600, str(p))
+
+    def test_running_sandbox_is_not_deleted_without_exit(self):
+        self.remote.env['FAKE_RUSTY_SLEEP'] = '1'
+        launcher.setup_and_start(self.remote, self.state, ['x'])
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertEqual(self.state['status'], 'running')
 
 
 if __name__ == "__main__":

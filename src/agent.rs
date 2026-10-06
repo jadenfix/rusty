@@ -4,7 +4,7 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -46,6 +46,9 @@ pub struct Goal {
     pub objective: String,
     pub status: GoalStatus,
     pub turns: u32,
+    /// One checker attempt per goal, including after saving and resuming.
+    #[serde(default)]
+    pub checker_used: bool,
 }
 
 #[derive(Default)]
@@ -95,6 +98,7 @@ impl Totals {
 }
 
 pub struct Agent {
+    pub backend: crate::backend::Backend,
     client: Arc<Client>,
     pub model: String,
     pub temperature: f32,
@@ -158,6 +162,7 @@ impl Agent {
     pub fn new(client: Arc<Client>, model: String, cwd: PathBuf, policy: Policy, memory: Memory) -> Self {
         let project_notes = load_project_notes(&cwd);
         Self {
+            backend: crate::backend::Backend::Local,
             client,
             model,
             temperature: 0.2,
@@ -202,6 +207,17 @@ impl Agent {
         }
     }
 
+    pub fn set_backend(&mut self, backend: crate::backend::Backend) -> Result<()> {
+        if backend.name() == "daytona" {
+            let description = backend.initial_description();
+            self.cwd = backend.cwd(&self.cwd);
+            self.project_notes = description["notes"].as_str().unwrap_or("").to_string();
+            self.infra.target = serde_json::from_value(description["target"].clone())?;
+        }
+        self.backend = backend;
+        Ok(())
+    }
+
     /// Auto's pick for a request; a production target is always careful.
     fn pick_mode(&self, request: &str) -> (ExecutionMode, String) {
         if self.infra.target.production {
@@ -231,17 +247,22 @@ impl Agent {
             return;
         }
         self.apply_profile(ExecutionMode::Careful, why.to_string());
-        self.checker_owed = true;
+        self.checker_owed = !self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active && g.checker_used);
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("auto · switched up: {why}"))));
     }
 
     /// The most workers one swarm may start. Vibe keeps it small unless the
     /// user chose delegation settings themselves.
     pub fn swarm_cap(&self) -> usize {
-        if self.execution_mode == ExecutionMode::Vibe && !self.delegation_override {
+        let cap = if self.execution_mode == ExecutionMode::Vibe && !self.delegation_override {
             self.agents.swarm_max.min(ExecutionMode::VIBE_WORKERS)
         } else {
             self.agents.swarm_max
+        };
+        if self.backend.name() == "daytona" {
+            cap.min(8)
+        } else {
+            cap
         }
     }
 
@@ -250,6 +271,9 @@ impl Agent {
     /// agent owns the fixes; there is no second review.
     fn review_completion(&mut self, query: &str, d: &mut Display) {
         self.checker_owed = false;
+        if let Some(g) = &mut self.goal {
+            g.checker_used = true;
+        }
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim("a read-only checker is reviewing the result")));
         let constraints = context::user_messages(&self.history, 8_000);
         let working = context::working_set(&self.history);
@@ -474,8 +498,10 @@ impl Agent {
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
         let mut d = Display::new(self.is_worker);
         let before = self.totals.clone();
-        // How often each exact call has been made this turn, to catch doom loops.
-        let mut seen: HashMap<String, u32> = HashMap::new();
+        // Only consecutive unchanged results count: an edit, a different call,
+        // or new output is progress. Retain one call rather than a turn-sized map.
+        let mut previous_call: Option<(String, String)> = None;
+        let mut repeats = 0;
         let mut outcome: Result<bool> = Ok(true);
         self.pending_goal = None;
         // Goals keep one review budget across all their turns (set in run_goal);
@@ -583,11 +609,12 @@ impl Agent {
             for call in &reply.tool_calls {
                 let output = if signal::interrupted() {
                     "skipped: the user interrupted".to_string()
+                } else if outcome.is_err() {
+                    "skipped: the turn stalled; task completion is unconfirmed".to_string()
                 } else {
-                    let repeats = seen.entry(format!("{}{}", call.name, call.arguments)).or_insert(0);
-                    *repeats += 1;
-                    let n = *repeats;
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                    // JSON whitespace/key order must not bypass repeat detection.
+                    let signature = format!("{}:{args}", call.name);
                     let class = crate::permissions::classify(&call.name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
@@ -607,18 +634,39 @@ impl Agent {
                             self.escalate("three commands failed in a row", &mut d);
                         }
                     }
-                    if n == 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                    if matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
+                        previous_call = None;
+                        repeats = 0;
+                    } else {
+                        repeats = if previous_call.as_ref().is_some_and(|(s, o)| s == &signature && o == &out) {
+                            repeats + 1
+                        } else {
+                            1
+                        };
+                        previous_call = Some((signature, out.clone()));
+                    }
+                    if repeats == 3 {
                         self.escalate("the same call keeps repeating", &mut d);
                     }
-                    if n >= 3 && !matches!(call.name.as_str(), "plan" | "recall") {
+                    if repeats == 4 {
+                        outcome = Err(anyhow::anyhow!(
+                            "stopped after four consecutive identical tool calls with unchanged results; \
+                             task completion is unconfirmed. Inspect the result and try a different approach."
+                        ));
+                    }
+                    if repeats >= 3 {
                         out.push_str(&format!(
-                            "\n\nnote: this exact call has now run {n} times this turn. Repeating it will not change \
-                             the result. Step back, re-read the error, and try a different approach."
+                            "\n\nnote: this call has returned the same result {repeats} times consecutively. \
+                             Step back, re-read the result, and try a different approach."
                         ));
                     }
                     out
                 };
                 self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
+            }
+            if outcome.is_err() {
+                self.pending_goal = None;
+                break;
             }
             if signal::interrupted() {
                 self.pending_goal = None;
@@ -788,7 +836,8 @@ impl Agent {
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
-        match self.policy.decide(name, args, &self.cwd) {
+        let mut approval = self.backend.decide(name, args, &self.policy, &self.cwd)?;
+        match approval.clone() {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.refused(name, args, "denied", &why);
@@ -829,6 +878,7 @@ impl Agent {
                         println!("  {}", ui::dim(&format!("allowing `{rule}` from now on (/permissions to undo)")));
                         self.policy.allow.push(rule);
                         self.policy.save();
+                        approval = Verdict::Allow;
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
@@ -842,9 +892,9 @@ impl Agent {
             }
         }
         if name == "bash" {
-            return self.run_bash(args, d);
+            return self.run_bash(args, &approval, d);
         }
-        tools::execute(name, args)
+        self.backend.execute(name, args, &self.policy, &approval)
     }
 
     /// A shell command that never ran still gets its audit line.
@@ -858,9 +908,11 @@ impl Agent {
     /// Runs a shell command through the infra harness: a change gets a
     /// snapshot of what it is about to touch first, and everything that
     /// touches infrastructure is logged.
-    fn run_bash(&mut self, args: &Value, d: &mut Display) -> Result<String> {
+    fn run_bash(&mut self, args: &Value, approval: &Verdict, d: &mut Display) -> Result<String> {
         let cmd = args["command"].as_str().unwrap_or("").to_string();
-        let Some(action) = infra::inspect(&cmd) else { return tools::execute("bash", args) };
+        let Some(action) = infra::inspect(&cmd) else {
+            return self.backend.execute("bash", args, &self.policy, approval);
+        };
         if self.execution_mode == ExecutionMode::Careful {
             if let Some(refusal) = self.infra.gate(&action) {
                 self.infra.record_refusal("careful", &cmd, "blocked", "needs a dry run first");
@@ -872,7 +924,7 @@ impl Agent {
         if action.mutating && !action.snapshots.is_empty() {
             d.set_status("snapshotting before the change".into());
             d.tick();
-            match self.infra.snapshot(&action, &cmd) {
+            match self.backend.snapshot(&self.infra, &action, &cmd) {
                 Ok(path) => {
                     d.line(&format!("  {} {}", ui::accent("⎘ snapshot"), ui::dim(&path.display().to_string())));
                     snapshot = Some(path.display().to_string());
@@ -885,7 +937,7 @@ impl Agent {
             d.set_status(String::new());
         }
         let started = Instant::now();
-        let mut out = tools::execute("bash", args)?;
+        let mut out = self.backend.execute("bash", args, &self.policy, approval)?;
         let (outcome, exit) = infra::outcome(&out);
         self.infra.saw_dry_run(&action, exit);
         // In careful mode a change is not done until it is seen to be healthy.
@@ -897,7 +949,11 @@ impl Agent {
         {
             d.set_status("verifying the change".into());
             d.tick();
-            let (ok, what) = self.infra.verify(&action);
+            let (ok, what) = if self.backend.name() == "local" {
+                self.infra.verify(&action)
+            } else {
+                self.infra.verify_with(&action, |command, timeout| self.backend.shell(command, timeout))
+            };
             d.set_status(String::new());
             verified = Some(ok);
             if ok {
@@ -973,10 +1029,12 @@ impl Agent {
             let counter = Arc::new(AtomicUsize::new(0));
             counters.push(counter.clone());
             let execution_mode = self.execution_mode;
+            let backend = self.backend.clone();
             let (client, cwd, deny, tx) = (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), tx.clone());
             std::thread::spawn(move || {
                 let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
                 w.is_worker = true;
+                w.backend = backend;
                 w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
                 w.progress = Some(counter);
@@ -1068,7 +1126,12 @@ impl Agent {
     pub fn run_goal(&mut self, objective: Option<&str>) -> Result<()> {
         let mut prompt = match objective {
             Some(obj) => {
-                self.goal = Some(Goal { objective: obj.to_string(), status: GoalStatus::Active, turns: 0 });
+                self.goal = Some(Goal {
+                    objective: obj.to_string(),
+                    status: GoalStatus::Active,
+                    turns: 0,
+                    checker_used: false,
+                });
                 format!(
                     "{}New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
                      Verify as you go with builds, tests or by running the code. When the goal is achieved and \
@@ -1094,7 +1157,8 @@ impl Agent {
             self.apply_profile(mode, why);
             self.show_pick(&mut Display::new(false));
         }
-        self.checker_owed = self.execution_mode == ExecutionMode::Careful;
+        self.checker_owed =
+            self.execution_mode == ExecutionMode::Careful && !self.goal.as_ref().is_some_and(|g| g.checker_used);
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
             let finished = self.run_turn(&prompt)?;
@@ -1348,7 +1412,7 @@ fn job(v: &Value) -> (String, String) {
     (v["description"].as_str().unwrap_or("worker").to_string(), v["prompt"].as_str().unwrap_or("").to_string())
 }
 
-fn load_project_notes(cwd: &std::path::Path) -> String {
+pub(crate) fn load_project_notes(cwd: &std::path::Path) -> String {
     let mut out = String::new();
     for name in ["AGENTS.md", "RUSTY.md", "CLAUDE.md"] {
         if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {

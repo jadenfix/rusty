@@ -141,6 +141,7 @@ when rate limited.
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
 | `/mode auto\|careful\|standard\|vibe` | how hard rusty thinks and checks its work |
+| `/tools [local\|daytona]` | show tool placement; save the default for the next session |
 | `/view default\|verbose\|adhd` | how much you see |
 | `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
@@ -154,7 +155,7 @@ That's separate from what it's allowed to do.
 | | |
 |---|---|
 | `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
-| `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal is checked once. |
+| `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal gets one checker attempt, including after saving and resuming. |
 | `standard` | Normal effort, and it checks what it changed. |
 | `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
 
@@ -175,6 +176,12 @@ reasoning budget. In a quick test, the low budget clearly cut reasoning,
 but asking for "high" made no difference on easy questions. Whether careful
 mode beats standard on real tasks is still being measured; see the evals
 below.
+
+All profiles stop a turn after four consecutive identical tool calls return
+unchanged results. Remaining tools in that batch are skipped and the goal stays
+open. A different call or changed output resets the counter; JSON formatting
+changes do not. This bounds exact-call loops, not every possible lack of progress.
+It adds no model request, checker or dependency.
 
 ## Permissions
 
@@ -272,6 +279,27 @@ Anything your endpoint serves, chosen with `--model`, `RUSTY_MODEL` or `/model`.
 To use another endpoint, set `RUSTY_BASE_URL`, for example `http://localhost:11434/v1`.
 
 ## Run it anywhere
+
+Keep reasoning and memory local while executing the entire swarm's tools in
+Daytona. `hybrid` uses the pinned Daytona SDK and attaches to an already
+started sandbox; it never creates or wakes one. The snapshot must contain
+this version of rusty and the remote workspace must already exist.
+
+```bash
+cargo build --bins
+uv run cloud/daytona.py hybrid --sandbox <id> --workspace /home/daytona/work \
+    --mode standard --agents swarm --swarm-max 3 --memory-mode on \
+    --prompt "Use three workers to inspect the project, then fix and verify the bug."
+```
+
+`--tools local|daytona` (or `RUSTY_TOOLS`) overrides the saved default.
+`/tools` and `/settings` show the current location; `/tools local|daytona`
+changes the next session, so a goal never changes workspaces halfway through.
+The hybrid launcher supplies the ephemeral local SDK connection for
+`--tools daytona`. Swarm workers remain read-only and share the lead's remote
+checkout; only the lead edits. No model credentials are copied to the sandbox.
+Cloud compute and model usage still consume credits. Full setup, lifecycle,
+placement choices and evidence are in [docs/CLOUD.md](docs/CLOUD.md).
 
 The core CLI is one static binary. `docker build --target bin -o out .` produces
 `rusty` and the optional `rusty-memoryd` companion for Linux.

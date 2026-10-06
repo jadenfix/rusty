@@ -19,6 +19,8 @@ python3 scripts/memory_smoke.py --report "${TMPDIR:-/tmp}/rusty-memory-offline-$
 
 step "cloud launcher (offline)"
 python3 -m unittest cloud/test_daytona.py
+step "hybrid tools + swarms (real Rust CLI, offline SDK/model)"
+python3 -m unittest cloud/test_hybrid.py
 
 if [[ "${1:-}" == "--live" ]]; then
   cargo build --release

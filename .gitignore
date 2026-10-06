@@ -4,3 +4,5 @@
 /out
 
 /memory-*.json
+
+__pycache__/

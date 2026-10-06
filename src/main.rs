@@ -1,4 +1,5 @@
 mod agent;
+mod backend;
 mod config;
 mod context;
 mod display;
@@ -33,6 +34,13 @@ use permissions::{Mode, Policy, Verdict};
 #[derive(Parser)]
 #[command(name = "rusty", version)]
 struct Cli {
+    /// Tool location: local or daytona (reasoning and memory stay in this process)
+    #[arg(long, env = "RUSTY_TOOLS")]
+    tools: Option<String>,
+
+    /// Private endpoint for the Daytona SDK bridge; no model or memory required
+    #[arg(long, hide = true)]
+    tool_rpc: bool,
     /// Run this prompt once and exit. Omit for interactive mode.
     prompt: Vec<String>,
 
@@ -59,6 +67,10 @@ struct Cli {
     /// Delegation: off, sub, swarm or auto (overrides saved settings)
     #[arg(short, long, env = "RUSTY_AGENTS")]
     agents: Option<String>,
+
+    /// Maximum parallel workers (1..8); overrides saved swarm size
+    #[arg(long, env = "RUSTY_SWARM_MAX", value_parser = clap::value_parser!(u8).range(1..=8))]
+    swarm_max: Option<u8>,
 
     /// View: default, verbose or adhd (overrides saved settings)
     #[arg(long)]
@@ -100,6 +112,15 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
+    // The sandbox's tool endpoint must never load model keys from dotenv.
+    if std::env::args().take_while(|arg| arg != "--").any(|arg| arg == "--tool-rpc") {
+        let cli = Cli::parse();
+        if let Some(dir) = &cli.dir {
+            std::env::set_current_dir(dir)?;
+        }
+        signal::install();
+        return backend::serve_rpc();
+    }
     config::load_env();
     let cli = Cli::parse();
     if let Some(d) = &cli.dir {
@@ -108,6 +129,7 @@ fn run() -> Result<i32> {
     let cwd = std::env::current_dir()?.canonicalize()?;
 
     let mut settings = Settings::load();
+    let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
     ui::set_theme(&settings.theme);
     ui::set_font(&settings.font);
     display::set_view(&settings.view);
@@ -118,6 +140,9 @@ fn run() -> Result<i32> {
     }
     if let Some(a) = &cli.agents {
         settings.agents.mode = AgentsMode::parse(a).ok_or_else(|| anyhow!("unknown agents mode `{a}`"))?;
+    }
+    if let Some(max) = cli.swarm_max {
+        settings.agents.swarm_max = max as usize;
     }
 
     // An explicit mode always wins; without one rusty picks per request.
@@ -149,16 +174,20 @@ fn run() -> Result<i32> {
     } else {
         Mode::parse(&cli.permissions).ok_or_else(|| anyhow!("unknown permission mode `{}`", cli.permissions))?
     };
-    let pdir = project_dir(&cwd);
+    let pdir = project_dir(&PathBuf::from(backend.identity(&cwd)));
     let global = config::config_dir().unwrap_or_default();
     let policy = Policy::load(pdir.join("permissions.json"), mode);
     let memory = Memory::load(pdir.join("memory.jsonl"), global.join("memory.jsonl"));
 
     let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy, memory);
+    if backend.name() == "local" {
+        agent.infra.target = infra::Target::detect(&cwd);
+    }
+    agent.set_backend(backend)?;
     agent.memory_mode = rusty::advisor::Mode::parse(&cli.memory)
         .ok_or_else(|| anyhow!("unknown memory mode `{}` (legacy, off, on, deep)", cli.memory))?;
     if matches!(agent.memory_mode, rusty::advisor::Mode::On | rusty::advisor::Mode::Deep) {
-        match rusty::advisor::Hooks::connect(&global, &cwd, agent.memory_mode) {
+        match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_mode) {
             Ok(h) => agent.advisor = Some(h),
             Err(_) => {
                 eprintln!("memory advisor unavailable; continuing with memory off");
@@ -174,7 +203,6 @@ fn run() -> Result<i32> {
     agent.set_execution_mode(chosen.unwrap_or(ExecutionMode::Standard));
     agent.mode_fixed = chosen.is_some();
     agent.infra.dir = Some(pdir.clone());
-    agent.infra.target = infra::Target::detect(&cwd);
     // A production target makes auto start careful and keep picking it; an
     // explicit mode still wins. Nothing is saved.
     if agent.infra.target.production && !agent.mode_fixed {
@@ -245,6 +273,7 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
             "memory_mode": agent.memory_mode,
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         "execution_mode": agent.execution_mode.name(),
+        "tools_location": agent.backend.summary(),
         "messages": agent.history,
         "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
     });
@@ -271,6 +300,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
             "memory_mode": agent.memory_mode,
+            "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
     );
@@ -427,6 +457,17 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
             print_mode(agent);
         }
+        "/tools" => {
+            if !rest.is_empty() {
+                if !matches!(rest, "local" | "daytona") {
+                    return Err(anyhow!("tool placement must be local or daytona"));
+                }
+                settings.tools = rest.into();
+                settings.save();
+                println!("  default tools {rest} · takes effect next session; --tools overrides it");
+            }
+            println!("  current tools {} · reasoning and memory in this process", agent.backend.summary());
+        }
         "/models" => {
             for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
                 println!("  {m}");
@@ -520,7 +561,11 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!("  tips {}", on_off(agent.tips));
         }
         "/target" => {
-            agent.infra.target = infra::Target::detect_with_identity(cwd);
+            agent.infra.target = if agent.backend.name() == "local" {
+                infra::Target::detect_with_identity(cwd)
+            } else {
+                serde_json::from_value(agent.backend.describe(true)?["target"].clone())?
+            };
             let line = if agent.infra.target.is_empty() { ui::dim("none detected") } else { target_line(agent) };
             println!("  target {line}");
         }
@@ -742,6 +787,8 @@ fn print_settings(agent: &Agent) {
     let a = &agent.agents;
     let rows = [
         ("model", agent.model.clone()),
+        ("tools", agent.backend.summary()),
+        ("memory location", "this process (controller)".into()),
         ("execution", if agent.mode_fixed { agent.execution_mode.name().to_string() } else { "auto".to_string() }),
         ("checker", agent.execution_mode.checker().to_string()),
         ("permissions", agent.policy.mode.name().to_string()),
@@ -833,14 +880,25 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
         }
         "check" if !arg.is_empty() => {
             let args = serde_json::json!({"command": arg});
-            let class = permissions::classify("bash", &args, &agent.cwd);
-            let verdict = match p.decide("bash", &args, &agent.cwd) {
+            let decision = match agent.backend.decide("bash", &args, p, &agent.cwd) {
+                Ok(verdict) => verdict,
+                Err(e) => {
+                    println!("  cannot check remote permissions: {e:#}");
+                    return;
+                }
+            };
+            let verdict = match decision {
                 Verdict::Allow => ui::ok("✓ runs"),
                 Verdict::Ask(_) => ui::warn("? asks first"),
                 Verdict::Confirm(_) => ui::err("‼ needs you every time"),
                 Verdict::Deny(why) => ui::err(&format!("✗ refused · {why}")),
             };
-            println!("  {verdict} {}", ui::dim(&format!("· {} · {} mode", class.describe(), p.mode.name())));
+            let class = if agent.backend.name() == "local" {
+                permissions::classify("bash", &args, &agent.cwd).describe()
+            } else {
+                "checked in the sandbox".into()
+            };
+            println!("  {verdict} {}", ui::dim(&format!("· {class} · {} mode", p.mode.name())));
         }
         m => match Mode::parse(m) {
             Some(mode) => {
@@ -939,6 +997,7 @@ fn print_help(cwd: &Path) {
                 ("/agents off|sub|swarm|auto", "delegation · default follows /mode · model <id> for subagents"),
                 ("/swarm size|models|spread", "tune parallel workers"),
                 ("/mode auto|careful|standard|vibe", "how hard rusty thinks and checks; permissions stay separate"),
+                ("/tools [local|daytona]", "show placement or save the default for the next session"),
                 ("/plan", "the current plan"),
             ],
         ),
