@@ -21,7 +21,7 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::OpenAi, Provider::Anthropic];
+    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::Anthropic, Provider::OpenAi];
 
     pub fn name(self) -> &'static str {
         match self {

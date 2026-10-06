@@ -822,13 +822,20 @@ fn scripted_endpoint(replies: Vec<serde_json::Value>) -> (String, std::thread::J
 /// names) and JSON body.
 #[allow(clippy::type_complexity)]
 fn scripted_sse(bodies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<(String, serde_json::Value)>>) {
+    scripted_http(bodies.into_iter().map(|b| (200, b)).collect())
+}
+
+/// Like `scripted_sse`, with a status code per response. A request without
+/// a body (a GET) is recorded as null.
+#[allow(clippy::type_complexity)]
+fn scripted_http(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Vec<(String, serde_json::Value)>>) {
     use std::io::{BufRead, BufReader, Read};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for sse in bodies {
+        for (status, sse) in responses {
             let start = Instant::now();
             let (mut stream, _) = loop {
                 match listener.accept() {
@@ -860,8 +867,11 @@ fn scripted_sse(bodies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<(St
             }
             let mut body = vec![0; size];
             reader.read_exact(&mut body).unwrap();
-            requests.push((headers, serde_json::from_slice(&body).unwrap()));
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
+            requests.push((
+                headers,
+                if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap() },
+            ));
+            write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
         }
         requests
     });
@@ -1420,9 +1430,48 @@ fn with_only_an_anthropic_key_claude_is_the_default() {
 }
 
 #[test]
+fn doctor_checks_every_provider_without_showing_keys() {
+    let s = Sandbox::new("doctor");
+    let (nvidia, nvidia_server) = scripted_http(vec![(
+        200,
+        r#"{"data": [{"id": "nvidia/nemotron-3-super-120b-a12b"}, {"id": "z-ai/glm-5.3"}]}"#.into(),
+    )]);
+    let (anthropic, anthropic_server) = scripted_http(vec![(
+        401,
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#.into(),
+    )]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", &nvidia)
+        .env("ANTHROPIC_API_KEY", "sk-ant-secret-value")
+        .env("ANTHROPIC_BASE_URL", anthropic.trim_end_matches("/v1"))
+        .arg("--doctor")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a failing provider fails the check: {text}");
+    assert!(text.contains("✓ compatible") && text.contains("2 models"), "{text}");
+    assert!(text.contains("✗ anthropic") && text.contains("401"), "{text}");
+    assert!(text.contains("not set up · add OPENAI_API_KEY"), "{text}");
+    assert!(text.contains("model nvidia/nemotron-3-super-120b-a12b → compatible") && text.contains("listed"), "{text}");
+    assert!(text.contains("ANTHROPIC_API_KEY") && !text.contains("secret-value"), "names only, never values");
+    assert_eq!(anthropic_server.join().unwrap().len(), 1, "one attempt, no retries");
+    let (headers, _) = &nvidia_server.join().unwrap()[0];
+    assert!(headers.starts_with("get /v1/models"), "{headers}");
+}
+
+#[test]
 fn an_empty_base_url_means_the_default() {
     let s = Sandbox::new("empty-base");
     let out = s.cmd().env("RUSTY_BASE_URL", "").args(["--model", "gpt-5", "hi"]).stdin(Stdio::null()).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("OPENAI_API_KEY is not set"), "gpt-5 must not go to an empty endpoint: {err}");
+}
+
+#[test]
+fn switching_to_a_model_without_its_key_warns_at_once() {
+    let s = Sandbox::new("model-warning");
+    let out = s.repl(&["/model gpt-5", "/model openai/gpt-oss-20b"]);
+    assert!(out.contains("model gpt-5 · openai needs OPENAI_API_KEY"), "{out}");
+    assert!(out.contains("model openai/gpt-oss-20b · compatible"), "{out}");
 }
