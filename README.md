@@ -96,6 +96,8 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
 | **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
+| **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
+| **Secrets stay out of the transcript** | Tool output is redacted before the model, the screen or a session file sees it. |
 | **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
 | **Subagents and swarms** | `/agents sub\|swarm\|auto`. Swarm workers can rotate models and spread their temperatures. Off by default, so you never pay for tokens you didn't ask for. |
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
@@ -133,6 +135,8 @@ when rate limited.
 | `/agents off\|sub\|swarm\|auto` | delegation · `/agents model <id>` sets the subagent model |
 | `/swarm size\|models\|spread` | worker count (up to 64), model rotation, temperature spread |
 | `/compact [focus]` | summarise now, keeping what you name in detail |
+| `/target` · `/audit [n]` · `/changes` | where infra commands will land · the infra audit log · what this session changed |
+| `/triage` `/change` `/postmortem` | infra skills: incident triage, a change plan with rollback, a blameless write-up |
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
