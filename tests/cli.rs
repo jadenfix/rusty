@@ -1085,3 +1085,105 @@ fn two_empty_replies_fail_without_an_unbounded_retry_loop() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("two empty replies"));
     assert_eq!(server.join().unwrap().len(), 2);
 }
+
+#[test]
+fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Condvar, Mutex};
+    let s = Sandbox::new("parallel-swarm");
+    for i in 0..3 {
+        std::fs::write(s.project.join(format!("file{i}.txt")), format!("FACT-{i}")).unwrap();
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate_server = gate.clone();
+    let server = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut handlers = Vec::new();
+        // Four lead requests and three requests per worker.
+        while handlers.len() < 13 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(15), "missing swarm request");
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let gate = gate_server.clone();
+            handlers.push(std::thread::spawn(move || {
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut size = 0;
+                loop {
+                    let mut line = String::new(); reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some((key, val)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") { size = val.trim().parse().unwrap(); }
+                    }
+                }
+                let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                let prompt = messages.iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap();
+                let steps = messages.iter().filter(|m| m["role"] == "tool").count();
+                let reply = if let Some(i) = prompt.strip_prefix("WORKER-").and_then(|p| p.chars().next()).and_then(|c| c.to_digit(10)) {
+                    assert!(!body["tools"].to_string().contains("\"write_file\""), "write tool exposed to worker");
+                    match steps {
+                        0 => {
+                            let (lock, cv) = &*gate;
+                            let mut entered = lock.lock().unwrap(); *entered += 1; cv.notify_all();
+                            let (entered, _) = cv.wait_timeout_while(entered, Duration::from_secs(5), |n| *n < 3).unwrap();
+                            assert_eq!(*entered, 3, "workers did not overlap");
+                            // Even a forged write tool call must be denied by policy.
+                            tool_reply("write_file", json!({"path":"forbidden.txt","content":"worker wrote"}))
+                        }
+                        1 => {
+                            assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("denied"));
+                            tool_reply("read_file", json!({"path":format!("file{i}.txt")}))
+                        }
+                        _ => {
+                            assert!(messages.last().unwrap()["content"].as_str().unwrap().contains(&format!("FACT-{i}")));
+                            text_reply(&format!("FACT-{i}"))
+                        }
+                    }
+                } else {
+                    match steps {
+                        0 => tool_reply("swarm", json!({"tasks": (0..3).map(|i| json!({"description":format!("slice-{i}"),"prompt":format!("WORKER-{i}: inspect file{i}.txt")})).collect::<Vec<_>>()})),
+                        1 => {
+                            let report = messages.last().unwrap()["content"].as_str().unwrap();
+                            assert_eq!(report.matches("(done)").count(), 3);
+                            assert!((0..3).all(|i| report.contains(&format!("FACT-{i}"))));
+                            tool_reply("write_file", json!({"path":"report.md","content":report}))
+                        }
+                        2 => tool_reply("bash", json!({"command":"test -s report.md && printf verified > proof.txt"})),
+                        _ => text_reply("Done and verified."),
+                    }
+                };
+                let data = format!("data: {reply}\n\ndata: [DONE]\n\n");
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",data.len(),data).unwrap();
+            }));
+        }
+        for h in handlers {
+            h.join().unwrap();
+        }
+    });
+    let child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", endpoint)
+        .args(["--yolo", "--mode", "standard", "--agents", "swarm", "inspect three slices with a swarm"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    server.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(*gate.0.lock().unwrap(), 3);
+    assert!(!s.project.join("forbidden.txt").exists());
+    assert_eq!(std::fs::read_to_string(s.project.join("proof.txt")).unwrap(), "verified");
+}

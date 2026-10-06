@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["daytona", "python-dotenv"]
+# dependencies = ["daytona==0.220.0", "python-dotenv"]
 # ///
 """Run rusty in a Daytona cloud sandbox.
 
@@ -36,9 +36,12 @@ import secrets
 import shlex
 import sys
 import time
+import subprocess
+import tempfile
 from pathlib import Path
 
 BASE_IMAGE = "debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+BUILD_IMAGE = "rust:1.90.0-alpine3.22@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26"
 PACKAGES = ["ca-certificates", "curl", "git", "make", "python3", "python3-venv", "ripgrep"]
 KEY_PREFIXES = ("NVIDIA_API_KEY", "RUSTY_")
 RUNS = Path("cloud-runs")
@@ -64,15 +67,15 @@ class Remote:
         r = self.sandbox.process.exec(f"bash -lc {shlex.quote(cmd)}", timeout=timeout)
         return r.exit_code, r.result
 
-    def start(self, cmd: str) -> str:
+    def start(self, cmd: str, session: str = "rusty") -> str:
         from daytona import SessionExecuteRequest
 
         try:
-            self.sandbox.process.create_session("rusty")
+            self.sandbox.process.create_session(session)
         except Exception:
             pass  # already there after a reconnect
         req = SessionExecuteRequest(command=f"bash -lc {shlex.quote(cmd)}", run_async=True)
-        return self.sandbox.process.execute_session_command("rusty", req).cmd_id
+        return self.sandbox.process.execute_session_command(session, req).cmd_id
 
     def path(self, p: str) -> str:
         if self._home is None:
@@ -89,10 +92,33 @@ class Remote:
             return None
 
 
-def daytona_client():
-    from daytona import Daytona
+def daytona_client(target=None):
+    from daytona import Daytona, DaytonaConfig
 
-    return Daytona()
+    return Daytona(DaytonaConfig(target=target))
+
+
+def check_endpoint(remote) -> None:
+    """Check HTTPS reachability without sending model credentials."""
+    code, _ = remote.sh("""python3 - <<'PY'
+import os, urllib.request, urllib.error
+url = os.environ.get('RUSTY_BASE_URL', 'https://integrate.api.nvidia.com/v1').rstrip('/') + '/models'
+try:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        pass
+except urllib.error.HTTPError as error:
+    # An unauthenticated response proves transport, not credential validity.
+    if error.code != 401:
+        raise SystemExit(1)
+except Exception:
+    raise SystemExit(1)
+PY""", timeout=15)
+    if code != 0:
+        raise RuntimeError(
+            "model endpoint is unreachable from this sandbox; no model calls started. "
+            "For NVIDIA on Daytona Tier 1/2, request an organization network exception "
+            "or upgrade to Tier 3: https://www.daytona.io/docs/en/network-limits/"
+        )
 
 
 # ------------------------------------------------------------------- state
@@ -102,10 +128,19 @@ def state_path(run_id: str) -> Path:
     return RUNS / run_id / "run.json"
 
 
+def private_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def save(state: dict) -> None:
     p = state_path(state["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, indent=2) + "\n")
+    private_write(p, (json.dumps(state, indent=2) + "\n").encode())
 
 
 def load(run_id: str) -> dict:
@@ -122,9 +157,11 @@ def model_env() -> dict:
 # ------------------------------------------------------------- environment
 
 
-def snapshot_name(binary: Path) -> str:
+def snapshot_name(binary: Path, cpu: int = 2, memory: int = 4) -> str:
     h = hashlib.sha256()
     h.update(BASE_IMAGE.encode())
+    h.update(f"{cpu}:{memory}".encode())
+    h.update(os.environ.get("DAYTONA_TARGET", "").encode())
     h.update(" ".join(PACKAGES).encode())
     h.update(binary.read_bytes())
     advisor = binary.with_name("rusty-memoryd")
@@ -141,19 +178,22 @@ def find_binary(arg: str | None) -> Path:
 
 
 def cmd_prepare(args) -> int:
-    from daytona import CreateSnapshotParams, Image
+    from daytona import CreateSnapshotParams, Image, Resources, DaytonaNotFoundError
+
+    if args.source:
+        return prepare_source(args)
 
     binary = find_binary(args.binary)
     advisor = binary.with_name("rusty-memoryd")
     if not advisor.is_file():
         sys.exit("rusty-memoryd missing; rebuild both binaries with docker build --target bin -o out .")
-    name = snapshot_name(binary)
+    name = snapshot_name(binary, args.cpu, args.memory)
     d = daytona_client()
     try:
         d.snapshot.get(name)
         print(f"☾ {name} is already prepared")
         return 0
-    except Exception:
+    except DaytonaNotFoundError:
         pass
     image = (
         Image.base(BASE_IMAGE)
@@ -164,11 +204,59 @@ def cmd_prepare(args) -> int:
         )
         .add_local_file(str(binary), "/usr/local/bin/rusty")
         .add_local_file(str(advisor), "/usr/local/bin/rusty-memoryd")
+        .add_local_file("LICENSE", "/usr/share/doc/rusty/LICENSE")
+        .add_local_file("THIRD_PARTY_NOTICES.txt", "/usr/share/doc/rusty/THIRD_PARTY_NOTICES.txt")
         .run_commands("chmod 755 /usr/local/bin/rusty /usr/local/bin/rusty-memoryd && rusty --version")
     )
     print(f"☾ preparing {name} from {BASE_IMAGE.split('@')[0]} and {binary}…", file=sys.stderr)
-    d.snapshot.create(CreateSnapshotParams(name=name, image=image), on_logs=lambda line: print(line, file=sys.stderr))
+    d.snapshot.create(CreateSnapshotParams(name=name, image=image, resources=Resources(cpu=args.cpu, memory=args.memory)), on_logs=lambda line: print(line, file=sys.stderr))
     print(f"☾ prepared {name}")
+    return 0
+
+
+def prepare_source(args) -> int:
+    """Build only the tracked runtime inputs in Daytona, never upload .env/.git.
+    A multi-stage build keeps Rust and build dependencies out of the runtime.
+    """
+    from daytona import CreateSnapshotParams, Image, Resources, DaytonaNotFoundError
+
+    root = Path(__file__).resolve().parent.parent
+    paths = ["Cargo.toml", "Cargo.lock", "src", "skills", "LICENSE", "THIRD_PARTY_NOTICES.txt"]
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    archive = subprocess.check_output(["git", "archive", "--format=tar", revision, *paths], cwd=root)
+    recipe = "\n".join([
+        f"FROM {BUILD_IMAGE} AS build", "RUN apk add --no-cache gcc musl-dev", "WORKDIR /src",
+        "COPY Cargo.toml Cargo.lock ./", "COPY src src", "COPY skills skills",
+        "RUN cargo build --release --bins --locked && strip target/release/rusty target/release/rusty-memoryd",
+        f"FROM {BASE_IMAGE}",
+        "RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends " + " ".join(PACKAGES) + " && rm -rf /var/lib/apt/lists/*",
+        "COPY --from=build /src/target/release/rusty /usr/local/bin/rusty",
+        "COPY --from=build /src/target/release/rusty-memoryd /usr/local/bin/rusty-memoryd",
+        "COPY LICENSE THIRD_PARTY_NOTICES.txt /usr/share/doc/rusty/",
+        "RUN rusty --version", "CMD [\"sleep\", \"infinity\"]",
+    ])
+    region = os.environ.get("DAYTONA_TARGET", "")
+    fingerprint = hashlib.sha256(archive + recipe.encode() + f"{args.cpu}:{args.memory}".encode() + region.encode()).hexdigest()[:12]
+    name = f"rusty-{fingerprint}"
+    d = daytona_client()
+    try:
+        snapshot = d.snapshot.get(name)
+    except DaytonaNotFoundError:
+        snapshot = None
+    if snapshot is not None:
+        if str(snapshot.state).split(".")[-1].lower() != "active":
+            raise RuntimeError(f"snapshot {name} exists but is {snapshot.state}; inspect before retrying")
+        print(name)
+        return 0
+    with tempfile.TemporaryDirectory(prefix="rusty-source-") as tmp:
+        # git archive contains only our explicit tracked paths, not the checkout.
+        subprocess.run(["tar", "xf", "-", "-C", tmp], input=archive, check=True)
+        dockerfile = Path(tmp) / "Dockerfile"
+        dockerfile.write_text(recipe + "\n")
+        image = Image.from_dockerfile(dockerfile, strict_context=True)
+        print(f"☾ building {revision} as {name} in Daytona ({args.cpu} CPU, {args.memory} GiB)…", file=sys.stderr)
+        d.snapshot.create(CreateSnapshotParams(name=name, image=image, resources=Resources(cpu=args.cpu, memory=args.memory)), on_logs=lambda line: print(line, file=sys.stderr))
+    print(name)
     return 0
 
 
@@ -225,6 +313,8 @@ def setup_and_start(remote, state: dict, task: list[str]) -> None:
         if code != 0:
             raise RuntimeError("memory import failed; check explicit project identity and snapshot scope")
     words = ["rusty", "--yolo", "--stats", "--mode", state["mode"], "--agents", state["agents"], "--memory", memory]
+    if state.get("model"):
+        words.extend(["--model", state["model"]])
     rusty = shlex.join([*words, "--trajectory", "TRAJECTORY", *task]).replace("TRAJECTORY", f"{RUN}/trajectory.json")
     state["command"] = rusty
     state["cmd_id"] = remote.start(
@@ -301,10 +391,10 @@ def export(remote, state: dict) -> bool:
         data = remote.download(f"{RUN}/{name}")
         if data is None:
             continue
-        (dest / name).write_bytes(data)
+        private_write(dest / name, data)
         manifest[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    ok = "patch.diff" in manifest and "out.log" in manifest and memory_ok
+    private_write(dest / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
+    ok = all(name in manifest for name in ["patch.diff", "out.log", "stderr.log", "trajectory.json", "exit"]) and memory_ok
     if state.get("memory_mode") in ("on", "deep"):
         ok = ok and "memory.json.gz" in manifest
     state["exported"] = ok
@@ -316,7 +406,7 @@ def export(remote, state: dict) -> bool:
 def finish(d, remote, state: dict, keep: bool) -> int:
     code = exit_code(remote)
     state["exit_code"] = code
-    state["status"] = "finished"
+    state["status"] = "finished" if code is not None else "running"
     save(state)
     ok = export(remote, state)
     dest = RUNS / state["id"]
@@ -326,8 +416,11 @@ def finish(d, remote, state: dict, keep: bool) -> int:
         reason = "kept (--keep)" if keep else "kept because the export failed"
         print(f"☾ sandbox {state['sandbox']} {reason}", file=sys.stderr)
         return code if code is not None else 1
+    if code is None:
+        print("☾ sandbox kept: no confirmed exit receipt", file=sys.stderr)
+        return 1
     delete_sandbox(d, remote, state)
-    return code if code is not None else 1
+    return code
 
 
 def delete_sandbox(d, remote, state: dict) -> None:
@@ -344,7 +437,7 @@ def delete_sandbox(d, remote, state: dict) -> None:
 
 
 def cmd_run(args) -> int:
-    from daytona import CreateSandboxFromSnapshotParams, Resources
+    from daytona import CreateSandboxFromSnapshotParams, DaytonaNotFoundError
 
     env = model_env()
     if "NVIDIA_API_KEY" not in env and "RUSTY_API_KEY" not in env:
@@ -357,7 +450,7 @@ def cmd_run(args) -> int:
     d = daytona_client()
     try:
         d.snapshot.get(snapshot)
-    except Exception:
+    except DaytonaNotFoundError:
         sys.exit(f"snapshot {snapshot} isn't prepared yet. Run:\n  uv run cloud/daytona.py prepare")
     run_id = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
     state = {
@@ -365,8 +458,10 @@ def cmd_run(args) -> int:
         "repo": args.repo,
         "ref": args.ref,
         "snapshot": snapshot,
+        "target": os.environ.get("DAYTONA_TARGET"),
         "mode": args.mode,
         "agents": args.agents,
+        "model": args.model,
         "memory_mode": args.memory_mode,
         "memory_input": str(Path(args.memory_input).resolve()) if args.memory_input else None,
         "project_id": args.project_id or args.repo,
@@ -375,7 +470,6 @@ def cmd_run(args) -> int:
         "status": "creating",
     }
     print(f"☾ run {run_id}: creating a sandbox from {snapshot}…", file=sys.stderr)
-    resources = Resources(cpu=args.cpu, memory=args.memory) if (args.cpu or args.memory) else None
     sandbox = d.create(
         CreateSandboxFromSnapshotParams(
             snapshot=snapshot,
@@ -383,7 +477,6 @@ def cmd_run(args) -> int:
             labels={"app": "rusty", "rusty-run": run_id},
             # A run may be followed from nowhere; don't stop it for being quiet.
             auto_stop_interval=0,
-            **({"resources": resources} if resources else {}),
         ),
         timeout=300,
     )
@@ -392,6 +485,7 @@ def cmd_run(args) -> int:
     remote = Remote(sandbox)
     task = ["--goal", args.goal] if args.goal else [args.prompt]
     try:
+        check_endpoint(remote)
         setup_and_start(remote, state, task)
     except Exception as e:
         print(f"☾ {e}", file=sys.stderr)
@@ -405,7 +499,7 @@ def cmd_run(args) -> int:
 
 def reconnect(run_id: str):
     state = load(run_id)
-    d = daytona_client()
+    d = daytona_client(state.get("target"))
     return d, Remote(d.get(state["sandbox"])), state
 
 
@@ -462,6 +556,9 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare", help="build the pinned snapshot for your rusty binary")
     p.add_argument("--binary", help="static Linux rusty binary (default out/rusty)")
+    p.add_argument("--source", action="store_true", help="build tracked HEAD in Daytona; no local Docker needed")
+    p.add_argument("--cpu", type=int, default=2, choices=range(1, 9))
+    p.add_argument("--memory", type=int, default=4, choices=range(1, 33), help="snapshot RAM in GiB")
     p = sub.add_parser("run", help="start a run")
     p.add_argument("--repo", required=True, help="git URL (or path) of the project")
     p.add_argument("--ref", help="branch, tag or commit to start from")
@@ -470,10 +567,9 @@ def main(argv=None) -> int:
     task.add_argument("--prompt", help="a single prompt instead of a goal")
     p.add_argument("--mode", default="auto", choices=["auto", "careful", "standard", "vibe"])
     p.add_argument("--agents", default="off", choices=["off", "sub", "swarm", "auto"])
+    p.add_argument("--model", help="model served by the configured endpoint")
     p.add_argument("--snapshot", help="use this prepared snapshot instead of the one for out/rusty")
     p.add_argument("--binary", help="static Linux rusty binary the snapshot was built from")
-    p.add_argument("--cpu", type=int)
-    p.add_argument("--memory", type=int, help="GiB")
     p.add_argument("--memory-mode", default="legacy", choices=["legacy", "off", "on", "deep"])
     p.add_argument("--memory-input", help="scoped gzip export from rusty-memoryd")
     p.add_argument("--project-id", help="same RUSTY_PROJECT_ID used locally; defaults to repo URL")
@@ -505,4 +601,7 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # This file's name otherwise shadows the installed `daytona` SDK.
+    here = Path(__file__).resolve().parent
+    sys.path = [p for p in sys.path if Path(p or ".").resolve() != here]
     sys.exit(main())
