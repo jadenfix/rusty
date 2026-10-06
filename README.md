@@ -20,8 +20,8 @@
 
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
-![evals](https://img.shields.io/badge/evals-12%2F12-ec7a34)
-![tests](https://img.shields.io/badge/tests-57%20passing-ec7a34)
+![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
+![tests](https://img.shields.io/badge/tests-84%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -231,17 +231,26 @@ anything else sends it back to the model as feedback.
 
 ## Verified end to end
 
-Nothing here is a mock. The model is real, the terminal is real, and every
-check is hidden from the agent.
+The live rows use the real model and a real terminal, and every eval check
+is hidden from the agent. The offline tests drive the real binary against a
+scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 33 unit tests (about 250 classified commands), 20 end-to-end tests on the real binary | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 84 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
-| Single-turn evals: Python, Rust, JS, code search, cross-file rename, CLI flag | 6/6 |
-| Multi-turn evals: change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | 6/6 |
+| 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |
 | Inside a FullStack-Bench task container under Harbor | installs, works the task with the environment's own CLI, closes its goal with evidence |
+
+These are single runs of each task on the same model, so a difference of
+one or two tasks between modes isn't meaningful yet. Runs that the API's
+rate limit cut off were rerun, and every miss was read from its logs:
+- standard and auto each went in circles on one task until the time limit;
+- vibe closed one goal that failed the hidden checks;
+- auto ran out of time on another goal even after switching itself up to careful.
+
+Careful used about 2.5 times the tokens of standard on the tasks both passed.
 
 ```bash
 scripts/qa.sh            # offline checks
