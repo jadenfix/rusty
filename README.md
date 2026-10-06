@@ -262,10 +262,19 @@ rate limit cut off were rerun, and every miss was read from its logs:
 
 Careful used about 2.5 times the tokens of standard on the tasks both passed.
 
+Five newer tasks (a Rust ring buffer, exact-cents bill splitting, backup
+rotation in bash, a bounded-concurrency `fetchAll` in JS, and a TTL cache
+written from its docstring) check more than their visible tests do, so
+fixing only the example doesn't pass. The `evals` workflow runs any of this
+on demand from GitHub with the repository's keys.
+
 ```bash
 scripts/qa.sh            # offline checks
-scripts/qa.sh --live     # plus live tests, the terminal check and all 12 evals
+scripts/qa.sh --live     # plus live tests, the terminal check and every eval
 scripts/eval.sh multi    # just the multi-turn evals; logs land in target/evals/
+
+# the same tasks on several models, three runs each, compared in one table
+EVAL_MODELS="claude-opus-5-5 gpt-5 nvidia/nemotron-3-super-120b-a12b" EVAL_REPEATS=3 scripts/eval.sh
 ```
 
 ## Models

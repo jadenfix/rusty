@@ -11,14 +11,19 @@
 #
 #   scripts/eval.sh                  # everything, EVAL_JOBS at a time (default 4)
 #   scripts/eval.sh multi            # only multi-turn tasks
-#   scripts/eval.sh rust-slugify     # one task
+#   scripts/eval.sh rust-slugify     # one task (or a comma-separated list)
+#
+# EVAL_MODELS="claude-opus-5-5 gpt-5 nvidia/nemotron-3-super-120b-a12b" runs
+# every task on each model (each needs its provider's key), and
+# EVAL_REPEATS=3 runs each pair three times. The summary compares models.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 cargo build --release -q
 bin=$root/target/release/rusty
 limit=${EVAL_TIMEOUT:-600}
-model=${RUSTY_MODEL:-nvidia/nemotron-3-super-120b-a12b}
+models=${EVAL_MODELS:-${RUSTY_MODEL:-nvidia/nemotron-3-super-120b-a12b}}
+repeats=${EVAL_REPEATS:-1}
 jobs_max=${EVAL_JOBS:-4}
 stamp=$(date +%Y%m%d-%H%M%S)
 logs=$root/target/evals/$stamp
@@ -56,7 +61,7 @@ run_multi() {
 }
 
 run_task() {
-  name=$1 dir=$2
+  name=$1 dir=$2 model=$3 rep=$4
   local work start code verdict
   work=$(mktemp -d) home=$(mktemp -d)
   cp -R "$dir/files/." "$work/" 2>/dev/null
@@ -73,46 +78,44 @@ run_task() {
   if [[ $code == 142 ]]; then verdict=timeout
   elif (cd "$work" && EVAL_DIR=$dir RUSTY_HOME=$home bash "$dir/check.sh" >"$home/check" 2>&1); then verdict=pass
   # The endpoint failing is an infrastructure error, not an agent failure.
-  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed" "$home/stdout" "$home/stderr"; then verdict=infra
+  elif grep -qE "giving up after|HTTP 5[0-9][0-9]|request failed|connection to the model closed|API error: .*(overloaded|api_error|rate_limit)|is served by .* is not set" "$home/stdout" "$home/stderr"; then verdict=infra
   fi
-  mkdir -p "$logs/$name" && cp "$home/stdout" "$home/stderr" "$home/check" "$logs/$name/" 2>/dev/null
-  python3 - "$name" "$model" "$verdict" "$secs" "$home" "$out" <<'PY'
-import json, sys
-name, model, verdict, secs, home, out = sys.argv[1:]
+  local where="$logs/${model//\//_}/$name.$rep"
+  mkdir -p "$where" && cp "$home/stdout" "$home/stderr" "$home/check" "$where/" 2>/dev/null
+  python3 - "$name" "$model" "$verdict" "$secs" "$home" "$out" "$rep" <<'PY'
+import json, re, sys
+name, model, verdict, secs, home, out, rep = sys.argv[1:]
 runs = [json.loads(l) for l in open(f"{home}/stderr") if l.startswith("{")]
 tot = {k: sum(r.get(k, 0) or 0 for r in runs) for k in ("requests", "prompt", "completion")}
 reason = open(f"{home}/check").read().strip().splitlines()[-1:] if verdict == "fail" else []
-row = {"task": name, "model": model, "verdict": verdict, "secs": int(secs), "sessions": len(runs), **tot, "reason": reason}
+if verdict == "infra":  # the endpoint's own words, so a run of these can be diagnosed from the jsonl
+    pat = re.compile(r"giving up after|HTTP [45][0-9][0-9]|request failed|connection to the model closed|API error|is not set")
+    hits = [l.strip() for f in ("stdout", "stderr") for l in open(f"{home}/{f}", errors="replace") if pat.search(l)]
+    reason = hits[-1:]
+row = {"task": name, "model": model, "rep": int(rep), "verdict": verdict, "secs": int(secs), "sessions": len(runs), **tot, "reason": reason}
 open(out, "a").write(json.dumps(row) + "\n")
 mark = {"pass": "✓", "fail": "✗", "timeout": "⧗", "infra": "⚠"}[verdict]
-print(f"{mark} {name:<18} {verdict:<8} {int(secs):>4}s  {len(runs)} session(s)  {(tot['prompt'] + tot['completion']) / 1000:>5.0f}k tok  {' '.join(reason)[:80]}")
+print(f"{mark} {name:<18} {model[-24:]:<24} {verdict:<8} {int(secs):>4}s  {len(runs)} session(s)  {(tot['prompt'] + tot['completion']) / 1000:>5.0f}k tok  {' '.join(reason)[:80]}")
 PY
   rm -rf "$work" "$home"
 }
 
-echo "model $model · timeout ${limit}s per session"
-for dir in evals/*/ evals/multi/*/; do
-  [[ -f $dir/prompt.txt || -f $dir/turns.txt ]] || continue
-  name=$(basename "$dir")
-  case "${1:-}" in
-    "") ;;
-    multi) [[ $dir == evals/multi/* ]] || continue ;;
-    *) [[ $name == "$1" ]] || continue ;;
-  esac
-  while (( $(jobs -rp | wc -l) >= jobs_max )); do sleep 1; done
-  run_task "$name" "$root/${dir%/}" &
+echo "models $models · ${repeats}x · timeout ${limit}s per session"
+for model in $models; do
+  for ((rep = 1; rep <= repeats; rep++)); do
+    for dir in evals/*/ evals/multi/*/; do
+      [[ -f $dir/prompt.txt || -f $dir/turns.txt ]] || continue
+      name=$(basename "$dir")
+      case "${1:-}" in
+        "") ;;
+        multi) [[ $dir == evals/multi/* ]] || continue ;;
+        *) [[ ",$1," == *",$name,"* ]] || continue ;;
+      esac
+      while (( $(jobs -rp | wc -l) >= jobs_max )); do sleep 1; done
+      run_task "$name" "$root/${dir%/}" "$model" "$rep" &
+    done
+  done
 done
 wait
 
-python3 - "$out" <<'PY'
-import json, sys
-rows = [json.loads(l) for l in open(sys.argv[1])]
-passed = sum(r["verdict"] == "pass" for r in rows)
-infra = sum(r["verdict"] == "infra" for r in rows)
-scored = len(rows) - infra
-tok = sum(r["prompt"] + r["completion"] for r in rows)
-note = f" · {infra} infrastructure errors (not scored; rerun them)" if infra else ""
-print(f"\n{passed}/{scored} passed{note} · {tok/1000:.0f}k tokens · {sum(r['secs'] for r in rows)}s agent time")
-print(f"logs: {sys.argv[1][:-6]}/")
-sys.exit(0 if passed == scored else 1)
-PY
+python3 scripts/eval_report.py "$out"
