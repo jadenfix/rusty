@@ -273,6 +273,20 @@ rusty also plugs into Harbor benchmarks with `--goal`, `--trajectory` and
 ## Inside
 
 ```
+  prompt · /goal · /loop
+            │
+  ┌─────────▼──────────── agent loop ───────────┐      ┌──────────────┐
+  │ mode     auto ▸ careful · standard · vibe   │ ◀──▶ │ model, SSE   │
+  │ context  budgets · elision · /compact       │      │ key rotation │
+  │ memory   BM25 recall                        │      └──────────────┘
+  └─────┬────────────────────────────────┬──────┘
+        ▼                                ▼
+  permissions ▸ infra ▸ tools        read-only workers
+  runs · asks   target   bash        subagent · swarm
+  · needs you   audit    files       careful checker
+```
+
+```
 src/
   main.rs         CLI, REPL, slash commands, settings
   agent.rs        the loop: model ⇄ tools, goal, loop, subagents and swarms, compaction
@@ -285,7 +299,9 @@ src/
   skills.rs       built-in and user skills
   tips.rs         token tips from real usage
   markdown.rs     terminal markdown
-  ui.rs           themes, banner, sky, spinner
+  ui.rs           themes, banner, mission line, spinner
+  execution.rs    careful, standard and vibe profiles, and auto's pick
+  infra.rs        live target, dry-run gate, snapshots, audit log, redaction
 ```
 
 Why it's built this way: [docs/DESIGN.md](docs/DESIGN.md) covers where coding
