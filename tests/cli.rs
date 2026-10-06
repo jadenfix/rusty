@@ -124,6 +124,31 @@ fn version_and_help() {
 }
 
 #[test]
+fn saved_memory_and_history_do_not_contain_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new("private-persistence");
+    s.repl(&["/remember DB_PASSWORD=cli-secret-canary-12345", "/agents off", "/allow read_file", "/exit"]);
+    fn inspect(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                inspect(&p);
+            } else {
+                let text = std::fs::read_to_string(&p).unwrap();
+                assert!(!text.contains("cli-secret-canary-12345"), "credential persisted in {}", p.display());
+                if p.file_name().unwrap() == "history"
+                    || p.file_name().unwrap() == "memory.jsonl"
+                    || p.extension().is_some_and(|s| s == "json")
+                {
+                    assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
+                }
+            }
+        }
+    }
+    inspect(&s.home);
+}
+
+#[test]
 fn missing_key_is_a_clear_error() {
     let s = Sandbox::new("nokey");
     let mut c = s.cmd();

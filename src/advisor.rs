@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -21,7 +22,6 @@ const FRAME: usize = 32_768;
 const TRANSFER: usize = 4 * 1024 * 1024;
 const LESSONS: usize = 512;
 const SESSIONS: usize = 32;
-const EVENTS: usize = 2048;
 const HOOK_MS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +307,10 @@ fn words(s: &str) -> HashSet<String> {
 fn features(query: &str, lesson: &Lesson) -> [f64; 4] {
     let q = words(query);
     let t = words(&lesson.text);
-    let overlap = q.intersection(&t).count() as f64 / q.len().min(t.len()).max(1) as f64;
+    features_terms(&q, lesson, &t)
+}
+fn features_terms(q: &HashSet<String>, lesson: &Lesson, t: &HashSet<String>) -> [f64; 4] {
+    let overlap = q.intersection(t).count() as f64 / q.len().min(t.len()).max(1) as f64;
     [
         1.0,
         overlap,
@@ -316,14 +319,46 @@ fn features(query: &str, lesson: &Lesson) -> [f64; 4] {
     ]
 }
 fn pack(s: &str) -> Result<Vec<u8>> {
+    // Tiny notes would grow under gzip. A zero tag denotes bounded raw UTF-8;
+    // existing gzip blobs keep their original header and remain readable.
+    let raw = || {
+        let mut b = Vec::with_capacity(s.len() + 1);
+        b.push(0);
+        b.extend_from_slice(s.as_bytes());
+        b
+    };
+    if s.len() < 32 {
+        return Ok(raw());
+    }
     let mut w = GzEncoder::new(Vec::new(), Compression::fast());
     w.write_all(s.as_bytes())?;
-    Ok(w.finish()?)
+    let packed = w.finish()?;
+    Ok(if packed.len() < s.len() + 1 { packed } else { raw() })
 }
 fn unpack(b: &[u8]) -> Result<String> {
+    if b.first() == Some(&0) {
+        if b.len() > FRAME + 1 {
+            bail!("raw memory exceeds limit");
+        }
+        return Ok(std::str::from_utf8(&b[1..])?.to_owned());
+    }
     let mut s = String::new();
-    GzDecoder::new(b).take(FRAME as u64).read_to_string(&mut s)?;
+    GzDecoder::new(b).take(FRAME as u64 + 1).read_to_string(&mut s)?;
+    if s.len() > FRAME {
+        bail!("decompressed memory exceeds limit");
+    }
     Ok(s)
+}
+
+// SQLite's dynamic type permits a backwards-compatible upgrade from plain
+// TEXT to gzip BLOBs without a second table or an in-memory storage engine.
+fn stored_text(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<String> {
+    match row.get::<_, rusqlite::types::Value>(column)? {
+        rusqlite::types::Value::Text(s) => Ok(s),
+        rusqlite::types::Value::Blob(b) => unpack(&b)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Blob, e.into())),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 struct Store {
@@ -332,16 +367,88 @@ struct Store {
 impl Store {
     fn open(home: &Path) -> Result<Self> {
         let dir = home.join("memory");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::privacy::private_dir(&dir)?;
+        for name in ["memory.sqlite", "memory.sqlite-wal", "memory.sqlite-shm"] {
+            let path = dir.join(name);
+            if path.exists() || path.is_symlink() {
+                let f = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        drop(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(dir.join("memory.sqlite"))?,
+        );
         let db = Connection::open(dir.join("memory.sqlite"))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA journal_size_limit=1048576; PRAGMA wal_autocheckpoint=128; PRAGMA max_page_count=4096;
+        db.execute_batch("PRAGMA secure_delete=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-512; PRAGMA mmap_size=0;
+          PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA journal_size_limit=65536; PRAGMA wal_autocheckpoint=16; PRAGMA max_page_count=4096;
           CREATE TABLE IF NOT EXISTS lessons(id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL,evidence BLOB NOT NULL,helpful INTEGER DEFAULT 0,harmful INTEGER DEFAULT 0);
-          CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,scope TEXT,session TEXT,payload BLOB);
-          CREATE TABLE IF NOT EXISTS boards(scope TEXT,session TEXT,payload BLOB,PRIMARY KEY(scope,session));
           CREATE TABLE IF NOT EXISTS policies(scope TEXT PRIMARY KEY,payload TEXT);
           CREATE TABLE IF NOT EXISTS deleted(id TEXT PRIMARY KEY,scope TEXT NOT NULL);")?;
-        Ok(Self { db })
+        // Migrate the first version's duplicated L1 journals. L1 now stays in
+        // RAM, so tool arguments/output never enter the advisor database.
+        let old: bool =
+            db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('events','boards'))", [], |r| {
+                r.get(0)
+            })?;
+        if old {
+            db.execute_batch(
+                "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS boards; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+        }
+        let mut store = Self { db };
+        // Upgrade lessons saved through older direct CLI paths, tombstoning
+        // unsafe old identities when redaction changes canonical text.
+        let rows = {
+            let mut q =
+                store.db.prepare("SELECT id,scope,kind,text,evidence,helpful,harmful FROM lessons LIMIT 513")?;
+            let rows = q.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    stored_text(r, 3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                    r.get::<_, u64>(5)?,
+                    r.get::<_, u64>(6)?,
+                    r.get_ref(3)?.data_type() == rusqlite::types::Type::Text,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.len() > LESSONS {
+            bail!("existing store exceeds lesson limit");
+        }
+        let mut changed = false;
+        for (id, scope, kind, text, evidence, helpful, harmful, plain) in rows {
+            let evidence = unpack(&evidence)?;
+            let clean_text = crate::privacy::redact(&text).0;
+            let clean_evidence = crate::privacy::redact(&evidence).0;
+            if !plain && text == clean_text && evidence == clean_evidence {
+                continue;
+            }
+            let new_id = format!("{:016x}", hash(&format!("{scope}:{kind}:{clean_text}")));
+            let tx = store.db.transaction()?;
+            tx.execute("DELETE FROM lessons WHERE id=?1", [&id])?;
+            if new_id != id {
+                tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, scope])?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO lessons VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![new_id, scope, kind, pack(&clean_text)?, pack(&clean_evidence)?, helpful, harmful],
+            )?;
+            tx.commit()?;
+            changed = true;
+        }
+        if changed {
+            store.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok(store)
     }
     fn lessons(&self, scope: &str) -> Result<Vec<Lesson>> {
         let mut q =
@@ -351,7 +458,7 @@ impl Store {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
+                stored_text(r, 3)?,
                 r.get::<_, Vec<u8>>(4)?,
                 r.get::<_, u64>(5)?,
                 r.get::<_, u64>(6)?,
@@ -374,27 +481,8 @@ impl Store {
         {
             bail!("memory capacity reached; forget unused lessons first");
         }
-        tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,l.text,pack(&l.evidence)?,l.helpful,l.harmful])?;
+        tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,pack(&l.text)?,pack(&l.evidence)?,l.helpful,l.harmful])?;
         tx.commit()?;
-        Ok(())
-    }
-    fn event(&self, r: &Request, b: &Board) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO events(scope,session,payload) VALUES(?1,?2,?3)",
-            params![r.scope, r.session, pack(&serde_json::to_string(r)?)?],
-        )?;
-        self.db.execute(
-            "DELETE FROM events WHERE id NOT IN(SELECT id FROM events ORDER BY id DESC LIMIT ?1)",
-            [EVENTS as i64],
-        )?;
-        self.db.execute(
-            "INSERT INTO boards VALUES(?1,?2,?3) ON CONFLICT(scope,session) DO UPDATE SET payload=excluded.payload",
-            params![r.scope, r.session, pack(&serde_json::to_string(b)?)?],
-        )?;
-        self.db.execute(
-            "DELETE FROM boards WHERE rowid NOT IN(SELECT rowid FROM boards ORDER BY rowid DESC LIMIT ?1)",
-            [SESSIONS as i64],
-        )?;
         Ok(())
     }
     fn policy(&self, scope: &str) -> Policy {
@@ -424,13 +512,12 @@ struct TeacherMetrics {
     hints: u64,
 }
 
-fn teacher(board: &Board, metrics: &Arc<Mutex<TeacherMetrics>>) -> Option<String> {
+fn teacher(board: &Board, metrics: &Arc<Mutex<TeacherMetrics>>, client: &reqwest::blocking::Client) -> Option<String> {
     let key = std::env::var("RUSTY_API_KEY").or_else(|_| std::env::var("NVIDIA_API_KEY")).ok()?;
     let base = std::env::var("RUSTY_BASE_URL").unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".into());
     let model = std::env::var("RUSTY_MEMORY_MODEL")
         .or_else(|_| std::env::var("RUSTY_MODEL"))
         .unwrap_or_else(|_| "nvidia/nemotron-3-super-120b-a12b".into());
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20)).build().ok()?;
     let prompt="You advise a coding agent using only the supplied request and observed evidence. Choose one specific useful NEXT step or remain silent. Do not invent preferences, repositories, credentials or permissions. Return JSON only: {\"next_step\":\"...\",\"evidence_ids\":[1]}. Each ID must reference an observation that supports the step. If no grounded intervention is needed return {\"next_step\":\"\",\"evidence_ids\":[]}. Do not repeat a successful action or prescribe external mutations.";
     let mut body = json!({"model":model,"stream":false,"temperature":0.0,"max_tokens":2048,"messages":[{"role":"system","content":prompt},{"role":"user","content":serde_json::to_string(board).ok()?}]});
     if base.trim_end_matches('/') == "https://integrate.api.nvidia.com/v1"
@@ -440,16 +527,20 @@ fn teacher(board: &Board, metrics: &Arc<Mutex<TeacherMetrics>>) -> Option<String
         body["reasoning_budget"] = json!(512);
     }
     metrics.lock().unwrap().requests += 1;
-    let v: Value = client
+    let response = client
         .post(format!("{}/chat/completions", base.trim_end_matches('/')))
         .bearer_auth(key)
         .json(&body)
         .send()
         .ok()?
         .error_for_status()
-        .ok()?
-        .json()
         .ok()?;
+    let mut text = String::new();
+    response.take(65_537).read_to_string(&mut text).ok()?;
+    if text.len() > 65_536 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&text).ok()?;
     {
         let mut m = metrics.lock().unwrap();
         m.prompt_tokens += v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
@@ -470,7 +561,7 @@ fn teacher(board: &Board, metrics: &Arc<Mutex<TeacherMetrics>>) -> Option<String
     }
     Some(format!(
         "Suggested next step (background analysis; verify applicability): {} [events: {}]",
-        clip(text, 1200),
+        clip(&crate::privacy::redact(text).0, 1200),
         ids.iter().filter_map(Value::as_u64).map(|n| n.to_string()).collect::<Vec<_>>().join(",")
     ))
 }
@@ -480,7 +571,7 @@ struct Engine {
     boards: HashMap<String, Board>,
     used: HashMap<String, (String, [f64; 4])>,
     delivered: HashMap<String, HashSet<String>>,
-    cache: HashMap<String, Vec<Lesson>>,
+    cache: HashMap<String, Vec<(Lesson, HashSet<String>)>>,
     prepared: Arc<Mutex<HashMap<String, Prepared>>>,
     jobs: mpsc::SyncSender<Job>,
     teacher_metrics: Arc<Mutex<TeacherMetrics>>,
@@ -496,12 +587,21 @@ impl Engine {
         let measurements = teacher_metrics.clone();
         let (tx, rx) = mpsc::sync_channel::<Job>(4);
         std::thread::spawn(move || {
+            let mut client = None;
             for j in rx {
                 if current.lock().unwrap().get(&j.key) != Some(&j.board.seq) {
                     continue;
                 }
+                // The on/off paths never initialize TLS or a provider client.
+                if client.is_none() {
+                    client = reqwest::blocking::Client::builder()
+                        .connect_timeout(Duration::from_secs(5))
+                        .timeout(Duration::from_secs(20))
+                        .build()
+                        .ok();
+                }
                 let start = Instant::now();
-                let answer = teacher(&j.board, &measurements);
+                let answer = client.as_ref().and_then(|client| teacher(&j.board, &measurements, client));
                 {
                     let mut m = measurements.lock().unwrap();
                     m.call_us += start.elapsed().as_micros() as u64;
@@ -520,22 +620,9 @@ impl Engine {
             }
         });
         let store = Store::open(home)?;
-        let boards = {
-            let mut q = store.db.prepare("SELECT scope,session,payload FROM boards")?;
-            let rows =
-                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
-            let mut boards = HashMap::new();
-            for row in rows {
-                let (scope, session, b) = row?;
-                if let Ok(b) = serde_json::from_str::<Board>(&unpack(&b)?) {
-                    boards.insert(format!("{scope}:{session}"), b);
-                }
-            }
-            boards
-        };
         Ok(Self {
             store,
-            boards,
+            boards: HashMap::new(),
             used: HashMap::new(),
             delivered: HashMap::new(),
             cache: HashMap::new(),
@@ -545,7 +632,7 @@ impl Engine {
             versions,
         })
     }
-    fn handle(&mut self, r: Request) -> Result<Response> {
+    fn handle(&mut self, mut r: Request) -> Result<Response> {
         if r.op != "import" && serde_json::to_vec(&r)?.len() > FRAME {
             bail!("memory frame too large");
         }
@@ -558,6 +645,11 @@ impl Engine {
             reply.text = "memory is off".into();
             return Ok(reply);
         }
+        // Every ingress path uses the same filter, including direct CLI/RPC
+        // callers. Imported canonical IDs must not be silently rewritten.
+        if r.op != "import" {
+            crate::privacy::scrub(&mut r.data);
+        }
         match r.op.as_str() {
             "begin" | "event" | "finish" => {
                 if self.boards.len() >= SESSIONS && !self.boards.contains_key(&key) {
@@ -566,6 +658,7 @@ impl Engine {
                         self.used.remove(&k);
                         self.delivered.remove(&k);
                         self.versions.lock().unwrap().remove(&k);
+                        self.prepared.lock().unwrap().remove(&k);
                     }
                 }
                 let board = self.boards.entry(key.clone()).or_default();
@@ -596,9 +689,12 @@ impl Engine {
                 if r.op == "finish" {
                     board.complete = r.data["complete"].as_bool().unwrap_or(false);
                 }
-                self.store.event(&r, board)?;
                 if r.op == "finish" {
                     self.versions.lock().unwrap().remove(&key);
+                    self.prepared.lock().unwrap().remove(&key);
+                    // Keep only sequence/completion so stale calls still fail.
+                    board.request.clear();
+                    board.observations.clear();
                 } else {
                     self.versions.lock().unwrap().insert(key.clone(), r.seq);
                 }
@@ -637,18 +733,29 @@ impl Engine {
                     b.observations.last().map(|o| format!("{} {} {}", o.tool, o.args, o.output)).unwrap_or_default()
                 );
                 let policy = self.store.policy(&r.scope);
+                let query_terms = words(&query);
                 let mut best: Option<(f64, Lesson, [f64; 4])> = None;
                 if !self.cache.contains_key(&r.scope) {
                     if self.cache.len() >= SESSIONS {
                         self.cache.clear();
                     }
-                    self.cache.insert(r.scope.clone(), self.store.lessons(&r.scope)?);
+                    let lessons = self
+                        .store
+                        .lessons(&r.scope)?
+                        .into_iter()
+                        .map(|mut l| {
+                            let terms = words(&l.text);
+                            l.evidence = clip(&l.evidence, 160);
+                            (l, terms)
+                        })
+                        .collect();
+                    self.cache.insert(r.scope.clone(), lessons);
                 }
-                for l in &self.cache[&r.scope] {
+                for (l, terms) in &self.cache[&r.scope] {
                     if self.delivered.get(&key).is_some_and(|d| d.contains(&l.id)) {
                         continue;
                     }
-                    let f = features(&query, l);
+                    let f = features_terms(&query_terms, l, terms);
                     if f[1] < 0.25 && l.kind != "preference" {
                         continue;
                     }
@@ -724,6 +831,7 @@ impl Engine {
                     reply.text = "no memory in this scope".into();
                 }
                 tx.commit()?;
+                self.store.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 self.prepared.lock().unwrap().clear();
                 self.used.retain(|_, (last, _)| last != id);
                 self.cache.remove(&r.scope);
@@ -773,6 +881,8 @@ impl Engine {
                         || l.text.is_empty()
                         || l.text.len() > 2048
                         || l.evidence.len() > 2048
+                        || crate::privacy::redact(&l.text).0 != l.text
+                        || crate::privacy::redact(&l.evidence).0 != l.evidence
                         || !["preference", "fact", "decision", "gotcha", "todo"].contains(&l.kind.as_str())
                         || l.id != format!("{:016x}", hash(&format!("{}:{}:{}", l.scope, l.kind, l.text)))
                     {
@@ -790,7 +900,7 @@ impl Engine {
                     tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, r.scope])?;
                 }
                 for l in lessons {
-                    tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,0,0 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,l.text,pack(&l.evidence)?])?;
+                    tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,0,0 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,pack(&l.text)?,pack(&l.evidence)?])?;
                 }
                 let n: i64 = tx.query_row("SELECT count(*) FROM lessons", [], |r| r.get(0))?;
                 if n > LESSONS as i64 {
@@ -805,10 +915,9 @@ impl Engine {
                 reply.text = "memory daemon stopped".into();
             }
             "status" => {
-                let lessons = self.store.lessons(&r.scope)?.len();
-                let bytes: i64 =
-                    self.store.db.query_row("SELECT COALESCE(sum(length(payload)),0) FROM events", [], |r| r.get(0))?;
-                reply.data = json!({"lessons":lessons,"sessions":self.boards.len(),"compressed_event_bytes":bytes,"policy_updates":self.store.policy(&r.scope).updates,"background":*self.teacher_metrics.lock().unwrap(),"l1":self.boards.get(&key).map(|b| json!({"seq":b.seq,"observations":b.observations.len(),"complete":b.complete}))});
+                let lessons: i64 =
+                    self.store.db.query_row("SELECT count(*) FROM lessons WHERE scope=?1", [&r.scope], |r| r.get(0))?;
+                reply.data = json!({"lessons":lessons,"sessions":self.boards.len(),"compressed_event_bytes":0,"l1_persistence":"ram-only","policy_updates":self.store.policy(&r.scope).updates,"background":*self.teacher_metrics.lock().unwrap(),"l1":self.boards.get(&key).map(|b| json!({"seq":b.seq,"observations":b.observations.len(),"complete":b.complete}))});
                 reply.text = reply.data.to_string();
             }
             _ => bail!("unknown memory operation"),
@@ -819,11 +928,16 @@ impl Engine {
 
 pub fn serve(home: &Path) -> Result<()> {
     let dir = home.join("memory");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    crate::privacy::private_dir(&dir)?;
     // A lock prevents a second daemon from unlinking an active socket.
     use std::os::fd::AsRawFd;
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("daemon.lock"))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("daemon.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("memory daemon already running");
     }
@@ -916,6 +1030,8 @@ mod tests {
         let b = pack(&text).unwrap();
         assert!(b.len() < text.len() / 5);
         assert_eq!(unpack(&b).unwrap(), text);
+        assert_eq!(pack("small").unwrap().len(), 6);
+        assert_eq!(unpack(&pack("small").unwrap()).unwrap(), "small");
         let (mut e, p) = engine();
         e.handle(req("begin", "a", 1, json!({"text":"work"}))).unwrap();
         for n in 2..30 {
@@ -959,5 +1075,74 @@ mod tests {
         assert!(p.score(x) > before);
         p.update(x, false);
         assert!(p.score(x) < before + 0.02);
+    }
+
+    #[test]
+    fn upgrade_removes_legacy_traces_and_sanitizes_saved_lessons() {
+        let (e, p) = engine();
+        let text = "DB_PASSWORD=legacy-secret-canary-12345";
+        let id = format!("{:016x}", hash(&format!("a:fact:{text}")));
+        e.store
+            .db
+            .execute(
+                "INSERT INTO lessons VALUES(?1,'a','fact',?2,?3,0,0)",
+                params![id, text, pack("Bearer legacy-evidence-canary-12345").unwrap()],
+            )
+            .unwrap();
+        e.store.db.execute_batch("CREATE TABLE events(payload BLOB); CREATE TABLE boards(payload BLOB); INSERT INTO events VALUES('legacy-tool-output-canary');").unwrap();
+        drop(e);
+        let store = Store::open(&p).unwrap();
+        let lessons = store.lessons("a").unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_ne!(lessons[0].id, id);
+        assert!(!lessons[0].text.contains("legacy-secret"));
+        assert!(!lessons[0].evidence.contains("legacy-evidence"));
+        assert!(store
+            .db
+            .query_row("SELECT EXISTS(SELECT 1 FROM deleted WHERE id=?1)", [&id], |r| r.get::<_, bool>(0))
+            .unwrap());
+        let old: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('events','boards')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old, 0);
+        drop(store);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn compressed_input_cannot_expand_past_the_bound() {
+        let bomb = pack(&"x".repeat(FRAME + 1)).unwrap();
+        assert!(unpack(&bomb).is_err());
+    }
+
+    #[test]
+    fn sustained_hooks_bound_ram_state_without_growing_disk() {
+        let (mut e, p) = engine();
+        e.handle(req("remember", "a", 0, json!({"kind":"preference","text":"Inspect the workspace manifest"})))
+            .unwrap();
+        let bytes =
+            || std::fs::read_dir(p.join("memory")).unwrap().map(|f| f.unwrap().metadata().unwrap().len()).sum::<u64>();
+        let before = bytes();
+        for n in 0..120 {
+            let mut r = req("begin", "a", 1, json!({"text":"workspace manifest"}));
+            r.session = format!("session-{n}");
+            e.handle(r.clone()).unwrap();
+            r.op = "advice".into();
+            e.handle(r.clone()).unwrap();
+            r.op = "event".into();
+            r.data = json!({"tool":"bash","args":"a".repeat(4000),"output":"b".repeat(4000)});
+            for seq in 2..12 {
+                r.seq = seq;
+                e.handle(r.clone()).unwrap();
+            }
+        }
+        assert_eq!(e.boards.len(), SESSIONS);
+        assert!(e.used.len() <= SESSIONS && e.delivered.len() <= SESSIONS);
+        assert!(e.versions.lock().unwrap().len() <= SESSIONS);
+        assert!(e.boards.values().all(|b| b.observations.len() <= 8));
+        assert_eq!(bytes(), before, "coding hooks wrote persistent data");
+        drop(e);
+        std::fs::remove_dir_all(p).unwrap();
     }
 }

@@ -118,8 +118,8 @@ impl Policy {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(path, s);
+            if let Ok(value) = serde_json::to_value(self) {
+                let _ = rusty::privacy::write_json(path, value);
             }
         }
     }

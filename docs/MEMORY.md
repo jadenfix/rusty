@@ -16,7 +16,7 @@ rusty --memory off "fix this small bug"
 | `legacy` (default) | Existing JSONL/BM25 memory; compatibility with current users. |
 | `off` | No advisor hooks, recall or writes from this agent. |
 | `on` | Local L1/L2 advisor with an online intervention selector; no advisor model calls. |
-| `deep` | Same fast path plus bounded background model analysis after failures or every third observed tool action. |
+| `deep` | Same fast path plus bounded background model analysis after failures or periodic tool observations. |
 
 These are independent of `careful`, `standard`, `vibe`, delegation and tool
 permissions. Careful still uses the existing single read-only checker. Deep
@@ -29,7 +29,7 @@ flowchart LR
   Agent -->|"begin / tool result / finish"| Service["rusty-memoryd: local Unix socket"]
   Service -->|"0 or 1 bounded next-step hint"| Agent
   Service --> L1["L1: versioned request + last 8 observations"]
-  Service <--> L2["L2: SQLite lessons, gzip evidence, feedback policy"]
+  Service <--> L2["L2: SQLite packed lessons/evidence + feedback policy"]
   L1 -->|"deep mode, bounded queue"| Teacher["background model: proposed next step + evidence IDs"]
   Teacher -->|"only matching state version"| Service
 ```
@@ -68,32 +68,50 @@ success labels without controlling for task difficulty and credit attribution.
 
 ## Bounded hot path and disk
 
-- L1: at most 32 sessions, each with a 4 KiB request and eight observations;
-  each observation has at most 1 KiB arguments and 2 KiB output.
+- L1: RAM only, at most 32 sessions, each with a 4 KiB request and eight
+  observations of at most 1 KiB arguments and 2 KiB output. Coding hooks do not
+  write a database journal or checkpoint. Finish clears request/observations;
+  a daemon restart loses L1 but preserves L2.
 - Hooks: bounded queue of eight; caller waits at most 50 ms. The transport has a
   200 ms timeout so abandoned work also drains. Startup can take up to two
   seconds; explicit memory management has a separate one-second deadline.
 - Advice: at most 800 bytes (`on`) or 1600 (`deep`), at most two/four
   interventions per turn, respectively. Repeated lessons are suppressed.
-- L2: at most 512 active lessons across the local store, 2048 recent compressed
-  events, 32 compressed L1 checkpoints. Evidence/checkpoints use gzip; the
-  SQLite database has a 16 MiB page quota with regular WAL checkpointing. The
-  WAL can temporarily add disk usage; the database quota is not a whole-folder
-  quota. No automatic vacuum runs on the coding path.
+- L2: at most 512 active lessons across the local store. Text and evidence
+  use gzip when smaller, otherwise bounded raw UTF-8. Existing plain-text
+  lesson columns are migrated to packed blobs at service startup. The SQLite
+  database has a 16 MiB page quota, a 512 KiB page-cache target, in-memory
+  temporary tables and frequent WAL checkpoints with a 64 KiB retained-journal
+  target. These targets are not a hard whole-process or whole-folder quota.
+  Old duplicated event/checkpoint tables are removed and vacuumed once at
+  upgrade; no vacuum runs on the coding path.
 - Deep: one background worker, queue of four, at most four jobs per turn,
   20-second request timeout.
   The NVIDIA default model gets low reasoning effort and a 512-token reasoning
   budget within a 2048-token output cap. Other providers get a generic request.
 
-Socket/directory permissions are 0600/0700. Agent hooks apply the existing
-secret redactor before persistence and model analysis; arbitrary private source
-context can still be stored. Memory is project scoped, including preferences.
-The sidecar does not import legacy/global memory automatically. `forget` removes
-a durable lesson and adds a tombstone so old snapshot imports cannot resurrect
-it; retained recent traces are a separate bounded history, not secure erasure.
-Imports preserve the local feedback policy and reset imported lesson utility.
+Socket/files/directories use 0600/0600/0700. Persistence refuses symlinked
+memory directories and files. A shared redactor covers Rusty hooks, direct
+service saves, imports, session/trajectory JSON, history and audit metadata.
+Imports containing recognizable credentials are rejected instead of silently
+changing canonical lesson IDs. Startup sanitizes older saved lessons; unsafe
+old IDs become tombstones. L1/tool observations are never written by the advisor.
+The CLI's sessions/history and explicitly saved L2 lessons remain intentional
+persistence; `--memory off` disables memory, not these separate session files.
+Infrastructure snapshots containing recognizable secrets are refused rather
+than persisting secrets or creating a redacted, invalid rollback artifact.
 
-`/memory status` shows L1 counts, compressed evidence bytes, learning updates,
+The redactor covers known token shapes, credential fields and configured secret
+values. It is not an exhaustive detector of arbitrary or encoded secrets. These
+files are access-controlled, not encrypted. SQLite secure deletion and WAL
+truncation reduce retained deleted bytes, but do not erase OS swap, filesystem
+snapshots, backups or already exported files. A forgotten lesson's tombstone
+prevents old imports from resurrecting it. Imports preserve the local feedback
+policy and reset imported lesson utility. The sidecar does not import legacy or
+global memory automatically; all companion lessons, including preferences, are
+project scoped.
+
+`/memory status` shows L1 counts, RAM-only persistence, learning updates,
 and background model requests/tokens/time. `--stats` and `--trajectory` include
 hook counts, deadlines missed, injections, total hook time and maximum hook time.
 The background-model totals are separate from the coding-model totals.

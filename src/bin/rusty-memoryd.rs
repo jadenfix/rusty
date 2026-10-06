@@ -69,7 +69,10 @@ fn main() -> Result<()> {
         Control::Export { .. } => ("export", json!(null)),
         Control::Import { file } => {
             let mut text = String::new();
-            GzDecoder::new(std::fs::File::open(file)?).take(4 * 1024 * 1024).read_to_string(&mut text)?;
+            GzDecoder::new(std::fs::File::open(file)?).take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 4 * 1024 * 1024 {
+                bail!("decompressed import exceeds limit");
+            }
             ("import", serde_json::from_str(&text)?)
         }
     };

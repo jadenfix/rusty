@@ -29,7 +29,7 @@ def main():
                 r=rpc(home,'remember',dict(kind='fact',text=f'Workspace package {i} requires inspect manifest then run Python checks.',evidence='observed result '*100))
                 assert not r['error'],r['text']
             assert rpc(home,'status')['data']['lessons']==512
-            # Cold load then 100 fresh decisions. begin writes real checkpoints;
+            # Cold load then 100 fresh decisions. begin updates the bounded RAM notepad;
             # advice times include the socket, selection, JSON and response.
             times=[];seq=0
             for _ in range(101):

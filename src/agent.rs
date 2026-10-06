@@ -1301,10 +1301,13 @@ impl Agent {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal});
-        let _ = std::fs::write(path, body.to_string());
+        let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {
-            let _ = std::fs::write(path.with_extension("changes.txt"), changes);
+            use std::io::Write;
+            if let Ok(mut f) = rusty::privacy::private_file(&path.with_extension("changes.txt"), false) {
+                let _ = f.write_all(infra::redact(&changes).0.as_bytes());
+            }
         }
     }
 
@@ -1335,9 +1338,7 @@ impl Agent {
             "finish": reply.finish_reason,
         });
         use std::io::Write;
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(path.with_extension("trace.jsonl"))
-        {
+        if let Ok(mut f) = rusty::privacy::private_file(&path.with_extension("trace.jsonl"), true) {
             let _ = writeln!(f, "{line}");
         }
     }

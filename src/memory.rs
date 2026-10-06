@@ -100,10 +100,17 @@ impl Memory {
                 .entries
                 .iter()
                 .filter(|e| e.global == global)
-                .filter_map(|e| serde_json::to_string(e).ok())
+                .filter_map(|e| {
+                    let mut value = serde_json::to_value(e).ok()?;
+                    rusty::privacy::scrub(&mut value);
+                    serde_json::to_string(&value).ok()
+                })
                 .map(|l| l + "\n")
                 .collect();
-            let _ = std::fs::write(path, body);
+            use std::io::Write;
+            if let Ok(mut f) = rusty::privacy::private_file(path, false) {
+                let _ = f.write_all(body.as_bytes());
+            }
         }
         self.dirty = false;
     }
@@ -111,7 +118,8 @@ impl Memory {
     /// Saves a memory. Near-duplicates update the existing entry instead.
     pub fn add(&mut self, kind: &str, text: &str, global: bool) -> String {
         let kind = if KINDS.contains(&kind) { kind } else { "fact" };
-        let text = text.trim();
+        let cleaned = rusty::privacy::redact(text);
+        let text = cleaned.0.trim();
         let new_terms: HashSet<String> = terms(text).into_iter().collect();
         for e in &mut self.entries {
             let old: HashSet<String> = terms(&e.text).into_iter().collect();

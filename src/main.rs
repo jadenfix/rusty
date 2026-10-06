@@ -250,7 +250,7 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(&body)?)?;
+    rusty::privacy::write_json(path, body)?;
     Ok(())
 }
 
@@ -308,7 +308,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             println!("{}", ui::dim("  (typed while rusty was working)"));
             signal::restore_terminal();
             signal::reset();
-            let _ = rl.add_history_entry(&queued);
+            let _ = rl.add_history_entry(rusty::privacy::redact(&queued).0);
             if let Err(e) = agent.run_turn(&queued) {
                 println!("{} {e:#}\n", ui::err("error:"));
             }
@@ -344,7 +344,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if input.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(&input);
+        let _ = rl.add_history_entry(rusty::privacy::redact(&input).0);
         signal::restore_terminal();
         signal::reset();
 
@@ -366,7 +366,9 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if let Some(dir) = h.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = rl.save_history(h);
+        if rusty::privacy::private_file(h, true).is_ok() {
+            let _ = rl.save_history(h);
+        }
     }
     agent.save_session();
     print_changes(agent);

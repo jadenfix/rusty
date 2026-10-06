@@ -35,7 +35,19 @@ impl Service {
     }
     fn ready(&self) {
         let start = Instant::now();
-        while !self.root.join("memory/advisor.sock").exists() {
+        while rpc(
+            &self.root.join("memory/advisor.sock"),
+            &Request {
+                op: "status".into(),
+                scope: "ready".into(),
+                session: "ready".into(),
+                seq: 0,
+                mode: Mode::On,
+                data: Value::Null,
+            },
+        )
+        .is_err()
+        {
             assert!(start.elapsed() < Duration::from_secs(3));
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -57,10 +69,11 @@ impl Drop for Service {
 }
 
 #[test]
-fn daemon_restarts_preserves_scoped_board_feedback_and_deletions() {
+fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
     let mut s = Service::new();
     for _ in 0..30 {
         drop(std::os::unix::net::UnixStream::connect(s.root.join("memory/advisor.sock")).unwrap());
+        assert!(!s.call("status", "ready", 0, Value::Null).error);
     }
     let id = s
         .call("remember", "repo-a", 0, json!({"kind":"preference","text":"Always inspect workspace packages manifest"}))
@@ -102,7 +115,7 @@ fn daemon_restarts_preserves_scoped_board_feedback_and_deletions() {
     }
     let status = s.call("status", "repo-a", 1, Value::Null).data;
     assert_eq!(status["policy_updates"], 1);
-    assert_eq!(status["l1"]["seq"], 1);
+    assert!(status["l1"].is_null(), "short-term observations survived restart");
     s.call("forget", "repo-a", 1, json!({"id":id}));
     assert!(!s.call("import", "repo-a", 1, snapshot).error);
     assert!(s.call("list", "repo-a", 1, Value::Null).text.is_empty(), "deleted lesson resurrected");
@@ -135,6 +148,58 @@ fn export_larger_than_hook_frame_roundtrips_and_invalid_import_rolls_back() {
     snapshot["lessons"][0]["id"] = json!("0000000000000000");
     assert!(s.call("import", "a", 0, snapshot).error);
     assert_eq!(s.call("status", "a", 0, Value::Null).data["lessons"], 40);
+}
+
+#[test]
+fn direct_ingress_redacts_secrets_and_l1_never_reaches_disk() {
+    let s = Service::new();
+    let saved = s.call(
+        "remember",
+        "privacy",
+        0,
+        json!({"text":"DB_PASSWORD=secret-canary-12345","evidence":"Authorization: Bearer evidence-canary-12345"}),
+    );
+    assert!(!saved.error);
+    let exported = s.call("export", "privacy", 0, Value::Null).data.to_string();
+    assert!(exported.contains("[redacted]"));
+    assert!(!exported.contains("secret-canary") && !exported.contains("evidence-canary"));
+    s.call("begin", "privacy", 1, json!({"text":"temporary-request-canary"}));
+    s.call(
+        "event",
+        "privacy",
+        2,
+        json!({"tool":"bash","args":"temporary-args-canary","output":"temporary-output-canary"}),
+    );
+    let db = rusqlite::Connection::open(s.root.join("memory/memory.sqlite")).unwrap();
+    let traces: i64 =
+        db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('boards','events')", [], |r| r.get(0)).unwrap();
+    assert_eq!(traces, 0);
+    drop(db);
+    for entry in std::fs::read_dir(s.root.join("memory")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            let bytes = std::fs::read(path).unwrap();
+            for canary in
+                ["secret-canary-12345", "temporary-request-canary", "temporary-args-canary", "temporary-output-canary"]
+            {
+                assert!(!bytes.windows(canary.len()).any(|w| w == canary.as_bytes()));
+            }
+        }
+    }
+    assert!(!s.call("finish", "privacy", 3, json!({"complete":true})).error);
+    assert_eq!(s.call("status", "privacy", 3, Value::Null).data["l1"]["observations"], 0);
+}
+
+#[test]
+fn daemon_refuses_symlinked_persistence() {
+    use std::os::unix::fs::symlink;
+    let s = Service::new();
+    let root = s.root.join("symlink-test");
+    std::fs::create_dir(&root).unwrap();
+    symlink(s.root.join("memory"), root.join("memory")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(root).output().unwrap();
+    assert!(!out.status.success());
 }
 
 #[test]

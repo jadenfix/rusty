@@ -149,8 +149,8 @@ impl Settings {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, s);
+            if let Ok(value) = serde_json::to_value(self) {
+                let _ = rusty::privacy::write_json(&p, value);
             }
         }
     }
