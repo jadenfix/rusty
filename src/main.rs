@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, env = "RUSTY_TOOLS")]
     tools: Option<String>,
 
-    /// Private endpoint for the Daytona SDK bridge; no model or memory required
+    /// Private endpoint for the Daytona tool bridge; no model or memory required
     #[arg(long, hide = true)]
     tool_rpc: bool,
     /// Run this prompt once and exit. Omit for interactive mode.
