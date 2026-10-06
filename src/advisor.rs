@@ -941,11 +941,13 @@ pub fn serve(home: &Path) -> Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("memory daemon already running");
     }
+    // A connectable socket must mean initialization is complete. Cold overlay
+    // filesystems can take longer than the hook deadline to initialize SQLite.
+    let mut engine = Engine::new(home)?;
     let path = dir.join("advisor.sock");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let mut engine = Engine::new(home)?;
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
             continue;
