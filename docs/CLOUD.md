@@ -113,6 +113,9 @@ claim. The sandbox can continue consuming compute credits after the CLI exits.
 scripts/qa.sh
 # Or only the hybrid journey after building both binaries:
 python3 -m unittest cloud/test_hybrid.py
+# Optional: repeat the same journeys through the real pinned SDK's HTTP
+# serialization/transport against a localhost Toolbox API. No account needed.
+uv run cloud/sdk_smoke.py
 ```
 
 These tests run the real Rust CLI, real Rust tools and HTTP bridge in separate
@@ -123,8 +126,9 @@ careful has one checker; memory on runs on the controller without hook timeouts.
 Additional checks cover remote script inspection, changed approvals, unavailable
 transport, missing/invalid placement settings, authentication, request bounds,
 attach-only lifecycle behavior, and remote infra gates/snapshots/verification.
-They establish local integration behavior, **not** fresh hosted or live-model
-qualification. No new sandbox or paid model run was used for this feature.
+The optional SDK smoke test also passed all ten cases through SDK 0.220.0
+against the localhost Toolbox API fixture. These establish local integration
+behavior, **not** fresh hosted or live-model qualification. No new sandbox or paid model run was used for this feature.
 
 ### Fully cloud agent
 
