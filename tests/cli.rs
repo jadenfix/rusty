@@ -318,7 +318,7 @@ fn execution_modes_persist_without_changing_permissions() {
         serde_json::from_str(&std::fs::read_to_string(s.home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings["execution_mode"], "vibe");
     let out = s.repl(&["/mode", "/agents off", "/mode careful", "/mode vibe"]);
-    assert!(out.contains("rechecks 2"), "{out}");
+    assert!(out.contains("checker one read-only check"), "{out}");
     let out = s.repl(&["/mode"]);
     assert!(out.contains("workers off"), "explicit delegation choice must persist: {out}");
     let out = s.repl(&["/agents default", "/mode"]);
@@ -402,36 +402,58 @@ fn tool_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
         "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
 }
 
-#[test]
-fn careful_goal_cannot_skip_the_two_inference_rechecks() {
-    let s = Sandbox::new("careful-loop");
-    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
-    let (url, server) = scripted_endpoint(vec![
-        done.clone(),
-        tool_reply("bash", serde_json::json!({"command": "printf first-check"})),
-        done.clone(),
-        tool_reply("bash", serde_json::json!({"command": "printf second-check"})),
-        done,
-    ]);
+fn text_reply(text: &str) -> serde_json::Value {
+    serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+}
+
+/// Runs rusty against a scripted endpoint and returns (stdout, stderr, requests).
+fn scripted_run(
+    s: &Sandbox,
+    replies: Vec<serde_json::Value>,
+    args: &[&str],
+) -> (String, String, Vec<serde_json::Value>) {
+    let (url, server) = scripted_endpoint(replies);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
-        .args(["--mode", "careful", "--goal", "check the workspace", "--stats"])
+        .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 5);
-    // A local test endpoint is not the default NVIDIA model, so the cap stays at 16k.
-    assert!(requests.iter().all(|r| r["max_tokens"] == 16384));
-    assert!(requests[1]["messages"].to_string().contains("Second look (1 of 2)"));
-    assert!(requests[3]["messages"].to_string().contains("Second look (2 of 2)"));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("first-check") && text.contains("second-check"), "{text}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
+    let (stdout, stderr) =
+        (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
+    assert!(out.status.success(), "{stderr}");
+    (stdout, stderr, server.join().unwrap())
+}
+
+#[test]
+fn careful_goal_gets_one_checker_review_then_closes() {
+    let s = Sandbox::new("careful-goal");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let (stdout, stderr, requests) = scripted_run(
+        &s,
+        vec![
+            done.clone(),
+            // The checker, a separate read-only worker.
+            text_reply("finding: the empty-input case is not handled (main.py:3)"),
+            // The main agent fixes it, verifies, and claims done again: no second review.
+            tool_reply("bash", serde_json::json!({"command": "printf fixed-and-tested"})),
+            done,
+        ],
+        &["--mode", "careful", "--goal", "check the workspace", "--stats"],
+    );
+    assert_eq!(requests.len(), 4);
+    let checker = requests[1]["messages"].to_string();
+    assert!(checker.contains("read-only reviewer"), "{checker}");
+    assert!(!requests[1]["tools"].to_string().contains("goal_done"), "the checker can't close the goal");
+    let fix = requests[2]["messages"].to_string();
+    assert!(fix.contains("checker's review") && fix.contains("empty-input"), "{fix}");
+    assert!(stdout.contains("careful check") && stdout.contains("fixed-and-tested"), "{stdout}");
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
 }
 
 #[test]
@@ -498,59 +520,44 @@ fn careful_does_not_review_a_plain_answer() {
 }
 
 #[test]
-fn careful_reviews_an_answer_after_a_change() {
+fn careful_checks_an_answer_after_a_change() {
     let s = Sandbox::new("careful-change");
-    let answer = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
-    let (url, server) = scripted_endpoint(vec![
-        tool_reply("write_file", serde_json::json!({"path": "note.txt", "content": "hi"})),
-        answer.clone(),
-        answer.clone(),
-        answer,
-    ]);
-    let out = s
-        .cmd()
-        .env("RUSTY_BASE_URL", url)
-        .args(["--mode", "careful", "write a note"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map(|child| wait(child, Duration::from_secs(20)))
-        .unwrap();
-    assert!(out.status.success());
-    let requests = server.join().unwrap();
+    let (_, _, requests) = scripted_run(
+        &s,
+        vec![
+            tool_reply("write_file", serde_json::json!({"path": "note.txt", "content": "hi"})),
+            text_reply("done"),
+            text_reply("no findings; could not run anything for a text file"),
+            text_reply("done, and the checker found nothing"),
+        ],
+        &["--mode", "careful", "write a note"],
+    );
     assert_eq!(requests.len(), 4);
-    assert!(requests[3]["messages"].to_string().contains("Second look (2 of 2)"));
+    assert!(requests[3]["messages"].to_string().contains("checker's review"));
 }
 
 #[test]
-fn careful_reviews_once_per_goal_not_once_per_goal_turn() {
+fn careful_checks_once_per_goal_not_once_per_goal_turn() {
     let s = Sandbox::new("careful-goal-turns");
     let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
-    let text = serde_json::json!({"choices": [{"delta": {"content": "still checking"}, "finish_reason": "stop"}]});
-    // Turn 1: claims done, gets look 1, answers in text and the turn ends.
-    // Turn 2: claims done, gets look 2, claims done again and closes.
-    let (url, server) = scripted_endpoint(vec![done.clone(), text, done.clone(), done]);
-    let out = s
-        .cmd()
-        .env("RUSTY_BASE_URL", url)
-        .args(["--mode", "careful", "--goal", "inspect", "--stats"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map(|child| wait(child, Duration::from_secs(20)))
-        .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(server.join().unwrap().len(), 4);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
+    // Turn 1: claims done, the checker reviews, the agent answers in text and the turn ends.
+    // Turn 2: claims done again and the goal closes without another review.
+    let (_, stderr, requests) = scripted_run(
+        &s,
+        vec![done.clone(), text_reply("looks fine"), text_reply("still checking"), done],
+        &["--mode", "careful", "--goal", "inspect", "--stats"],
+    );
+    assert_eq!(requests.len(), 4);
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
 }
 
 #[test]
-fn truncated_careful_review_leaves_the_goal_open() {
+fn truncated_reply_after_the_check_leaves_the_goal_open() {
     let s = Sandbox::new("careful-truncated");
     let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
-    let mut truncated = done.clone();
+    let mut truncated = text_reply("I'll fix the empty case by");
     truncated["choices"][0]["finish_reason"] = serde_json::json!("length");
-    let (url, server) = scripted_endpoint(vec![done.clone(), done, truncated]);
+    let (url, server) = scripted_endpoint(vec![done, text_reply("finding: empty case"), truncated]);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)

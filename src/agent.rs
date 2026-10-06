@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::config::{AgentsConfig, AgentsMode};
 use crate::context;
 use crate::display::{self, Display, View};
-use crate::execution::{ExecutionMode, ReviewGate};
+use crate::execution::ExecutionMode;
 use crate::llm::{Client, Event, Reply, ToolCall};
 use crate::memory::{Memory, KINDS};
 use crate::permissions::{Mode, Policy, Verdict};
@@ -100,7 +100,8 @@ pub struct Agent {
     pub model_override: Option<String>,
     pub delegation_override: bool,
     pending_goal: Option<Value>,
-    reviews: ReviewGate,
+    /// Careful mode still owes one checker review for this turn or goal.
+    checker_owed: bool,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     pub policy: Policy,
@@ -130,7 +131,7 @@ impl Agent {
             model_override: None,
             delegation_override: false,
             pending_goal: None,
-            reviews: ReviewGate::default(),
+            checker_owed: false,
             cwd,
             history: Vec::new(),
             policy,
@@ -172,12 +173,33 @@ impl Agent {
         }
     }
 
-    /// The next careful-mode review prompt, if any are left, with a status line.
-    fn second_look(&mut self, d: &mut Display) -> Option<String> {
-        let step = self.reviews.step();
-        let prompt = self.reviews.next()?;
-        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim(&format!("second look {step}/2"))));
-        Some(prompt)
+    /// Careful mode's one review: a read-only worker checks the proposed
+    /// completion against the real files and the user's constraints. The main
+    /// agent owns the fixes; there is no second review.
+    fn review_completion(&mut self, query: &str, d: &mut Display) {
+        self.checker_owed = false;
+        d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim("a read-only checker is reviewing the result")));
+        let constraints = context::user_messages(&self.history, 8_000);
+        let working = context::working_set(&self.history);
+        let recent: Vec<Value> = self.history.iter().rev().take(12).rev().cloned().collect();
+        let recent = serde_json::to_string(&recent).unwrap_or_default();
+        let prompt = format!(
+            "Check this proposed completion once, as a read-only reviewer. Look at the actual files or state it \
+             touched, compare the work with everything the user asked for, and judge the test evidence. Look for \
+             concrete bugs, regressions, and security or data-integrity problems where they matter. You may read \
+             and run read-only commands, never change anything. Report actionable findings with file and line \
+             references, or say you found none and name what you could not verify. Keep it short.\n\n\
+             Task: {query}\n\nWhat the user asked for:\n{constraints}\n\nWorking set:\n{working}\n\n\
+             Recent steps and the proposed completion:\n{}",
+            ui::truncate(&recent, 24_000)
+        );
+        let report = self.run_workers(vec![("careful check".into(), prompt)], d);
+        self.history.push(json!({"role": "user", "content": format!(
+            "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
+             There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
+             give your final answer, or call goal_done with evidence.",
+            context::NOTE
+        )}));
     }
 
     pub fn clear(&mut self) {
@@ -380,9 +402,9 @@ impl Agent {
         // every other turn gets its own.
         let in_goal = self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active);
         if !in_goal {
-            self.reviews = ReviewGate::new(if self.is_worker { ExecutionMode::Standard } else { self.execution_mode });
+            self.checker_owed = !self.is_worker && self.execution_mode == ExecutionMode::Careful;
         }
-        // Careful reviews only follow turns that changed something.
+        // The checker only reviews turns that changed something.
         let mut changed = false;
 
         for step in 0..max_steps {
@@ -437,11 +459,13 @@ impl Agent {
                 if reply.finish_reason.as_deref() == Some("length") {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
-                if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal {
-                    if let Some(prompt) = self.second_look(&mut d) {
-                        self.history.push(json!({"role": "user", "content": prompt}));
-                        continue;
+                if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal && self.checker_owed {
+                    self.review_completion(&query, &mut d);
+                    if signal::interrupted() {
+                        outcome = Ok(false);
+                        break;
                     }
+                    continue;
                 }
                 break;
             }
@@ -479,11 +503,14 @@ impl Agent {
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
-                match self.second_look(&mut d) {
-                    Some(prompt) => self.history.push(json!({"role": "user", "content": prompt})),
-                    None => {
-                        self.close_goal(&args);
+                if self.checker_owed {
+                    self.review_completion(&query, &mut d);
+                    if signal::interrupted() {
+                        outcome = Ok(false);
+                        break;
                     }
+                } else {
+                    self.close_goal(&args);
                 }
             }
             if self.goal.as_ref().is_some_and(|g| g.status != GoalStatus::Active) {
@@ -553,6 +580,11 @@ impl Agent {
     }
 
     fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+        if self.is_worker
+            && !matches!(call.name.as_str(), "read_file" | "list_files" | "search" | "glob" | "outline" | "bash")
+        {
+            return "denied: a read-only worker can only inspect files and run read-only commands".into();
+        }
         let raw = if call.arguments.trim().is_empty() { "{}" } else { &call.arguments };
         let args: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
@@ -762,9 +794,9 @@ impl Agent {
     // ------------------------------------------------------------- goal mode
 
     fn finish_goal(&mut self, args: &Value) -> String {
-        if self.execution_mode == ExecutionMode::Careful && !args["blocked"].as_bool().unwrap_or(false) {
+        if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
             self.pending_goal = Some(args.clone());
-            return "completion proposed; careful mode will recheck before closing the goal".into();
+            return "completion proposed; a read-only checker will review it before the goal closes".into();
         }
         self.pending_goal = None;
         self.close_goal(args)
@@ -806,7 +838,7 @@ impl Agent {
             },
         };
         println!("{} {}", ui::accent("◎ goal"), ui::bold(&self.goal.as_ref().unwrap().objective));
-        self.reviews = ReviewGate::new(self.execution_mode);
+        self.checker_owed = self.execution_mode == ExecutionMode::Careful;
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         loop {
             let finished = self.run_turn(&prompt)?;

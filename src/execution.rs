@@ -41,11 +41,12 @@ impl ExecutionMode {
         }
     }
 
-    pub fn review_passes(self) -> usize {
+    /// Careful mode has one read-only checker review the finished work.
+    pub fn checker(self) -> &'static str {
         if self == Self::Careful {
-            2
+            "one read-only check"
         } else {
-            0
+            "off"
         }
     }
 
@@ -82,43 +83,6 @@ impl ExecutionMode {
     }
 }
 
-/// Careful mode takes two extra looks before it accepts "done". The gate lives
-/// on the agent: one per user turn that changed something, one per goal.
-/// It makes the model look again; it does not grade what it finds.
-#[derive(Default)]
-pub struct ReviewGate {
-    remaining: usize,
-}
-
-impl ReviewGate {
-    pub fn new(mode: ExecutionMode) -> Self {
-        Self { remaining: mode.review_passes() }
-    }
-
-    pub fn next(&mut self) -> Option<String> {
-        let prompt = match self.remaining {
-            2 => {
-                "Second look (1 of 2): assume the work is not done yet. Look at what actually changed and run the \
-                  relevant checks again. Try the edge cases and anything that might have broken nearby. Fix what you \
-                  find. Don't repeat anything that writes outside the project just to check it."
-            }
-            1 => {
-                "Second look (2 of 2): go back over every constraint the user gave and check each one against the \
-                  result, with fresh reads or commands where it helps. Then give your final answer, or call goal_done \
-                  if this is a goal. Say which checks you ran and what you could not check."
-            }
-            _ => return None,
-        };
-        self.remaining -= 1;
-        Some(format!("{}{prompt}", crate::context::NOTE))
-    }
-
-    /// Which look comes next, for the status line.
-    pub fn step(&self) -> usize {
-        3 - self.remaining.min(2)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,15 +107,5 @@ mod tests {
         assert_eq!(body["max_tokens"], 16384, "unknown models keep the old cap");
         ExecutionMode::Vibe.apply_inference(&mut body, crate::config::DEFAULT_BASE_URL, crate::config::DEFAULT_MODEL);
         assert_eq!(body["reasoning_effort"], "low");
-    }
-
-    #[test]
-    fn careful_requires_two_separate_rechecks() {
-        let mut gate = ReviewGate::new(ExecutionMode::Careful);
-        assert!(gate.next().unwrap().contains("1 of 2"));
-        assert!(gate.next().unwrap().contains("2 of 2"));
-        assert!(gate.next().is_none());
-        assert!(ReviewGate::new(ExecutionMode::Standard).next().is_none());
-        assert!(ReviewGate::new(ExecutionMode::Vibe).next().is_none());
     }
 }

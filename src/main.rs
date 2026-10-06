@@ -363,7 +363,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
             let m = agent.execution_mode;
             let what = match m {
-                ExecutionMode::Careful => "thinks longer, takes two extra looks before calling work done",
+                ExecutionMode::Careful => "thinks longer, and a read-only checker reviews finished work",
                 ExecutionMode::Standard => "normal effort, checks what it changed",
                 ExecutionMode::Vibe => "quick passes, small checks, may send out a few read-only workers",
             };
@@ -371,9 +371,9 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!(
                 "  {}",
                 ui::dim(&format!(
-                    "model {} · rechecks {} · workers {} (≤{})",
+                    "model {} · checker {} · workers {} (≤{})",
                     agent.model,
-                    m.review_passes(),
+                    m.checker(),
                     agent.agents.mode.name(),
                     agent.swarm_cap()
                 ))
@@ -629,7 +629,7 @@ fn print_settings(agent: &Agent) {
     let rows = [
         ("model", agent.model.clone()),
         ("execution", agent.execution_mode.name().to_string()),
-        ("rechecks", agent.execution_mode.review_passes().to_string()),
+        ("checker", agent.execution_mode.checker().to_string()),
         ("permissions", agent.policy.mode.name().to_string()),
         ("view", display::view_name().to_string()),
         ("theme", ui::theme().name.to_string()),
