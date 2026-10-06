@@ -18,7 +18,9 @@ pub struct Facts<'a> {
 pub fn pick(f: &Facts, shown: &mut HashSet<&'static str>) -> Option<String> {
     let pct = (f.prompt_last as usize * 100) / f.window.max(1);
     let visible_tokens = (f.stats.visible_chars / 4) as u64;
-    let reread = f.stats.file_reads.iter().max_by_key(|(_, n)| **n).filter(|(_, n)| **n >= 3);
+    // Rereads only point at a crowded context when there is a crowd; early on
+    // they are just reads around an edit.
+    let reread = f.stats.file_reads.iter().max_by_key(|(_, n)| **n).filter(|(_, n)| **n >= 3 && pct >= 30);
     let candidates: Vec<(&'static str, Option<String>)> = vec![
         (
             "context",
@@ -90,5 +92,23 @@ mod tests {
         let mut shown = HashSet::new();
         assert!(pick(&f, &mut shown).unwrap().contains("context is 70% full"));
         assert!(pick(&f, &mut shown).is_none());
+    }
+
+    #[test]
+    fn rereads_blame_the_context_only_when_it_is_full_enough() {
+        let mut stats = TurnStats::default();
+        stats.file_reads.insert("shop/discounts.py".into(), 3);
+        let mut f = Facts {
+            stats: &stats,
+            prompt_last: 5_000,
+            window: 128_000,
+            completion: 10,
+            session_total: 0,
+            delegation_off: true,
+            model: "m",
+        };
+        assert!(pick(&f, &mut HashSet::new()).is_none());
+        f.prompt_last = 45_000;
+        assert!(pick(&f, &mut HashSet::new()).unwrap().contains("read 3 times"));
     }
 }
