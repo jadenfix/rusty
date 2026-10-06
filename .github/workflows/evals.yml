@@ -12,12 +12,16 @@ on:
       tasks:
         description: "comma-separated task names, or multi (empty: all)"
         default: ""
+      demo:
+        description: "also record this scripts/record.py scene against demo/shop (e.g. providers); empty: none"
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   evals:
+    if: inputs.models != ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -43,3 +47,32 @@ jobs:
             target/evals/*.jsonl
             target/evals/*.md
             target/evals/*/
+
+  # A real session for the README, recorded with the repository's keys.
+  demo:
+    if: inputs.demo != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: cargo build --release && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
+      - name: record
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SCENE: ${{ inputs.demo }}
+        run: |
+          mkdir -p out
+          work=$(mktemp -d) && cp -R demo/shop/. "$work"
+          (cd "$work" && RUSTY_BIN="$GITHUB_WORKSPACE/target/release/rusty" RUSTY_HOME="$(mktemp -d)" \
+            python3 "$GITHUB_WORKSPACE/scripts/record.py" "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
+          agg --theme monokai "out/$SCENE.cast" "out/$SCENE.gif"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo
+          path: out/
