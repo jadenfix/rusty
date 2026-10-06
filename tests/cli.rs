@@ -1070,6 +1070,61 @@ fn auto_keeps_questions_standard_even_with_a_production_target() {
 }
 
 #[test]
+fn saved_response_style_reaches_every_request_through_the_real_repl() {
+    struct Daemon(std::process::Child, PathBuf);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let s = Sandbox::new("repl-tone");
+    std::fs::write(s.project.join("hello.txt"), "hello").unwrap();
+    let root = PathBuf::from(format!("/tmp/rusty-repl-tone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
+            .args(["--home", root.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        root.clone(),
+    );
+    let start = Instant::now();
+    while !root.join("memory/advisor.sock").exists() {
+        assert!(start.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("read_file", serde_json::json!({"path":"hello.txt"})),
+        text_reply("The file says hello."),
+    ]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_HOME", &root)
+        .env("RUSTY_BASE_URL", url)
+        .args(["--memory", "on", "--agents", "off"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/remember preference: Response style: concise, warm, three bullets.\nRead hello.txt and answer in one sentence this time.\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(10));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    for body in requests {
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Response style: concise, warm, three bullets."));
+        assert!(system.contains("current instructions and tool permissions take precedence"));
+        assert!(body["messages"].to_string().contains("one sentence this time"));
+    }
+}
+
+#[test]
 fn blank_directory_uses_default_and_one_empty_reply_recovers() {
     let s = Sandbox::new("empty-recovery");
     std::fs::write(s.project.join("hello.txt"), "hello").unwrap();
