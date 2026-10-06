@@ -54,9 +54,10 @@ environment variables, never on a command line.
 The launcher checks endpoint transport before starting the agent, without
 sending a model key. This does not validate the key or model availability.
 Daytona Tier 1/2 blocks general outbound internet and rejects sandbox allowlist
-overrides. NVIDIA's `integrate.api.nvidia.com` currently needs an organization
-exception from Daytona support or Tier 3. Tier 3 requires a one-time $500
-wallet top-up; the launcher never upgrades or charges your account.
+overrides. NVIDIA's `integrate.api.nvidia.com` is blocked on the tested Tier 2
+account. The documented solution is Tier 3, requiring a one-time $500 wallet
+top-up. Support can be asked whether a scoped exception is possible; no such
+exception has been granted. The launcher never upgrades or charges your account.
 See [network limits](https://www.daytona.io/docs/en/network-limits/),
 [tiers](https://www.daytona.io/docs/en/limits/) and
 [troubleshooting](https://www.daytona.io/docs/en/troubleshooting/).

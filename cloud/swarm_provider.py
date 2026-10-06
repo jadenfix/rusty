@@ -34,7 +34,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
         messages=body['messages']
         prompt=next(m['content'] for m in reversed(messages) if m['role']=='user')
         steps=sum(m['role']=='tool' for m in messages)
-        with CONDITION:REQUESTS+=1
+        with CONDITION:REQUESTS+=1;metrics()
         def tool(name,args):
             return {'tool_calls':[{'index':0,'id':f'call-{steps}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]},'tool_calls'
         if prompt.startswith('WORKER-'):

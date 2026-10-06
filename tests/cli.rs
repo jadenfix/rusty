@@ -1090,6 +1090,7 @@ fn two_empty_replies_fail_without_an_unbounded_retry_loop() {
 fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
     use serde_json::json;
     use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     let s = Sandbox::new("parallel-swarm");
     for i in 0..3 {
@@ -1100,11 +1101,13 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
     let gate_server = gate.clone();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_server = requests.clone();
     let server = std::thread::spawn(move || {
         let start = Instant::now();
         let mut handlers = Vec::new();
         // Four lead requests and three requests per worker.
-        while handlers.len() < 13 {
+        while requests_server.load(Ordering::SeqCst) < 13 {
             let (mut stream, _) = match listener.accept() {
                 Ok(p) => p,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1115,12 +1118,23 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
                 Err(e) => panic!("{e}"),
             };
             let gate = gate_server.clone();
+            let requests = requests_server.clone();
             handlers.push(std::thread::spawn(move || {
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut size = 0;
+                let mut headers = 0;
                 loop {
-                    let mut line = String::new(); reader.read_line(&mut line).unwrap();
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        // A client may open a speculative idle connection.
+                        Ok(0) if headers == 0 => return,
+                        Err(e) if headers == 0 && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return,
+                        Ok(0) => panic!("incomplete request headers"),
+                        Err(e) => panic!("{e}"),
+                        Ok(_) => headers += 1,
+                    }
                     if line == "\r\n" { break; }
                     if let Some((key, val)) = line.split_once(':') {
                         if key.eq_ignore_ascii_case("content-length") { size = val.trim().parse().unwrap(); }
@@ -1128,6 +1142,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
                 }
                 let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).unwrap();
                 let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                requests.fetch_add(1, Ordering::SeqCst);
                 let messages = body["messages"].as_array().unwrap();
                 let prompt = messages.iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap();
                 let steps = messages.iter().filter(|m| m["role"] == "tool").count();
@@ -1184,6 +1199,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
     server.join().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(*gate.0.lock().unwrap(), 3);
+    assert_eq!(requests.load(Ordering::SeqCst), 13);
     assert!(!s.project.join("forbidden.txt").exists());
     assert_eq!(std::fs::read_to_string(s.project.join("proof.txt")).unwrap(), "verified");
 }
