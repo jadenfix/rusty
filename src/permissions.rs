@@ -685,7 +685,7 @@ const READ_ONLY: &[&str] = &[
     "nslookup", "host", "whois", "traceroute", "jq", "xmllint", "true", "false", "test", "[", "[[", "sleep", "wait",
     "jobs", "history", "man", "tldr", "help", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum", "base64",
     "xxd", "hexdump", "od", "strings", "nm", "otool", "objdump", "ldd", "tokei", "cloc", "scc", "delta", "exa", "eza",
-    "lsd", "zcat", "zgrep", "zless", "pbpaste", "set", "export", "unset", "alias", "shopt", "read", "exit", "return",
+    "lsd", "zcat", "zgrep", "zless", "pbpaste", "set", "export", "unset", "alias", "shopt", "read", "mapfile", "readarray", "exit", "return",
     "local", "declare", "trap", "cd", "time", "vm_stat", "top", "free", "env", "locale", "tput", "clear", "stty",
     "mdfind", "mdls", "sips", "ffprobe", "identify", "pdfinfo", "file", "lsblk", "mount",
 ];
@@ -2341,6 +2341,7 @@ mod tests {
                 "node --version",
                 "curl -s localhost:3000/health",
                 "curl http://127.0.0.1:8080/api/items | jq .",
+                "mapfile -t files < list.txt",
             ],
             |c| *c == Class::ReadOnly,
             "read-only",

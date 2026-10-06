@@ -50,7 +50,7 @@ pub fn definitions() -> Value {
         tool("outline", "List the definitions (functions, types, classes, impls) in a file or directory with line numbers. Use it to understand structure before reading.", json!({
             "path": {"type": "string"}
         }), &["path"]),
-        tool("bash", "Run a shell command in the working directory and return exit code, stdout and stderr. Use for builds, tests, git, etc. Non-interactive only.", json!({
+        tool("bash", "Run a shell command in the working directory and return exit code, stdout and stderr. Use for builds, tests, git, etc. Non-interactive only. Each call starts a fresh shell in the working directory: cd, variables and exports do not carry over, so chain them, as in `cd sub && make`.", json!({
             "command": {"type": "string"},
             "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}
         }), &["command"]),
@@ -313,7 +313,22 @@ fn bash(args: &Value) -> Result<String> {
     if !stderr.is_empty() {
         let _ = write!(out, "\nstderr:\n{stderr}");
     }
+    if only_changes_directory(command) {
+        out.push_str(
+            "\nnote: nothing else ran. Each bash call starts a fresh shell in the working directory, \
+             so this cd ended with the call. Chain it with what should run there: cd DIR && command",
+        );
+    }
     Ok(cap(out))
+}
+
+/// Whether a command does nothing but change directory, which a fresh shell
+/// per call throws away.
+fn only_changes_directory(cmd: &str) -> bool {
+    let segs: Vec<&str> = cmd.split(['\n', ';', '&']).map(str::trim).filter(|s| !s.is_empty()).collect();
+    !segs.is_empty()
+        && segs.iter().all(|seg| matches!(seg.split_whitespace().next(), Some("cd" | "pushd" | "popd")))
+        && !cmd.contains(['|', '>', '`', '$'])
 }
 
 /// Runs a shell command with a time limit. Returns (exit status, stdout,
@@ -544,6 +559,15 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lone_cd_is_recognised() {
+        assert!(only_changes_directory("cd test_rotate"));
+        assert!(only_changes_directory("cd /tmp/x && cd sub"));
+        for cmd in ["cd x && ls", "ls", "cd $(mktemp -d)", "cd x; ./rotate.sh . 2", ""] {
+            assert!(!only_changes_directory(cmd), "{cmd}");
+        }
+    }
 
     #[test]
     fn a_command_that_only_prints_is_recognised() {
