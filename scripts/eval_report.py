@@ -55,6 +55,13 @@ def report(rows):
             cells.append(f"{sum(r['verdict'] == 'pass' for r in scored)}/{len(scored)} {marks}")
         lines.append(f"| {t} | " + " | ".join(cells) + " |")
 
+    infra = [r for r in rows if r["verdict"] == "infra"]
+    if infra:
+        causes = defaultdict(int)
+        for r in infra:
+            causes[" ".join(r.get("reason") or ["(no message)"])[:120]] += 1
+        lines += ["", "Infrastructure errors (not scored):"]
+        lines += [f"- {n}× {why}" for why, n in sorted(causes.items(), key=lambda kv: -kv[1])]
     misses = [r for r in rows if r["verdict"] in ("fail", "timeout")]
     if misses:
         lines += ["", "Misses:"]
