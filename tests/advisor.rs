@@ -137,6 +137,46 @@ fn stalled_service_does_not_hold_coding_hook() {
 }
 
 #[test]
+fn management_transport_honors_its_one_second_budget() {
+    use std::io::{BufRead, BufReader, Write};
+    let root = PathBuf::from("/tmp").join(format!(
+        "rm-control-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("advisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&request).unwrap().op, "status");
+        std::thread::sleep(Duration::from_millis(350));
+        // The old 200 ms transport closes before this legitimate control reply.
+        let _ = writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&Response { text: "ready".into(), ..Response::default() }).unwrap()
+        );
+    });
+    let response = rpc(
+        &socket,
+        &Request {
+            op: "status".into(),
+            scope: "test".into(),
+            session: "test".into(),
+            seq: 0,
+            mode: Mode::On,
+            data: Value::Null,
+        },
+    );
+    server.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(response.unwrap().text, "ready");
+}
+
+#[test]
 fn export_larger_than_hook_frame_roundtrips_and_invalid_import_rolls_back() {
     let s = Service::new();
     for i in 0..40 {
