@@ -25,6 +25,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: cloud launcher, offline
+        run: python3 -m unittest cloud/test_daytona.py
 
   messages:
     if: github.event_name == 'pull_request'
