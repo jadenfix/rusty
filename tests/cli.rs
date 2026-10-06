@@ -1418,3 +1418,11 @@ fn with_only_an_anthropic_key_claude_is_the_default() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("claude-opus-5-5"), "{text}");
 }
+
+#[test]
+fn an_empty_base_url_means_the_default() {
+    let s = Sandbox::new("empty-base");
+    let out = s.cmd().env("RUSTY_BASE_URL", "").args(["--model", "gpt-5", "hi"]).stdin(Stdio::null()).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("OPENAI_API_KEY is not set"), "gpt-5 must not go to an empty endpoint: {err}");
+}
