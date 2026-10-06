@@ -12,7 +12,8 @@
   model, run `cargo xtask qa --live` or the relevant `scripts/eval.sh <task>`.
 - Never commit `.env` or print a key. Keys reach child processes and
   containers as environment variables, never as arguments.
-- Terminal UI changes need a real capture (`expect` + a pty) checked for
-  alignment, clipping and both narrow and wide terminals.
+- Terminal UI changes need a real capture (`cargo xtask tty-capture`, then
+  `cargo xtask tty-inspect`) checked for alignment, clipping and both narrow
+  and wide terminals.
 - Eval checks stay hidden from the agent: never copy `check.sh` or `check.py`
   into the task's `files/`.

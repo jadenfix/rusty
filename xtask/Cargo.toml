@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
+unicode-width = "0.1"

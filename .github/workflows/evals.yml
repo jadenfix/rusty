@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep expect
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
       - name: evals
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
