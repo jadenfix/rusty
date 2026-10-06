@@ -33,7 +33,7 @@ jobs:
       - name: memory hooks, real CLI and offline provider
         run: |
           cargo build --bins --locked
-          python3 scripts/memory_smoke.py --report memory-offline.json
+          cargo xtask memory-smoke --report memory-offline.json
 
   messages:
     if: github.event_name == 'pull_request'

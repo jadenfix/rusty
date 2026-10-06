@@ -20,7 +20,7 @@ on:
         description: tasks run at once (fewer is gentler on a rate-limited key)
         default: "4"
       demo:
-        description: "record this scripts/record.py scene against demo/shop and commit the GIF to the branch (e.g. models); empty: none"
+        description: "record this `cargo xtask record` scene against demo/shop and commit the GIF to the branch (e.g. models); empty: none"
         default: ""
 
 permissions:
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep expect
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
       - name: evals
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -46,7 +46,7 @@ jobs:
           EVAL_REPEATS: ${{ inputs.repeats }}
           EVAL_TASKS: ${{ inputs.tasks }}
           EVAL_JOBS: ${{ inputs.jobs }}
-        run: scripts/eval.sh "$EVAL_TASKS"
+        run: cargo xtask eval "$EVAL_TASKS"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
-      - run: cargo build --release && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
+      - run: cargo build --release --workspace && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
       - name: record
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -80,8 +80,9 @@ jobs:
         run: |
           mkdir -p out
           work=$(mktemp -d) && cp -R demo/shop/. "$work"
+          # The recorder runs from the copy, outside the workspace, so call it by path.
           (cd "$work" && RUSTY_BIN="$GITHUB_WORKSPACE/target/release/rusty" RUSTY_HOME="$(mktemp -d)" \
-            python3 "$GITHUB_WORKSPACE/scripts/record.py" "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
+            "$GITHUB_WORKSPACE/target/release/xtask" record "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
           agg --theme monokai --speed 2 --idle-time-limit 2 "out/$SCENE.cast" "out/$SCENE.gif"
       - uses: actions/upload-artifact@v4
         if: always()
