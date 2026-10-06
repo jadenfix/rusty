@@ -1,8 +1,9 @@
 name: ci
 on:
   push:
-    branches: [main, feat/proactive-memory]
+    branches: [main]
   pull_request:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
