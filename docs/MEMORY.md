@@ -137,7 +137,7 @@ export RUSTY_PROJECT_ID=https://github.com/you/project
 rusty-memoryd remember --kind fact "The monorepo URL is https://github.com/you/project"
 rusty-memoryd status
 rusty-memoryd export project-memory.json.gz
-uv run cloud/daytona.py run --repo "$RUSTY_PROJECT_ID" --memory-mode on \
+rusty-cloud run --repo "$RUSTY_PROJECT_ID" --memory-mode on \
   --memory-input project-memory.json.gz --project-id "$RUSTY_PROJECT_ID" \
   --goal "fix the failing tests"
 ```
