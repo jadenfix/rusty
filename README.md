@@ -95,7 +95,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
 | **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
-| **Execution modes** | `careful` takes two extra looks before calling work done, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
+| **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
 | **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
 | **Subagents and swarms** | `/agents sub\|swarm\|auto`. Swarm workers can rotate models and spread their temperatures. Off by default, so you never pay for tokens you didn't ask for. |
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
@@ -136,7 +136,7 @@ when rate limited.
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
-| `/mode careful\|standard\|vibe` | how hard rusty thinks and checks its work |
+| `/mode auto\|careful\|standard\|vibe` | how hard rusty thinks and checks its work |
 | `/view default\|verbose\|adhd` | how much you see |
 | `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
@@ -149,8 +149,9 @@ That's separate from what it's allowed to do.
 
 | | |
 |---|---|
-| `careful` | Thinks longer. When it says it's done, it has to take two more looks: run the checks again, try the edge cases, and go back over everything you asked for. A goal gets two looks in total, and a plain question gets none. |
-| `standard` | The default. Normal effort, and it checks what it changed. |
+| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
+| `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal is checked once. |
+| `standard` | Normal effort, and it checks what it changed. |
 | `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
 
 ```bash
@@ -158,16 +159,18 @@ rusty --mode careful --goal "move the sessions table to the new schema without l
 rusty --mode vibe "sketch a settings page"
 ```
 
-Switch with `/mode careful|standard|vibe`; the choice is saved. `--mode` or
-`RUSTY_MODE` sets it for one run. To use a different model per mode, set
+Switch with `/mode auto|careful|standard|vibe`; the choice is saved, and an
+explicit mode always beats auto. `--mode` or `RUSTY_MODE` sets it for one
+run. To use a different model per mode, set
 `RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL` or `RUSTY_VIBE_MODEL`
 (`--model` and `/model` still win). If you choose `/agents` settings
 yourself, they stick; `/agents default` hands delegation back to the mode.
 
 On the default NVIDIA model, careful and vibe also set the model's
 reasoning budget. In a quick test, the low budget clearly cut reasoning,
-but asking for "high" made no difference on easy questions. The second
-looks are where careful mode really earns its keep.
+but asking for "high" made no difference on easy questions. Whether careful
+mode beats standard on real tasks is still being measured; see the evals
+below.
 
 ## Permissions
 
