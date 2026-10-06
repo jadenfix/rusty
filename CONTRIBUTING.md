@@ -44,7 +44,7 @@ The rules:
 Turn on the local check once per clone:
 
 ```bash
-git config core.hooksPath .githooks
+cargo xtask install-hooks
 ```
 
 CI runs the same check on every commit in a pull request, and on its title.
@@ -70,6 +70,6 @@ The template in `.github/pull_request_template.md` keeps this short.
 ## Before you push
 
 ```bash
-scripts/qa.sh          # fmt, clippy -D warnings, unit and end-to-end tests
-scripts/qa.sh --live   # needs NVIDIA_API_KEY: live tests, terminal checks, evals
+cargo xtask qa         # fmt, clippy -D warnings, unit and end-to-end tests
+cargo xtask qa --live  # needs NVIDIA_API_KEY: live tests, terminal checks, evals
 ```

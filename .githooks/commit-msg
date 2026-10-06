@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Rejects commit messages that don't follow Conventional Commits or that carry
-# tool attribution. Enable with: git config core.hooksPath .githooks
-exec "$(git rev-parse --show-toplevel)/scripts/check-message.sh" "$1"

@@ -6,6 +6,7 @@ RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY xtask xtask
 COPY skills skills
 RUN cargo build --release --locked && strip target/release/rusty target/release/rusty-memoryd
 

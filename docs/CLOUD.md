@@ -110,7 +110,7 @@ claim. The sandbox can continue consuming compute credits after the CLI exits.
 ### Hybrid checks without cloud spending
 
 ```bash
-scripts/qa.sh
+cargo xtask qa
 # Or only the hybrid journey after building both binaries:
 python3 -m unittest cloud/test_hybrid.py
 # Optional: repeat the same journeys through the real pinned SDK's HTTP

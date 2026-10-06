@@ -262,7 +262,7 @@ scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 130 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
+| `cargo xtask qa`: fmt, clippy `-D warnings`, 130 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |
@@ -284,8 +284,8 @@ fixing only the example doesn't pass. The `evals` workflow runs any of this
 on demand from GitHub with the repository's keys.
 
 ```bash
-scripts/qa.sh            # offline checks
-scripts/qa.sh --live     # plus live tests, the terminal check and every eval
+cargo xtask qa           # offline checks
+cargo xtask qa --live    # plus live tests, the terminal check and every eval
 scripts/eval.sh multi    # just the multi-turn evals; logs land in target/evals/
 
 # the same tasks on several models, three runs each, compared in one table
