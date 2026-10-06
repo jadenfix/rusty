@@ -254,6 +254,10 @@ fn is_assignment(sep: &str) -> bool {
 
 fn secret_key(key: &str) -> bool {
     let k = key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_').to_ascii_lowercase();
+    // The shell's working-directory variables end in "pwd" but hold paths.
+    if matches!(k.as_str(), "pwd" | "oldpwd") {
+        return false;
+    }
     SECRET_KEYS.iter().any(|s| k.ends_with(s))
 }
 
@@ -317,6 +321,14 @@ pub fn redaction_note(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_working_directory_is_not_a_password() {
+        assert!(!secret_key("PWD") && !secret_key("OLDPWD"));
+        assert!(secret_key("DB_PWD") && secret_key("MYSQL_PWD"));
+        assert_eq!(redact("PWD=/home/runner/work/app").0, "PWD=/home/runner/work/app");
+    }
+
     #[test]
     fn private_json_stays_valid_and_refuses_symlinks() {
         use std::os::unix::fs::{symlink, PermissionsExt};
