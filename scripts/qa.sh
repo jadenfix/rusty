@@ -13,6 +13,9 @@ cargo clippy --all-targets -- -D warnings
 step "unit + offline end-to-end tests"
 cargo test
 
+step "cloud launcher (offline)"
+python3 -m unittest cloud/test_daytona.py
+
 if [[ "${1:-}" == "--live" ]]; then
   cargo build --release
   step "live end-to-end tests"
