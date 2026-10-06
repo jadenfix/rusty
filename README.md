@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-93%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-112%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -51,6 +51,24 @@ The model-backed clips in the following sections are real sessions, recorded wit
 [`scripts/record.py`](scripts/record.py) against the toy store in
 [`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
 faster playback. Run them yourself and you'll get the same kind of result.
+
+### The complete terminal UI session
+
+[![Editable drafts, workers and careful review](docs/demo/cli-session.gif)](docs/demo/cli-session.mp4)
+
+**[Watch the full 24-second video](docs/demo/cli-session.mp4)** ·
+[Replay the terminal recording](docs/demo/cli-session.cast)
+
+One continuous terminal session: read a Rust file, observe two failing tests,
+edit the helper, pass both tests, keep an unsent draft, run a read-only worker
+and a three-worker swarm, perform the single careful checker, then interrupt
+and send a new request. The geometric panel shows each stage and partial worker
+failure while the input stays editable beneath it.
+
+This UI recording uses scripted responses from a local SSE provider. File
+editing, Bash, worker execution, review and keyboard input run through the actual
+Rusty binary; it demonstrates terminal behavior, not live model quality or hosted
+Daytona connectivity. Its driver is [`tests/tty/demo.py`](tests/tty/demo.py).
 
 ### A swarm, when one pair of eyes isn't enough
 
@@ -124,8 +142,8 @@ Ctrl-C recovery are exercised too. [Reproduce the checks](docs/QUALITY.md).
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
 | **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. |
 | **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
-| **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |
-| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a steady geometric status panel with falling diamonds, grouped tool lines, rendered markdown. |
+| **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works; Enter stops and sends, Esc keeps your draft. Press Ctrl-C twice to quit. |
+| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a steady rotating Braille knot with event pulses, grouped tool lines, rendered markdown. |
 
 ## Quickstart
 
@@ -164,7 +182,7 @@ when rate limited.
 | `/mode auto\|careful\|standard\|vibe` | how hard rusty thinks and checks its work |
 | `/tools [local\|daytona]` | show tool placement; save the default for the next session |
 | `/view default\|verbose\|adhd` | how much you see |
-| `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
+| `/theme` · `/font` | `calm` `rust` `neon` `matrix` `amber` `ice` `mono` · banners: `minimal` `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
 | `/model` · `/models` · `/plan` · `/tips` · `/settings` · `/clear` · `/exit` | |
 
@@ -255,7 +273,7 @@ So `npm run deploy` is judged by what `deploy` does.
 
 `/permissions check <command>` shows the verdict and why. Deny rules always
 win. At a prompt, `a` allows that kind of call from then on, and typing
-anything else sends it back to the model as feedback.
+an empty answer declines. Other text goes back to the model as feedback.
 
 ## Verified end to end
 
@@ -364,7 +382,7 @@ src/
   tips.rs         token tips from real usage
   markdown.rs     terminal markdown
   ui.rs           themes, banner, mission line
-  footer.rs       steady status panel and falling geometric rail
+  footer.rs       steady activity strip, defined rules and rotating Braille knot
   execution.rs    careful, standard and vibe profiles, and auto's pick
   infra.rs        live target, dry-run gate, snapshots, audit log, redaction
 ```
@@ -378,24 +396,98 @@ each.
 Conventional Commits, and pull requests written by a person, for people. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## License
-
-MIT
+## Terminal appearance
 
 The status panel stays beneath the transcript on the normal terminal screen;
-completed output enters ordinary scrollback. The three diamonds fall inside
-the panel instead of moving the entire status line. Terminals narrower than
-31 columns or shorter than eight rows use one compact line. `RUSTY_NO_ANIM=1`
-keeps the rail still; `NO_COLOR=1` and pipes use plain output. No animation
+completed output enters ordinary scrollback. A small three-dimensional Braille
+trefoil rotates between crisp horizontal rules; the labels stay in fixed cells. Terminals
+narrower than 31 columns or shorter than eight rows use one compact line. `RUSTY_NO_ANIM=1`
+keeps the sculpture still and disables pulses; `NO_COLOR=1` and pipes use plain output. No animation
 thread or full-screen terminal framework is involved. Unicode cell measurement
 uses the same `unicode-width` version already used by rustyline.
+
+New installations use the warm `calm` theme and a small `minimal` banner.
+Existing saved choices stay in effect. Switch appearance and save it with:
+
+```text
+/theme calm
+/font minimal
+```
+
+The strip uses an 88-cell maximum width, separate status and hint colors, and a
+six-row knot rendered on a fixed 32×24-dot canvas. Below 60 columns or 20 rows
+it uses a smaller three-row strip. Long status text ends in an ellipsis.
+Tool starts briefly expand the sculpture; successful results give it an ivory
+pulse, and failures give it an accent-colored ripple. Test commands and explicit
+verification status show `verifying`; replies show `responding`. Shell commands
+reuse their existing wait loop to animate, with no added thread or completion
+delay. File tools pulse before and after their synchronous execution.
+
+The mode label stays visible, including automatic escalation to `careful`.
+Careful uses a slower knot inside a dotted shield. A delegated worker adds an
+orbiting satellite; a swarm uses several. The strip shows the actual number of
+returned reports, running workers, failures and tool calls, plus numbered worker
+markers (`●` running, `✓` returned, `×` failed). Delegation is read-only.
+The single careful checker has its own `checker` stage with a scanning satellite;
+this changes presentation and does not add reviews. Reduced motion retains the
+same mode, stage and worker information.
+`/theme` lists the other palettes; `/font` selects banner lettering only.
+
+Normal text uses your terminal's installed monospace font. CSS and web fonts do
+not apply to a CLI. In macOS Terminal, choose Settings → Profiles → Text → Font;
+in iTerm2, choose Settings → Profiles → Text. Menlo at 14–16 points is an available
+macOS starting point; choose any installed monospace font and size you prefer.
+Rusty does not change the terminal's global settings or install fonts.
+
+The interactive prompt supports local slash-command and argument hints, recent
+history hints, and filename completion (including `@path`). Tab accepts a hint or
+completes a path. For command or path alternatives, Tab cycles forward and
+Shift-Tab cycles back; Esc restores the original input. Completion stays in the
+prompt instead of opening a blocking pager. Up/Down and Ctrl-R use the line editor's history. Suggestions do
+not call a model. `/suggestions off` disables ghost hints and `RUSTY_NO_SUGGEST=1`
+disables them for a run; explicit Tab completion remains available.
+
+While a turn works, an editable draft sits beneath the activity strip. Enter
+stops the current turn and sends the draft through the normal command dispatcher;
+Esc or Ctrl-C stops without sending it. A draft left unsent returns to the normal
+editor when the turn ends. It stays in RAM until you submit it. Approval prompts
+own input separately and cannot consume that draft as an approval answer.
+The busy editor supports grapheme-aware arrows/backspace, Home/End, Ctrl-A/E,
+Ctrl-U/K/W, yank (Ctrl-Y), and one undo step (Ctrl-_). Idle input retains rustyline's
+full editing and history search. Busy drafts have a 64 KiB limit; their one-row
+viewport keeps the caret visible and displays newlines as `↵`.
+
+Use Ctrl-J or Alt-Enter for a newline, or backslash + Enter to continue a prompt.
+Bracketed multiline paste waits for Enter. Canceling a multiline prompt clears it
+without sending any partial message. Ctrl-D quits from an empty idle or busy
+prompt; with a draft present it deletes the next character. At an empty idle
+prompt, Ctrl-C twice quits. Settings commands print their values into scrollback
+and return directly to the editor; there is no settings screen to exit.
+With `NO_COLOR`, the busy composer is disabled: interrupt first, then edit at the
+ordinary prompt. The line editor and command completion still work.
 
 To capture and inspect the real CLI without model credentials:
 
 ```bash
 python3 tests/tty/capture.py --binary target/debug/rusty --output /tmp/rusty-tty
 python3 tests/tty/inspect.py /tmp/rusty-tty
+python3 tests/tty/input.py --binary target/debug/rusty --output /tmp/rusty-input
+python3 tests/tty/input_screen.py /tmp/rusty-input
+python3 tests/tty/navigation.py --binary target/debug/rusty --output /tmp/rusty-navigation
+python3 tests/tty/navigation_screen.py /tmp/rusty-navigation
+python3 tests/tty/demo.py --binary target/debug/rusty --output /tmp/rusty-demo
+python3 tests/tty/modes.py --binary target/debug/rusty --output /tmp/rusty-modes
+python3 tests/tty/modes.py --binary target/debug/rusty --reduced-only --output /tmp/rusty-modes-static
 ```
 
 The captures exercise real file writes, Bash results, streamed replies, and
 interactive Ctrl-C recovery through an `expect` PTY at 24/40/80/120 columns.
+Navigation checks additionally cover 8/12/24-row terminals, every theme and banner,
+completion cycling and cancellation, saved and malformed settings, approval
+cancellation, and idle/busy exits. They compare the PTY terminal flags before
+and after exit and replay clean-prompt checkpoints for panel overlap. The
+input and navigation journeys also run in Linux CI without model credentials.
+
+## License
+
+MIT

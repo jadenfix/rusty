@@ -1,0 +1,128 @@
+# Appended to input.exp's shared real-PTY setup by navigation.py.
+set checkpoints [open "$dest/checkpoints.tsv" w]
+proc checkpoint {name} {
+    global checkpoints cols rows events
+    puts $checkpoints "[tell $events]\t$name\t$cols\t$rows"
+}
+proc ready {name} {
+    watch {PASTE_ON\r› \r}
+    checkpoint $name
+}
+proc local {text} {
+    send -- "$text\r"
+    ready $text
+}
+switch -- $case {
+    settings {
+        foreach cmd {{/settings} {/help} {/theme} {/font} {/view} {/mode} {/agents} {/swarm} {/permissions} {/memory} {/tools} {/tips off} {/suggestions off}} {local $cmd}
+        foreach value {calm rust neon matrix amber ice mono calm} {local "/theme $value";local "/settings"}
+        foreach value {rust block thin classic minimal} {local "/font $value";local "/settings"}
+        foreach value {adhd verbose default} {local "/view $value"}
+        foreach value {careful vibe standard auto standard} {local "/mode $value"}
+        foreach value {sub swarm auto off default off} {local "/agents $value"}
+        foreach value {read-only auto ask} {local "/permissions $value"}
+        foreach cmd {{/tools daytona} {/tools local} {/swarm size 4} {/swarm spread 0.2} {/swarm models default} {/tips on} {/suggestions on} {/mode invalid} {/view invalid} {/theme invalid} {/font invalid} {/tools invalid} {/swarm size 0} {/swarm spread 2} {/suggestions off} {/settings}} {local $cmd}
+        send -- "do-not-send\x03"
+        after 150
+        checkpoint cleared-draft
+        send -- "instant\r";watch {DONE};ready model-recovered
+        send -- "/exit\r"
+    }
+    resume-settings - corrupt-settings {
+        send -- "/settings\r"
+        if {$case eq "resume-settings"} {watch {execution +careful};watch {view +adhd};watch {theme +amber};watch {suggestions +off}} else {watch {theme +calm}}
+        ready loaded-settings
+        send -- "/exit\r"
+    }
+    completion-escape - completion-cancel - completion-back {
+        local "/suggestions off"
+        send -- "/\t\t"
+        watch {› /adhd}
+        if {$case eq "completion-back"} {send -- "\x1b\x5bZ";send -- "\x1b"} elseif {$case eq "completion-escape"} {send -- "\x1b"} else {send -- "\x03"}
+        after 700
+        # Ctrl-U clears the completion prefix; no command may reach the provider.
+        send -- "\x15/settings\r"
+        watch {context window}
+        ready completion-recovered
+        send -- "/exit\r"
+    }
+    completion-cycle {
+        local "/suggestions off"
+        send -- "/mode \t";watch {› /mode auto}
+        send -- "\t";watch {› /mode careful}
+        send -- "\x1b\x5bZ";watch {› /mode auto}
+        send -- "\x1b";after 700
+        send -- "\x15/settings\r";watch {context window};ready cycle-recovered
+        send -- "/exit\r"
+    }
+    settings-after-stop {
+        local "/theme calm"
+        send -- "hold\r";watch {rusty /|◇ standard/}
+        send -- "/settings\r";watch {stopped};ready stopped-settings
+        send -- "hold\r";watch {rusty /|◇ standard/}
+        send -- "/theme amber"
+        send -- "\x1b";watch {stopped};watch {draft kept}
+        watch {PASTE_ON\r› /theme amber\r}
+        send -- "\x03"
+        after 150
+        send -- "/settings\r";ready cancelled-setting
+        send -- "instant\r";watch {DONE};ready model-recovered
+        send -- "/exit\r"
+    }
+    mode-navigation {
+        local "/mode careful"
+        send -- "/models\r"
+        watch {◇ careful/|rusty / careful /|careful ·}
+        send -- "\x1b";watch {stopped};ready models-cancelled
+        send -- "/loop 30s x2 instant\r";watch {next run in 30s}
+        watch {◇ careful/|rusty / careful /|careful ·}
+        send -- "\x1b";watch {loop stopped};ready loop-cancelled
+        local "/settings"
+        send -- "/exit\r"
+    }
+    quit - quit-short - eof - double-cancel - exit - busy-quit - busy-eof - approval-cancel {
+        local "/settings"
+        switch -- $case {
+            quit {send -- "/quit\r"}
+            quit-short {send -- "/q\r"}
+            exit {send -- "/exit\r"}
+            eof {send -- "\x04"}
+            double-cancel {
+                send -- "\x03";watch {again to quit};ready quit-armed
+                send -- "\x03"
+            }
+            busy-quit {
+                send -- "hold\r";watch {rusty /|◇ standard/}
+                send -- "/quit\r";watch {stopped}
+            }
+            busy-eof {
+                send -- "hold\r";watch {rusty /|◇ standard/}
+                send -- "\x04"
+            }
+            approval-cancel {
+                send -- "approve\r";watch {\[y\]es}
+                send -- "\x03";watch {stopped};ready approval-cancelled
+                send -- "/quit\r"
+            }
+        }
+    }
+    default {error "unknown navigation case $case"}
+}
+expect {
+    -re {.+} {
+        set chunk $expect_out(0,string)
+        binary scan [encoding convertto utf-8 $chunk] H* bytes
+        puts $events "[clock milliseconds]\t$bytes"
+        append seen $chunk
+        exp_continue
+    }
+    eof {}
+    timeout {error "navigation cannot exit: $case"}
+}
+close $events
+close $metrics
+close $checkpoints
+set result [wait]
+if {[lindex $result 3]!=0} {error "CLI failed: $result"}
+if {[string first TTY_RESTORED $seen]<0} {error "terminal mode was not restored: $seen"}
+puts "PASS $case $cols $rows"

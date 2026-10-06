@@ -14,6 +14,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::execution::ExecutionMode;
+use crate::footer::{Activity, Pulse};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +85,7 @@ pub struct Display {
     pub content: String,
     /// The current, not yet complete, line of the reply.
     line_buf: String,
+    reasoning_buf: String,
     in_code: bool,
     status: String,
     group: Vec<(String, String)>,
@@ -96,6 +99,32 @@ impl Drop for Display {
 }
 
 impl Display {
+    pub fn mode(&mut self, mode: ExecutionMode) {
+        self.footer.mode(mode);
+    }
+
+    pub fn workers_start(&mut self, total: usize, review: bool) {
+        self.status.clear();
+        self.footer.workers_start(total, review);
+        self.paint();
+    }
+
+    pub fn worker_done(&mut self, index: usize, failed: bool, calls: usize) {
+        self.footer.worker_done(index, failed);
+        self.footer.worker_calls(calls);
+        self.paint();
+    }
+
+    pub fn worker_progress(&mut self, calls: usize) {
+        self.footer.worker_calls(calls);
+        self.tick();
+    }
+
+    pub fn workers_end(&mut self) {
+        self.footer.workers_end();
+        self.status.clear();
+    }
+
     pub fn new(quiet: bool) -> Self {
         let now = Instant::now();
         Self {
@@ -111,6 +140,7 @@ impl Display {
             answered: false,
             content: String::new(),
             line_buf: String::new(),
+            reasoning_buf: String::new(),
             in_code: false,
             status: String::new(),
             group: Vec::new(),
@@ -120,10 +150,16 @@ impl Display {
 
     /// Advances only the geometric rail; completed output stays in scrollback.
     pub fn tick(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::tty() {
             return;
         }
-        let cadence = if ui::animate() { 100 } else { 1000 };
+        let cadence = if crate::signal::composer(1).is_some() {
+            50
+        } else if ui::animate() {
+            100
+        } else {
+            1000
+        };
         if self.last_draw.elapsed() < Duration::from_millis(cadence) {
             return;
         }
@@ -135,7 +171,7 @@ impl Display {
     }
 
     fn paint(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::tty() {
             return;
         }
         let extra = if !self.status.is_empty() {
@@ -164,7 +200,7 @@ impl Display {
         let mut buf = Vec::new();
         self.footer.clear(&mut buf);
         let _ = writeln!(buf, "{s}");
-        if ui::tty() && !self.in_reasoning {
+        if ui::tty() {
             let extra = if self.status.is_empty() { String::new() } else { self.status.clone() };
             let verb = if self.in_content { "Responding" } else { self.verb };
             self.footer.draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
@@ -175,6 +211,17 @@ impl Display {
     }
 
     pub fn set_status(&mut self, s: String) {
+        let stage = if s.contains("verifying") {
+            Activity::Verifying
+        } else if s.is_empty() {
+            Activity::Thinking
+        } else {
+            Activity::Working
+        };
+        self.footer.activity(stage);
+        if !s.is_empty() && s != self.status {
+            self.footer.pulse(Pulse::Tool);
+        }
         self.status = s;
     }
 
@@ -183,8 +230,8 @@ impl Display {
         if self.quiet {
             return;
         }
-        self.clear_spinner();
         self.flush_group();
+        self.clear_spinner();
     }
 
     pub fn line(&mut self, s: &str) {
@@ -201,16 +248,22 @@ impl Display {
             return;
         }
         if view() == View::Verbose {
-            self.pause();
-            if !self.in_reasoning {
-                print!("{} ", ui::dim("┊"));
-                self.in_reasoning = true;
+            self.in_reasoning = true;
+            self.reasoning_buf.push_str(s);
+            while let Some(pos) = self.reasoning_buf.find('\n') {
+                let line: String = self.reasoning_buf.drain(..=pos).collect();
+                self.append(&ui::dim(&format!("┊ {}", line.trim_end_matches('\n'))));
             }
-            print!("{}", ui::dim(&s.replace('\n', &format!("\n{} ", ui::dim("┊")))));
-            let _ = std::io::stdout().flush();
-        } else {
-            self.tick();
         }
+        self.tick();
+    }
+
+    fn flush_reasoning(&mut self) {
+        if !self.reasoning_buf.is_empty() {
+            let text = std::mem::take(&mut self.reasoning_buf);
+            self.append(&ui::dim(&format!("┊ {text}")));
+        }
+        self.in_reasoning = false;
     }
 
     pub fn content(&mut self, s: &str) {
@@ -222,13 +275,14 @@ impl Display {
         if !self.in_content {
             self.pause();
             if self.in_reasoning {
-                println!();
-                self.in_reasoning = false;
+                self.flush_reasoning();
+                self.clear_spinner();
             }
             if self.printed {
                 println!();
             }
             self.in_content = true;
+            self.footer.activity(Activity::Responding);
             self.printed = true;
             self.answered = true;
         }
@@ -246,8 +300,9 @@ impl Display {
         if !self.quiet && !self.line_buf.is_empty() {
             let rendered = crate::markdown::line(&self.line_buf, &mut self.in_code);
             self.append(&rendered);
-        } else if !self.quiet && self.in_reasoning {
-            println!();
+        }
+        if !self.quiet {
+            self.flush_reasoning();
         }
         self.line_buf.clear();
         self.in_code = false;
@@ -255,6 +310,7 @@ impl Display {
         self.in_reasoning = false;
         self.content.clear();
         self.status.clear();
+        self.footer.activity(Activity::Thinking);
     }
 
     /// Called before a tool runs.
@@ -274,6 +330,13 @@ impl Display {
         if self.quiet {
             return;
         }
+        let checking = name == "bash"
+            && ["cargo test", "cargo clippy", "pytest", "npm test", "test "]
+                .iter()
+                .any(|prefix| args["command"].as_str().unwrap_or("").trim_start().starts_with(prefix));
+        self.footer.activity(if checking { Activity::Verifying } else { Activity::Working });
+        self.footer.pulse(Pulse::Tool);
+        self.status = activity(name, &label);
         let v = view();
         if v == View::Adhd {
             self.status = activity(name, &label);
@@ -302,7 +365,11 @@ impl Display {
             return;
         }
         let first = text.lines().next().unwrap_or("");
-        if !ok || first.starts_with("denied") || first.starts_with("the user declined") || first.starts_with("blocked")
+        let failed = tool_failed(name, text, ok);
+        self.footer.pulse(if failed { Pulse::Error } else { Pulse::Success });
+        self.status =
+            format!("{} {}", if failed { "Failed:" } else { "Completed:" }, activity(name, &label(name, args)));
+        if failed && (!ok || !matches!(name, "task" | "swarm") && (name != "bash" || !first.starts_with("exit code: ")))
         {
             self.line(&format!("  {} {}", ui::err("└"), ui::err(ui::truncate(first, 160))));
             return;
@@ -429,6 +496,20 @@ impl Display {
     }
 }
 
+/// Tool execution can succeed as a transport while Bash itself exits nonzero.
+fn tool_failed(name: &str, text: &str, ok: bool) -> bool {
+    let first = text.lines().next().unwrap_or("");
+    !ok || first.starts_with("denied")
+        || first.starts_with("the user declined")
+        || first.starts_with("blocked")
+        || first.starts_with("timed out")
+        || first.starts_with("interrupted")
+        || (matches!(name, "task" | "swarm")
+            && (first.contains("interrupted after")
+                || text.lines().any(|line| line.starts_with("## ") && line.ends_with("(failed)"))))
+        || (name == "bash" && first.strip_prefix("exit code: ").is_some_and(|code| code.trim() != "0"))
+}
+
 fn label(name: &str, args: &Value) -> String {
     crate::tools::summary(name, args)
 }
@@ -494,4 +575,22 @@ pub fn render_plan(items: &Value) -> String {
         s.push('\n');
     }
     s.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+
+    #[test]
+    fn pulses_follow_actual_tool_results() {
+        assert!(!tool_failed("bash", "exit code: 0\nok", true));
+        assert!(tool_failed("bash", "exit code: 2\nfailed", true));
+        assert!(tool_failed("write_file", "error: disk full", false));
+        assert!(tool_failed("bash", "denied by permissions", true));
+        assert!(tool_failed("bash", "timed out after 1s (killed)", true));
+        assert!(tool_failed("bash", "interrupted by the user (killed)", true));
+        assert!(!tool_failed("write_file", "wrote 12 lines", true));
+        assert!(tool_failed("swarm", "## routes (done)\nok\n## tests (failed)\nfailed: model disconnected", true));
+        assert!(!tool_failed("swarm", "## routes (done)\nok", true));
+    }
 }

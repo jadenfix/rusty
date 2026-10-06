@@ -114,6 +114,7 @@ pub struct Settings {
     pub font: String,
     pub view: String,
     pub tips: bool,
+    pub suggestions: bool,
     pub agents: AgentsConfig,
     /// None means rusty picks per request.
     pub execution_mode: Option<crate::execution::ExecutionMode>,
@@ -124,10 +125,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             tools: "local".into(),
-            theme: "rust".into(),
-            font: "rust".into(),
+            theme: "calm".into(),
+            font: "minimal".into(),
             view: "default".into(),
             tips: true,
+            suggestions: true,
             agents: AgentsConfig::default(),
             execution_mode: None,
             delegation_override: false,

@@ -281,6 +281,10 @@ fn search(args: &Value) -> Result<String> {
 }
 
 fn bash(args: &Value) -> Result<String> {
+    bash_with_tick(args, &mut || {})
+}
+
+pub fn bash_with_tick(args: &Value, tick: &mut impl FnMut()) -> Result<String> {
     let command = arg(args, "command")?;
     let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
     let cwd = match args.get("cwd") {
@@ -288,7 +292,7 @@ fn bash(args: &Value) -> Result<String> {
         Some(value) => std::env::current_dir()?.join(value.as_str().context("cwd must be a string")?),
     };
     let cwd = cwd.canonicalize().context("bash cwd does not exist")?;
-    let (status, stdout, stderr) = run_in(command, timeout, &cwd)?;
+    let (status, stdout, stderr) = run_in(command, timeout, &cwd, tick)?;
     let mut out = match status {
         Some(code) => format!("exit code: {}\n", code.map_or("signal".into(), |c| c.to_string())),
         None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
@@ -309,10 +313,15 @@ fn bash(args: &Value) -> Result<String> {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
-    run_in(command, timeout, &std::env::current_dir()?)
+    run_in(command, timeout, &std::env::current_dir()?, &mut || {})
 }
 
-fn run_in(command: &str, timeout: Duration, cwd: &Path) -> Result<(Option<Option<i32>>, String, String)> {
+fn run_in(
+    command: &str,
+    timeout: Duration,
+    cwd: &Path,
+    tick: &mut impl FnMut(),
+) -> Result<(Option<Option<i32>>, String, String)> {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(command)
@@ -352,6 +361,7 @@ fn run_in(command: &str, timeout: Duration, cwd: &Path) -> Result<(Option<Option
             break exited;
         }
         signal::poll_keys();
+        tick();
         if start.elapsed() > timeout || signal::interrupted() {
             // The shell may be waiting on a child that still owns the output
             // pipes. Kill its process group so joining the drainers is bounded.
@@ -551,6 +561,24 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_closes_descendant_pipes() {
+        let start = Instant::now();
+        let (status, _, _) = run("sleep 15 & wait", Duration::from_secs(1)).unwrap();
+        assert_eq!(status, None);
+        assert!(start.elapsed() < Duration::from_secs(3), "descendant kept output pipes open");
+    }
+
+    #[test]
+    fn shell_wait_ticks_and_preserves_exit_status() {
+        let mut ticks = 0;
+        let result =
+            bash_with_tick(&json!({"command": "sleep 0.2; printf checked; exit 2"}), &mut || ticks += 1).unwrap();
+        assert!(ticks >= 2);
+        assert!(result.starts_with("exit code: 2\n"));
+        assert!(result.contains("checked"));
+    }
 
     #[test]
     fn wildcard_matching() {

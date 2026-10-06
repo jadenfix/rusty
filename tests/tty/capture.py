@@ -23,7 +23,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
             data={'choices':[{'delta':delta,'finish_reason':finish}]}
             try:self.wfile.write(('data: '+json.dumps(data)+'\n\n').encode());self.wfile.flush()
             except BrokenPipeError:pass
-        if 'Unix' in prompt:
+        if self.ui_case(body,prompt,send):
+            pass
+        elif 'Unix' in prompt:
             for _ in range(60):
                 time.sleep(.15);send({'content':'A long streamed reply for interruption.\n'})
         elif 'pong' in prompt:
@@ -38,7 +40,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
             time.sleep(.35)
             if count<12:
                 name='write_file' if count==0 else 'bash'
-                args={'path':'capture-note.txt','content':'verified\n'} if count==0 else {'command':f"printf 'step {count:02d} verified\\n'"}
+                args={'path':'capture-note.txt','content':'verified\n'} if count==0 else {'command': (
+                    "test -f capture-note.txt && sleep 1 && printf 'checked file\\n'" if count==1 else
+                    "printf 'controlled failure\\n'; exit 2" if count==4 else
+                    f"printf 'step {count:02d} verified\\n'"
+                )}
                 send({'tool_calls':[{'index':0,'id':f'call{count}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]},'tool_calls')
             else:
                 for i in range(18):
@@ -47,6 +53,39 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 send({'content':'CAPTURE_COMPLETE\n'},'stop')
         try:self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
         except BrokenPipeError:pass
+
+    def ui_case(self,body,prompt,send):
+        """Script responses; exercise the real worker runner and one checker."""
+        count=sum(m['role']=='tool' for m in body['messages'])
+        def tool(name,args):
+            send({'tool_calls':[{'index':0,'id':f'ui-{count}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]},'tool_calls')
+        worker_prompt=next((m['content'] for m in body['messages'] if m['role']=='user' and (m['content'].startswith('UI_WORKER_') or m['content'].startswith('Check this proposed completion once'))),'')
+        checker=worker_prompt.startswith('Check this proposed completion once')
+        if worker_prompt:
+            if count==0:
+                time.sleep(.2)
+                tool('read_file',{'path':'capture-note.txt' if checker else 'proof.txt'})
+            else:
+                if worker_prompt.startswith('UI_WORKER_B'):
+                    time.sleep(.3);send({'content':''},'stop')
+                else:
+                    time.sleep(2 if checker else 3 if worker_prompt.startswith('UI_WORKER_A') else 4)
+                    send({'content':'Read the file; no actionable findings.\n'},'stop')
+            return True
+        original=next((m['content'] for m in body['messages'] if m['role']=='user' and m['content'] in ['ui-swarm','ui-subagent','ui-careful']),None)
+        if not original:return False
+        time.sleep(.3)
+        if count==0:
+            if original=='ui-careful':
+                tool('write_file',{'path':'capture-note.txt','content':'verified\n'})
+            elif original=='ui-subagent':
+                tool('task',{'description':'inspect routes','prompt':'UI_WORKER_A'})
+            else:
+                tool('swarm',{'tasks':[{'description':label,'prompt':f'UI_WORKER_{key}'} for key,label in [('A','inspect routes'),('B','inspect failures'),('C','inspect tests')]]})
+        elif original=='ui-careful' and not any('[checker\'s review]' in m.get('content','') for m in body['messages'] if m['role']=='user'):
+            send({'content':'The file is updated.\n'},'stop')
+        else:send({'content':'CAPTURE_COMPLETE\n'},'stop')
+        return True
 
 
 def main():

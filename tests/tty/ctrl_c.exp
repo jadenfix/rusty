@@ -11,7 +11,7 @@ proc ready {} { expect -re {\?2004h}; sleep 0.4 }
 ready
 send -- "Write a 1500 word essay on the history of Unix, in plain prose. Do not use any tools.\r"
 # Wait until the steady panel is visible before sending the interrupt.
-expect -ex "ctrl-c to stop"
+expect -re {Esc/Ctrl-C stop|ctrl-c to stop}
 expect -timeout 2 -ex "NEVER_MATCHES"
 set t0 [clock milliseconds]
 send "\x03"
@@ -30,6 +30,12 @@ expect {
 ready
 send "\x03"
 expect -ex "again to quit"
+# The message precedes rustyline's raw-mode prompt. Wait until it can receive
+# the second key; otherwise canonical-mode Ctrl-C can land between prompts.
+ready
 send "\x03"
-expect eof
+expect {
+  eof {}
+  timeout { puts "\nFAIL: double ctrl-c did not quit"; exit 1 }
+}
 puts "\nPASS: stopped in ${ms}ms, recovered, quit on double ctrl-c"

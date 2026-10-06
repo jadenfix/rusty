@@ -62,6 +62,17 @@ jobs:
       - name: hybrid tools and parallel swarms, offline SDK and model
         run: python3 -m unittest cloud/test_hybrid.py
 
+      - name: install PTY test driver
+        run: sudo apt-get update -qq && sudo apt-get install -y expect
+      - name: terminal editing, settings navigation and exit
+        run: |
+          tty_root=$(mktemp -d)
+          trap 'rm -rf "$tty_root"' EXIT
+          python3 tests/tty/input.py --binary target/debug/rusty --output "$tty_root/input"
+          python3 tests/tty/input_screen.py "$tty_root/input"
+          python3 tests/tty/navigation.py --binary target/debug/rusty --output "$tty_root/navigation"
+          python3 tests/tty/navigation_screen.py "$tty_root/navigation"
+
   messages:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

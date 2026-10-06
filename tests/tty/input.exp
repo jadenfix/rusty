@@ -1,0 +1,209 @@
+# Interactive input journeys with actual Rusty, expect, and a PTY.
+set timeout 15
+set bin [lindex $argv 0]
+set env(RUSTY_BASE_URL) [lindex $argv 1]
+set dest [lindex $argv 2]
+set case [lindex $argv 3]
+set cols [lindex $argv 4]
+set env(NVIDIA_API_KEY) offline-test-key
+set env(RUSTY_NO_DOTENV) 1
+set env(RUSTY_HOME) "$dest/home"
+set env(TERM) xterm-256color
+set env(COLORTERM) truecolor
+unset -nocomplain env(NO_COLOR) env(RUSTY_NO_ANIM)
+if {$case eq "plain" || $case eq "plain-stop"} {set env(NO_COLOR) 1}
+if {$case eq "reduced"} {set env(RUSTY_NO_ANIM) 1}
+log_user 0
+log_file -a -noappend "$dest/terminal.ansi"
+set events [open "$dest/events.tsv" w]
+set metrics [open "$dest/latency.tsv" w]
+set seen ""
+set escape_buffer ""
+proc watch {pattern} {
+    global seen events escape_buffer
+    while {1} {
+        if {[regexp -indices -- $pattern $seen match]} {
+            set seen [string range $seen [expr {[lindex $match 1]+1}] end]
+            return
+        }
+        expect {
+            -re {.+} {
+                set chunk $expect_out(0,string)
+                binary scan [encoding convertto utf-8 $chunk] H* bytes
+                puts $events "[clock milliseconds]\t$bytes"
+                append escape_buffer $chunk
+                while {[string length $escape_buffer]>0} {
+                    if {[string index $escape_buffer 0] eq "\x1b"} {
+                        if {[regexp -indices {^\x1b\[[0-9;?]*[ -/]*[@-~]} $escape_buffer seq]} {
+                            set end [lindex $seq 1]
+                            set ansi [string range $escape_buffer 0 $end]
+                            if {[regexp {\[\?2004h$} $ansi]} {append seen PASTE_ON}
+                            set escape_buffer [string range $escape_buffer [expr {$end+1}] end]
+                        } else {break}
+                    } else {
+                        append seen [string index $escape_buffer 0]
+                        set escape_buffer [string range $escape_buffer 1 end]
+                    }
+                }
+            }
+            eof {error "unexpected EOF waiting for $pattern"}
+            timeout {error "timed out waiting for $pattern; tail: [string range $seen end-500 end]"}
+        }
+    }
+}
+proc pause {} {after 100}
+set perms ask
+set mode standard
+set agents off
+if {$case eq "subagent" || $case eq "swarm"} {set agents auto;set perms auto}
+if {$case eq "careful"} {set mode careful;set perms auto}
+spawn -noecho $bin --permissions $perms --mode $mode --agents $agents --memory off
+stty rows 24 columns $cols < $spawn_out(slave,name)
+if {$case eq "short"} {stty rows 8 columns 80 < $spawn_out(slave,name)}
+watch {PASTE_ON\r› \r}
+pause
+switch -- $case {
+    command {
+        send -- "/mode c\t\r"
+        watch {execution careful}
+        watch {PASTE_ON\r› \r}
+        send -- "/suggestions off\r"
+        watch {suggestions off · Tab completes commands and paths}
+        watch {PASTE_ON\r› \r}
+        send -- "/help\r"
+        watch {local command and history}
+    }
+    file {
+        send -- "@proof\t\r"
+        watch {DONE}
+    }
+    unicode {
+        fconfigure $spawn_id -encoding binary
+        send -- [binary format H* 1b5b3230307e68656c6c6f0af09f91a9e2808df09f92bbc3a91b5b3230317e]
+        fconfigure $spawn_id -encoding utf-8
+        pause
+        send -- "\x7f\x7f!\r"
+        watch {DONE}
+    }
+    multiline-cancel {
+        send -- "never-send\\\r"
+        pause
+        send -- "also-never\x03"
+        pause
+        send -- "instant\r"
+        watch {DONE}
+    }
+    history {
+        send -- "instant\r"
+        watch {DONE}
+        watch {PASTE_ON\r› \r}
+        send -- "ins\t\r"
+        watch {DONE}
+    }
+    unsent - escape - steer - slash - bash - bash-escape - bash-steer - reduced - verbose - verbose-flow - resize - busy-unicode - subagent - swarm - careful - short - goal {
+        if {$case eq "verbose" || $case eq "verbose-flow"} {send -- "/view verbose\r";watch {view verbose};watch {PASTE_ON\r› \r}}
+        set task hold
+        if {$case eq "unsent" || $case eq "reduced" || $case eq "resize" || $case eq "verbose-flow"} {set task slow}
+        if {$case eq "goal"} {set task "/goal hold-goal"}
+        if {$case eq "bash" || $case eq "bash-escape" || $case eq "bash-steer"} {set task bashhold}
+        if {$case eq "subagent"} {set task ui-subagent}
+        if {$case eq "swarm"} {set task ui-swarm}
+        if {$case eq "careful"} {set task ui-careful}
+        send -- "$task\r"
+        if {$case eq "subagent"} {watch {rusty / subagent}} elseif {$case eq "swarm"} {watch {rusty / swarm}} elseif {$case eq "careful"} {watch {rusty / checker}} else {watch {rusty /|◇ standard/}}
+        pause
+        if {$case eq "resize"} {stty rows 24 columns 24 < $spawn_out(slave,name); after 300; stty rows 24 columns 120 < $spawn_out(slave,name)}
+        if {$case eq "bash" || $case eq "bash-escape" || $case eq "bash-steer"} {watch {sleep 2; printf done}}
+        if {$case eq "slash"} {send -- "/mode c\t\r"; watch {stopped};watch {execution careful}} elseif {$case eq "steer" || $case eq "bash-steer"} {
+            set steering_at [clock milliseconds]
+            send -- "instant\r"; watch {stopped}
+            puts $metrics "steer_ms\t[expr {[clock milliseconds]-$steering_at}]"
+            watch {DONE}
+        } else {
+            set typed_at [clock milliseconds]
+            if {$case eq "busy-unicode"} {
+                fconfigure $spawn_id -encoding binary
+                send -- [binary format H* 1b5b3230307e696e7374616ef09f91a9e2808df09f92bbc3a91b5b3230317e7f7f]
+                fconfigure $spawn_id -encoding utf-8
+            } else {send -- "instanX\x7f"}
+            watch {› instan}
+            puts $metrics "feedback_ms\t[expr {[clock milliseconds]-$typed_at}]"
+            set stopped_at [clock milliseconds]
+            if {$case eq "escape" || $case eq "bash-escape"} {send -- "\x1b"} elseif {$case eq "bash" || $case eq "verbose" || $case eq "subagent" || $case eq "swarm" || $case eq "careful" || $case eq "short" || $case eq "busy-unicode" || $case eq "goal"} {send -- "\x03"}
+            if {$case eq "unsent" || $case eq "reduced" || $case eq "resize" || $case eq "verbose-flow"} {watch {DONE}} else {watch {stopped};puts $metrics "interrupt_ms\t[expr {[clock milliseconds]-$stopped_at}]"}
+            watch {draft kept}
+            watch {PASTE_ON\r› instan\r}
+            send -- "t\r"
+            watch {DONE}
+        }
+    }
+    approval - approval-empty - approval-stop {
+        send -- "approve\r"
+        watch {rusty /}
+        send -- "unsent-note"
+        watch {\[y\]es}
+        pause
+        if {$case eq "approval-stop"} {
+            send -- "\x03";watch {stopped}
+        } elseif {$case eq "approval-empty"} {
+            send -- "\r";watch {DONE}
+        } else {send -- "yes\r";watch {DONE}}
+        watch {draft kept}
+        watch {PASTE_ON\r› unsent-note\r}
+        send -- "\x03instant\r"
+        watch {DONE}
+    }
+    routes {
+        foreach cmd {{/help} {/?} {/mode standard} {/model fixture} {/compact} {/context} {/tokens} {/usage} {/cost} {/view adhd} {/adhd} {/verbose} {/view default} {/theme amber} {/font minimal} {/agents sub} {/subagents off} {/agents default} {/swarm size 2} {/swarm spread 0.2} {/tips off} {/target} {/changes} {/audit} {/settings} {/permissions read-only} {/perms ask} {/permissions check echo ok} {/plan on} {/plan off} {/goal status} {/goal clear} {/memory} {/mem} {/remember note} {/forget fixture} {/skills} {/clear} {/new} {/unknown-route}} {
+            send -- "$cmd\r"
+            watch {PASTE_ON\r› \r}
+        }
+        send -- "/help\r"
+        watch {local command and history}
+    }
+    loop {
+        send -- "/loop 30s x2 instant\r"
+        watch {next run in 30s}
+        send -- "instant\r"
+        watch {loop stopped}
+        watch {DONE}
+    }
+    plain-stop {
+        send -- "hold\r"
+        watch {HOLD_READY}
+        send -- "\x03"
+        watch {stopped}
+        watch {PASTE_ON\r› \r}
+        send -- "instant\r"
+        watch {DONE}
+    }
+    plain {
+        send -- "instant\r";watch {DONE}
+    }
+    error {
+        send -- "broken\r";watch {error:}
+        watch {PASTE_ON\r› \r}
+        send -- "instant\r";watch {DONE}
+    }
+    models {
+        send -- "/models\r";watch {listing models}
+        send -- "instant\r";watch {stopped};watch {DONE}
+    }
+    default {error "unknown case $case"}
+}
+watch {PASTE_ON\r› \r}
+send -- "/exit\r"
+expect {
+    -re {.+} {
+        binary scan [encoding convertto utf-8 $expect_out(0,string)] H* bytes
+        puts $events "[clock milliseconds]\t$bytes"
+        exp_continue
+    }
+    eof {}
+    timeout {error "CLI did not exit"}
+}
+close $events
+close $metrics
+set result [wait]
+if {[lindex $result 3]!=0} {error "rusty failed: $result"}
+puts "PASS $case $cols"
