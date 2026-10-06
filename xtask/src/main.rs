@@ -6,12 +6,14 @@
 //!     cargo xtask install-hooks        check every commit message locally
 //!     cargo xtask tty [CHECK]...       real-terminal checks (see tty.rs)
 //!     cargo xtask tty-capture | tty-inspect
+//!     cargo xtask record SCENE OUT     a demo session as an asciinema cast
 
 mod json;
 mod message;
 mod pattern;
 mod provider;
 mod pty;
+mod record;
 mod screen;
 mod tty;
 
@@ -50,11 +52,13 @@ fn run(args: &[String]) -> Result<ExitCode> {
         Some("tty") => tty::command(rest),
         Some("tty-capture") => tty::capture(rest),
         Some("tty-inspect") => tty::inspect(rest),
+        Some("record") => record::command(rest),
         _ => {
             eprintln!(
                 "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks\n    \
                  | tty [ctrl-c|approval|steady]... [--binary PATH] [--live]\n    \
-                 | tty-capture --binary PATH --output DIR | tty-inspect DIR>"
+                 | tty-capture --binary PATH --output DIR | tty-inspect DIR\n    \
+                 | record SCENE OUT.cast [-- RUSTY ARGS]>"
             );
             Ok(ExitCode::from(2))
         }

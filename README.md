@@ -49,7 +49,7 @@ endpoint.
 ## See it work
 
 Every clip below is a real session, recorded with
-[`scripts/record.py`](scripts/record.py) against the toy store in
+`cargo xtask record` ([`xtask/src/record.rs`](xtask/src/record.rs)) against the toy store in
 [`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
 faster playback. Run them yourself and you'll get the same kind of result.
 
