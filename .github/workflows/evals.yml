@@ -12,6 +12,9 @@ on:
       tasks:
         description: "comma-separated task names, or multi (empty: all)"
         default: ""
+      jobs:
+        description: tasks run at once (fewer is gentler on a rate-limited key)
+        default: "4"
 
 permissions:
   contents: read
@@ -34,6 +37,7 @@ jobs:
           EVAL_MODELS: ${{ inputs.models }}
           EVAL_REPEATS: ${{ inputs.repeats }}
           EVAL_TASKS: ${{ inputs.tasks }}
+          EVAL_JOBS: ${{ inputs.jobs }}
         run: scripts/eval.sh "$EVAL_TASKS"
       - uses: actions/upload-artifact@v4
         if: always()
