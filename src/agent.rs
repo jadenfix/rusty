@@ -23,6 +23,7 @@ use crate::signal;
 use crate::tips;
 use crate::tools;
 use crate::ui;
+use rusty::advisor::{Hooks, Mode as MemoryMode};
 
 const MAX_STEPS: usize = 80;
 const WORKER_STEPS: usize = 30;
@@ -111,6 +112,8 @@ pub struct Agent {
     pub history: Vec<Value>,
     pub policy: Policy,
     pub memory: Memory,
+    pub memory_mode: MemoryMode,
+    pub advisor: Option<Hooks>,
     pub plan: Vec<PlanItem>,
     pub goal: Option<Goal>,
     loop_ctl: Option<LoopCtl>,
@@ -128,6 +131,30 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn remember(&mut self, kind: &str, text: &str, global: bool) -> String {
+        if self.memory_mode == MemoryMode::Off {
+            return "memory is off".into();
+        }
+        if let Some(h) = &mut self.advisor {
+            return h.control("remember", json!({"kind":kind,"text":infra::redact(text).0,"global":false})).text;
+        }
+        self.memory.add(kind, text, global)
+    }
+
+    pub fn forget_memory(&mut self, id: &str) -> String {
+        if self.memory_mode == MemoryMode::Off {
+            return "memory is off".into();
+        }
+        if let Some(h) = &mut self.advisor {
+            return h.control("forget", json!({"id":id})).text;
+        }
+        if self.memory.forget(id) {
+            format!("forgot {id}")
+        } else {
+            format!("no memory with id {id}")
+        }
+    }
+
     pub fn new(client: Arc<Client>, model: String, cwd: PathBuf, policy: Policy, memory: Memory) -> Self {
         let project_notes = load_project_notes(&cwd);
         Self {
@@ -145,6 +172,8 @@ impl Agent {
             history: Vec::new(),
             policy,
             memory,
+            memory_mode: MemoryMode::Legacy,
+            advisor: None,
             plan: Vec::new(),
             goal: None,
             loop_ctl: None,
@@ -321,7 +350,11 @@ impl Agent {
             s.push_str(&self.project_notes);
             s.push('\n');
         }
-        let (mem, ids) = self.memory.context_block(query, context::MEMORY_CHARS);
+        let (mem, ids) = if self.memory_mode == MemoryMode::Legacy {
+            self.memory.context_block(query, context::MEMORY_CHARS)
+        } else {
+            (String::new(), Vec::new())
+        };
         if !mem.is_empty() {
             s.push_str("\nMemories relevant to this request (from earlier sessions; verify before relying on them):\n");
             s.push_str(&mem);
@@ -431,6 +464,9 @@ impl Agent {
     /// Runs one user turn to completion. Returns false if interrupted.
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
         self.history.push(json!({"role": "user", "content": user}));
+        if let Some(h) = &mut self.advisor {
+            h.begin(&infra::redact(user).0);
+        }
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
             None => user.to_string(),
@@ -456,6 +492,7 @@ impl Agent {
         // The checker only reviews turns that changed something.
         let mut changed = false;
         let mut failures_in_a_row = 0;
+        let mut empty_replies = 0;
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -463,7 +500,10 @@ impl Agent {
                 break;
             }
             self.manage_context(&mut d);
-            let (system, mem_ids) = self.system_prompt(&query);
+            let (mut system, mem_ids) = self.system_prompt(&query);
+            if let Some(h) = &mut self.advisor {
+                system.push_str(&h.advice());
+            }
             if step == 0 {
                 self.memory.touch(&mem_ids);
             }
@@ -489,6 +529,17 @@ impl Agent {
             }
             self.trace(&reply, started.elapsed());
 
+            // Fresh background analysis can arrive while the main model thinks.
+            // Reconsider an unexecuted tool proposal at most within the advisor budget.
+            if !reply.tool_calls.is_empty() {
+                if let Some(h) = &mut self.advisor {
+                    let advice = h.late_advice();
+                    if !advice.is_empty() {
+                        self.history.push(json!({"role":"user","content":advice}));
+                        continue;
+                    }
+                }
+            }
             let mut msg = json!({"role": "assistant", "content": reply.content});
             if !reply.tool_calls.is_empty() {
                 msg["tool_calls"] = Value::Array(
@@ -506,6 +557,16 @@ impl Agent {
                 break;
             }
             if reply.tool_calls.is_empty() {
+                if reply.content.trim().is_empty() && reply.finish_reason.as_deref() != Some("length") {
+                    empty_replies += 1;
+                    if empty_replies > 1 {
+                        outcome =
+                            Err(anyhow::anyhow!("model returned two empty replies; task completion is unconfirmed"));
+                        break;
+                    }
+                    self.history.push(json!({"role":"user","content":"The previous reply was empty. Continue the existing task using the available tools, or give a substantive final answer. Do not repeat completed actions."}));
+                    continue;
+                }
                 if reply.finish_reason.as_deref() == Some("length") {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
@@ -595,6 +656,9 @@ impl Agent {
             return outcome;
         }
         let interrupted = matches!(outcome, Ok(false)) || signal::interrupted();
+        if let Some(h) = &mut self.advisor {
+            h.finish(outcome.is_ok() && !interrupted);
+        }
         d.recap(
             self.totals.prompt - before.prompt,
             self.totals.completion - before.completion,
@@ -664,7 +728,7 @@ impl Agent {
         }
         d.tool(&call.name, &args);
         let result = match call.name.as_str() {
-            "remember" => Ok(self.memory.add(
+            "remember" => Ok(self.remember(
                 args["kind"].as_str().unwrap_or("fact"),
                 args["text"].as_str().unwrap_or(""),
                 args["global"].as_bool().unwrap_or(false),
@@ -672,7 +736,7 @@ impl Agent {
             "recall" => Ok(self.recall(args["query"].as_str().unwrap_or(""))),
             "forget" => {
                 let id = args["id"].as_str().unwrap_or("");
-                Ok(if self.memory.forget(id) { format!("forgot {id}") } else { format!("no memory with id {id}") })
+                Ok(self.forget_memory(id))
             }
             "plan" => {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
@@ -706,6 +770,9 @@ impl Agent {
         }
         // Secrets never reach the model, the screen or the session file.
         let (mut text, redacted) = infra::redact(&text);
+        if let Some(h) = &mut self.advisor {
+            h.event(&call.name, &infra::redact(&call.arguments).0, &text);
+        }
         if redacted > 0 {
             text.push_str(&infra::redaction_note(redacted));
         }
@@ -866,6 +933,12 @@ impl Agent {
     }
 
     fn recall(&mut self, query: &str) -> String {
+        if self.memory_mode == MemoryMode::Off {
+            return "memory is off".into();
+        }
+        if let Some(h) = &mut self.advisor {
+            return h.control("recall", json!({"query": infra::redact(query).0})).text;
+        }
         let hits: Vec<(String, String)> = self
             .memory
             .search(query, 10)
@@ -1176,7 +1249,7 @@ impl Agent {
             bail!("the model returned an empty summary");
         }
         for (kind, text) in &memories {
-            self.memory.add(kind, text, false);
+            self.remember(kind, text, false);
         }
         self.memory.save();
         let tail = self.history.split_off(split);
@@ -1228,10 +1301,13 @@ impl Agent {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal});
-        let _ = std::fs::write(path, body.to_string());
+        let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {
-            let _ = std::fs::write(path.with_extension("changes.txt"), changes);
+            use std::io::Write;
+            if let Ok(mut f) = rusty::privacy::private_file(&path.with_extension("changes.txt"), false) {
+                let _ = f.write_all(infra::redact(&changes).0.as_bytes());
+            }
         }
     }
 
@@ -1262,9 +1338,7 @@ impl Agent {
             "finish": reply.finish_reason,
         });
         use std::io::Write;
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(path.with_extension("trace.jsonl"))
-        {
+        if let Ok(mut f) = rusty::privacy::private_file(&path.with_extension("trace.jsonl"), true) {
             let _ = writeln!(f, "{line}");
         }
     }

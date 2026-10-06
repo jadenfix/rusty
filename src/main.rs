@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, env = "RUSTY_MODE")]
     mode: Option<String>,
 
+    /// Memory: legacy (existing store), off, on (local advisor), deep (background model)
+    #[arg(long, env = "RUSTY_MEMORY", default_value = "legacy")]
+    memory: String,
+
     /// Permission mode: read-only, ask, auto or yolo
     #[arg(short, long, env = "RUSTY_PERMISSIONS", default_value = "auto")]
     permissions: String,
@@ -150,6 +154,17 @@ fn run() -> Result<i32> {
     let memory = Memory::load(pdir.join("memory.jsonl"), global.join("memory.jsonl"));
 
     let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy, memory);
+    agent.memory_mode = rusty::advisor::Mode::parse(&cli.memory)
+        .ok_or_else(|| anyhow!("unknown memory mode `{}` (legacy, off, on, deep)", cli.memory))?;
+    if matches!(agent.memory_mode, rusty::advisor::Mode::On | rusty::advisor::Mode::Deep) {
+        match rusty::advisor::Hooks::connect(&global, &cwd, agent.memory_mode) {
+            Ok(h) => agent.advisor = Some(h),
+            Err(_) => {
+                eprintln!("memory advisor unavailable; continuing with memory off");
+                agent.memory_mode = rusty::advisor::Mode::Off;
+            }
+        }
+    }
     agent.agents = settings.agents.clone();
     agent.tips = settings.tips;
     agent.model_override = cli.model.clone();
@@ -225,7 +240,9 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
     let body = serde_json::json!({
         "agent": "rusty",
         "version": env!("CARGO_PKG_VERSION"),
-        "model": agent.model,
+            "model": agent.model,
+            "memory_mode": agent.memory_mode,
+            "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         "execution_mode": agent.execution_mode.name(),
         "messages": agent.history,
         "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
@@ -233,7 +250,7 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(&body)?)?;
+    rusty::privacy::write_json(path, body)?;
     Ok(())
 }
 
@@ -252,6 +269,8 @@ fn print_stats(agent: &Agent, started: Instant) {
             "mode_reason": if agent.mode_fixed { "chosen by the user" } else { agent.mode_reason.as_str() },
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
+            "memory_mode": agent.memory_mode,
+            "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
     );
 }
@@ -289,7 +308,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             println!("{}", ui::dim("  (typed while rusty was working)"));
             signal::restore_terminal();
             signal::reset();
-            let _ = rl.add_history_entry(&queued);
+            let _ = rl.add_history_entry(rusty::privacy::redact(&queued).0);
             if let Err(e) = agent.run_turn(&queued) {
                 println!("{} {e:#}\n", ui::err("error:"));
             }
@@ -325,7 +344,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if input.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(&input);
+        let _ = rl.add_history_entry(rusty::privacy::redact(&input).0);
         signal::restore_terminal();
         signal::reset();
 
@@ -347,7 +366,9 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if let Some(dir) = h.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = rl.save_history(h);
+        if rusty::privacy::private_file(h, true).is_ok() {
+            let _ = rl.save_history(h);
+        }
     }
     agent.save_session();
     print_changes(agent);
@@ -569,14 +590,14 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                     Some((k, t)) if memory::KINDS.contains(&k.trim()) => (k.trim(), t.trim()),
                     _ => ("fact", rest),
                 };
-                println!("  {}", agent.memory.add(kind, text, kind == "preference"));
+                println!("  {}", agent.remember(kind, text, kind == "preference"));
                 agent.memory.save();
             }
         }
         "/forget" => {
-            let ok = agent.memory.forget(rest);
+            let result = agent.forget_memory(rest);
             agent.memory.save();
-            println!("  {}", if ok { format!("forgot {rest}") } else { format!("no memory {rest}") });
+            println!("  {result}");
         }
         "/skills" => {
             for s in skills::all(cwd) {
@@ -831,7 +852,26 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
 }
 
 fn memory_cmd(agent: &mut Agent, rest: &str) {
+    if agent.memory_mode == rusty::advisor::Mode::Off {
+        println!("  memory is off");
+        return;
+    }
     let (sub, arg) = rest.split_once(char::is_whitespace).map(|(s, a)| (s, a.trim())).unwrap_or((rest, ""));
+    if let Some(h) = &mut agent.advisor {
+        let (op, data) = match sub {
+            "" | "list" => ("list", serde_json::Value::Null),
+            "search" => ("recall", serde_json::json!({"query":arg})),
+            "forget" => ("forget", serde_json::json!({"id":arg})),
+            "status" => ("status", serde_json::Value::Null),
+            "helpful" | "harmful" => ("feedback", serde_json::json!({"helpful":sub=="helpful"})),
+            _ => {
+                println!("  /memory [list | search <query> | forget <id> | status | helpful | harmful]");
+                return;
+            }
+        };
+        println!("  {}", h.control(op, data).text);
+        return;
+    }
     match sub {
         "" | "list" => {
             if agent.memory.entries.is_empty() {

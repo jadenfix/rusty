@@ -1,0 +1,43 @@
+name: memory live smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: memory-live-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bins --locked
+      - name: file editing, Bash, memory, latency and tool budget
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: python3 scripts/memory_smoke.py --live --binary target/release/rusty --report memory-live.json
+      - name: summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path('memory-live.json')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              if not p.exists():
+                  out.write('No behavioral receipt produced; inspect the failed step.\n')
+              else:
+                  d = json.loads(p.read_text())
+                  out.write('| Mode | Task | Pass | Seconds | Tools | Repeats | Max hook µs |\n|---|---|---|---|---|---|---|\n')
+                  for r in d['runs']:
+                      out.write(f"| {r['mode']} | {r['task']} | {r['passed']} | {r['wall_seconds']} | {r['tool_calls']} | {r['repeated_calls']} | {r['memory'].get('max_hook_us', 0)} |\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-live-receipt
+          path: memory-live.json
+          if-no-files-found: warn

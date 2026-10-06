@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-05",
+  "platform": "macOS arm64",
+  "baseline_commit": "50adbede0d1e96b123889a572451d5089c004051",
+  "lookup_before": {
+    "lessons": 512,
+    "cold_ms": 2.775,
+    "p50_ms": 0.515,
+    "p95_ms": 0.56,
+    "max_ms": 2.775,
+    "storage_bytes": 744552,
+    "binary_bytes": 5083840,
+    "passed": true
+  },
+  "lookup_after": {
+    "lessons": 512,
+    "cold_ms": 2.728,
+    "p50_ms": 0.061,
+    "p95_ms": 0.067,
+    "max_ms": 2.728,
+    "storage_bytes": 245760,
+    "binary_bytes": 5083984,
+    "passed": true
+  },
+  "resource_comparison": [
+    {
+      "version": "before",
+      "lessons": 512,
+      "sessions": 32,
+      "observations": 256,
+      "idle_rss_bytes": 3784704,
+      "loaded_rss_bytes": 8126464,
+      "storage_bytes": 801872,
+      "event_p95_ms": 0.161
+    },
+    {
+      "version": "after",
+      "lessons": 512,
+      "sessions": 32,
+      "observations": 256,
+      "idle_rss_bytes": 3653632,
+      "loaded_rss_bytes": 7946240,
+      "storage_bytes": 245760,
+      "event_p95_ms": 0.1
+    }
+  ]
+}

@@ -21,7 +21,7 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-83%20passing-ec7a34)
+![tests](https://img.shields.io/badge/tests-93%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
@@ -237,7 +237,7 @@ scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 46 unit tests (about 250 classified commands), 28 offline end-to-end tests on the real binary, 5 cloud launcher tests | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 93 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |
@@ -273,7 +273,13 @@ To use another endpoint, set `RUSTY_BASE_URL`, for example `http://localhost:114
 
 ## Run it anywhere
 
-One static binary: `docker build --target bin -o out .` produces it for Linux.
+The core CLI is one static binary. `docker build --target bin -o out .` produces
+`rusty` and the optional `rusty-memoryd` companion for Linux.
+[docs/MEMORY.md](docs/MEMORY.md) covers opt-in `--memory off|on|deep`, the
+RAM-only L1, packed L2, learning from feedback, live checks and cloud transfer.
+[docs/ARCHITECTURE_AUDIT.md](docs/ARCHITECTURE_AUDIT.md) records the storage,
+dependency and privacy tradeoffs. Redistributed binaries include `LICENSE` and
+`THIRD_PARTY_NOTICES.txt`.
 [docs/CLOUD.md](docs/CLOUD.md) covers Daytona sandboxes
 (`uv run cloud/daytona.py --repo … --goal …`), AWS, Devbox and Docker.
 rusty also plugs into Harbor benchmarks with `--goal`, `--trajectory` and

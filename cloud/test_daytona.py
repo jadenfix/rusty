@@ -57,6 +57,8 @@ class FakeRemote:
         bin_dir.mkdir()
         (bin_dir / "rusty").write_text(FAKE_RUSTY)
         (bin_dir / "rusty").chmod(0o755)
+        (bin_dir / "rusty-memoryd").write_text('#!/bin/bash\nif [ "$1" = export ]; then printf compressed-snapshot > "$2"; fi\n')
+        (bin_dir / "rusty-memoryd").chmod(0o755)
         self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
         self.sandbox = FakeSandbox(run_id)
         self.id = self.sandbox.id
@@ -69,6 +71,9 @@ class FakeRemote:
     def start(self, cmd):
         self.started.append(subprocess.Popen(["bash", "-c", cmd], env=self.env))
         return "cmd-1"
+
+    def upload(self, local, path):
+        Path(path.replace("$HOME", str(self.home))).write_bytes(Path(local).read_bytes())
 
     def download(self, path):
         p = Path(path.replace("$HOME", str(self.home)))
@@ -147,6 +152,55 @@ class LauncherTest(unittest.TestCase):
         subprocess.run(["git", "apply", str(dest.resolve() / "patch.diff")], cwd=check, check=True)
         self.assertEqual((check / "new_module.py").read_text(), 'print("new")\n')
 
+    def test_advisor_cloud_import_export_and_private_db_exclusion(self):
+        incoming = self.root / "incoming.gz"
+        incoming.write_bytes(b"scoped-memory")
+        self.state.update(memory_mode="deep", memory_input=str(incoming), project_id="my-project")
+        launcher.setup_and_start(self.remote, self.state, ["fix the file"])
+        self.assertIn("--memory deep", self.state["command"])
+        self.assertEqual((self.remote.home / "rusty-run/memory-input.json.gz").read_bytes(), b"scoped-memory")
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=0.05)
+        private = self.remote.home / ".config/rusty/memory"
+        private.mkdir()
+        (private / "memory.sqlite-wal").write_bytes(b"do not archive raw live WAL")
+        self.assertTrue(self.run_quietly(launcher.export, self.remote, self.state)[0])
+        dest = Path("cloud-runs/run-1")
+        self.assertEqual((dest / "memory.json.gz").read_bytes(), b"compressed-snapshot")
+        self.assertEqual(dest.stat().st_mode & 0o777, 0o700)
+        for item in dest.iterdir():
+            self.assertEqual(item.stat().st_mode & 0o777, 0o600, str(item))
+        with tarfile.open(dest / "session.tgz") as t:
+            self.assertFalse(any("/memory/" in n for n in t.getnames()))
+
+    def test_missing_trajectory_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=.05)
+        (self.remote.home / "rusty-run/trajectory.json").unlink()
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertFalse(self.state["exported"])
+
+    def test_unknown_exit_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        self.remote.env["FAKE_RUSTY_SLEEP"] = "1"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertEqual(self.state["status"], "running")
+
+    def test_missing_memory_export_preserves_cloud_sandbox(self):
+        self.state["memory_mode"] = "on"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=0.05)
+        (self.root / "bin/rusty-memoryd").unlink()
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertFalse(self.state["exported"])
+
     def test_ctrl_c_only_stops_following(self):
         self.remote.env["FAKE_RUSTY_SLEEP"] = "1"
         launcher.setup_and_start(self.remote, self.state, ["--goal", "fix app.py"])
@@ -194,6 +248,9 @@ class LauncherTest(unittest.TestCase):
         self.assertRegex(launcher.snapshot_name(a), launcher.SNAPSHOT_NAME)
         self.assertEqual(launcher.snapshot_name(a), launcher.snapshot_name(a))
         self.assertNotEqual(launcher.snapshot_name(a), launcher.snapshot_name(b))
+        old = launcher.snapshot_name(a)
+        (a.parent / "rusty-memoryd").write_bytes(b"advisor-v2")
+        self.assertNotEqual(old, launcher.snapshot_name(a))
         self.assertIn("@sha256:", launcher.BASE_IMAGE, "the base image must stay pinned by digest")
 
 

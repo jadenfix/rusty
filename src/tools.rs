@@ -82,11 +82,11 @@ pub fn summary(name: &str, args: &Value) -> String {
                 .unwrap_or(cmd);
             cmd.lines().next().unwrap_or("").to_string()
         }
-        "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().unwrap_or(".")),
+        "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".")),
         "glob" => s("pattern"),
         "outline" => s("path"),
         "swarm" => format!("{} tasks", args["tasks"].as_array().map_or(0, Vec::len)),
-        "list_files" => args["path"].as_str().unwrap_or(".").to_string(),
+        "list_files" => args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".").to_string(),
         "task" => s("description"),
         "remember" => format!("{}: {}", s("kind"), s("text")),
         "recall" => s("query"),
@@ -206,7 +206,7 @@ fn edit_file(args: &Value) -> Result<String> {
 }
 
 fn list_files(args: &Value) -> Result<String> {
-    let root = args["path"].as_str().unwrap_or(".");
+    let root = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
     let max_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
     let mut entries = Vec::new();
     walk(Path::new(root), Path::new(root), 0, max_depth, &mut entries)?;
@@ -244,7 +244,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<S
 
 fn search(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
     let context = args["context"].as_u64().unwrap_or(0).min(10).to_string();
     let output = if has_rg() {
         let mut cmd = Command::new("rg");
@@ -370,7 +370,7 @@ fn files_under(root: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn glob(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
-    let root = args["path"].as_str().unwrap_or(".");
+    let root = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
     let mut files = Vec::new();
     files_under(Path::new(root), &mut files);
     let hits: Vec<String> = files
