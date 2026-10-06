@@ -329,8 +329,9 @@ impl Agent {
              - The tests you were given, or wrote, rarely cover everything the task states. Before you finish, \
              check each stated rule directly with a quick run on inputs that hit its edges: boundaries and \
              off-by-one counts, ties and ordering, empty input, every invariant the task says must always or \
-             never hold, and exact results (integer or decimal arithmetic when the answer must be exact, not \
-             floats).\n\
+             never hold, inputs that nearly match a stated format (a name that fits your glob but not the \
+             stated pattern), state that persists between runs, and exact results (integer \
+             or decimal arithmetic when the answer must be exact, not floats).\n\
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n\
              - Save durable lessons with remember: build and test commands, conventions, traps, user preferences.\n\
              - If a tool call is denied, don't retry it. Find another way or ask.\n\
