@@ -200,8 +200,10 @@ impl Client {
         if ep.provider == Provider::Anthropic {
             let first_party = ep.base_url == crate::config::ANTHROPIC_BASE_URL;
             let (body, beta) = anthropic::request(model, messages, tools, execution_mode, first_party);
-            let resp = self.send(ep, &format!("{}/v1/messages", ep.base_url), Some(&body), beta.as_deref())?;
-            return anthropic::parse_stream(resp, on);
+            let url = format!("{}/v1/messages", ep.base_url);
+            return self.stream_with_retry(on, |on| {
+                anthropic::parse_stream(self.send(ep, &url, Some(&body), beta.as_deref())?, on)
+            });
         }
         let mut body = json!({
             "model": model,
@@ -220,8 +222,40 @@ impl Client {
             body["tools"] = tools.clone();
             body["tool_choice"] = json!("auto");
         }
-        let resp = self.send(ep, &format!("{}/chat/completions", ep.base_url), Some(&body), None)?;
-        parse_stream(resp, on)
+        let url = format!("{}/chat/completions", ep.base_url);
+        self.stream_with_retry(on, |on| parse_stream(self.send(ep, &url, Some(&body), None)?, on))
+    }
+
+    /// Runs one streamed request, and runs it again when the provider reports
+    /// an overload, rate limit or server error inside the stream (an HTTP 200
+    /// whose events carry the error) or the stream drops, as long as nothing
+    /// has been shown yet. Once text has streamed, a retry would repeat it, so
+    /// the error stands. Shares the retry budget and backoff with `send`.
+    fn stream_with_retry(
+        &self,
+        on: &mut dyn FnMut(Delta) -> bool,
+        mut attempt: impl FnMut(&mut dyn FnMut(Delta) -> bool) -> Result<Reply>,
+    ) -> Result<Reply> {
+        let started = std::time::Instant::now();
+        let budget = retry_budget();
+        let mut round = 0u32;
+        loop {
+            let mut shown = false;
+            let result = attempt(&mut |d| {
+                shown = true;
+                on(d)
+            });
+            let err = match result {
+                Err(e) if !shown && transient_stream_error(&format!("{e:#}")) => e,
+                other => return other,
+            };
+            round += 1;
+            let wait = backoff(round, None);
+            if started.elapsed() + wait > budget {
+                return Err(err.context(format!("giving up after {round} streamed attempts")));
+            }
+            wait_or_interrupt(wait, &format!("{err:#}"))?;
+        }
     }
 
     /// Model ids from every configured provider. A provider that fails to
@@ -331,15 +365,36 @@ impl Client {
             if all_refused || started.elapsed() + wait > budget {
                 bail!("giving up after {attempts} attempts in {}s: {last_err}", started.elapsed().as_secs());
             }
-            let until = std::time::Instant::now() + wait;
-            while std::time::Instant::now() < until {
-                if crate::signal::interrupted() {
-                    bail!("interrupted while waiting to retry: {last_err}");
-                }
-                std::thread::sleep(Duration::from_millis(100).min(until - std::time::Instant::now()));
-            }
+            wait_or_interrupt(wait, &last_err)?;
         }
     }
+}
+
+/// Sleeps for `wait`, or fails at once when Ctrl-C is pressed.
+fn wait_or_interrupt(wait: Duration, last_err: &str) -> Result<()> {
+    let until = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < until {
+        if crate::signal::interrupted() {
+            bail!("interrupted while waiting to retry: {last_err}");
+        }
+        std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(std::time::Instant::now())));
+    }
+    Ok(())
+}
+
+/// An error inside a stream worth trying again: overloaded, rate limited, a
+/// server-side failure, or the connection dropping. A bad request is not.
+fn transient_stream_error(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    if e.contains("stream interrupted") {
+        return true;
+    }
+    if !e.contains("api error") {
+        return false;
+    }
+    ["overloaded", "service_unavailable", "rate_limit", "api_error", "timeout", "\"code\":429", "\"code\":5"]
+        .iter()
+        .any(|k| e.contains(k))
 }
 
 /// "429 Too Many Requests" style, as reqwest prints a status.
@@ -488,6 +543,24 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, tc: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_transient_stream_errors_are_retried() {
+        for e in [
+            r#"API error: {"code":503,"message":"Service temporarily overloaded","type":"service_unavailable"}"#,
+            r#"API error: {"type":"overloaded_error","message":"Overloaded"}"#,
+            r#"API error: {"code":429,"message":"slow down"}"#,
+            "stream interrupted: connection reset",
+        ] {
+            assert!(transient_stream_error(e), "{e}");
+        }
+        for e in [
+            r#"API error: {"code":400,"message":"bad tool schema","type":"invalid_request_error"}"#,
+            "HTTP 404 Not Found: no such model",
+        ] {
+            assert!(!transient_stream_error(e), "{e}");
+        }
+    }
 
     #[test]
     fn backoff_grows_then_caps_and_honours_retry_after() {
