@@ -3,9 +3,15 @@ name: evals
 on:
   workflow_dispatch:
     inputs:
-      model:
-        description: model id
+      models:
+        description: space-separated model ids (each needs its provider's key as a secret)
         default: nvidia/nemotron-3-super-120b-a12b
+      repeats:
+        description: runs of each task per model
+        default: "1"
+      tasks:
+        description: "comma-separated task names, or multi (empty: all)"
+        default: ""
 
 permissions:
   contents: read
@@ -13,7 +19,7 @@ permissions:
 jobs:
   evals:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,10 +29,17 @@ jobs:
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
-          RUSTY_MODEL: ${{ inputs.model }}
-        run: scripts/eval.sh
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_MODELS: ${{ inputs.models }}
+          EVAL_REPEATS: ${{ inputs.repeats }}
+          EVAL_TASKS: ${{ inputs.tasks }}
+        run: scripts/eval.sh "$EVAL_TASKS"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: eval-results
-          path: target/evals/*.jsonl
+          path: |
+            target/evals/*.jsonl
+            target/evals/*.md
+            target/evals/*/
