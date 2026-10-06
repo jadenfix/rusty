@@ -83,11 +83,15 @@ run_task() {
   local where="$logs/${model//\//_}/$name.$rep"
   mkdir -p "$where" && cp "$home/stdout" "$home/stderr" "$home/check" "$where/" 2>/dev/null
   python3 - "$name" "$model" "$verdict" "$secs" "$home" "$out" "$rep" <<'PY'
-import json, sys
+import json, re, sys
 name, model, verdict, secs, home, out, rep = sys.argv[1:]
 runs = [json.loads(l) for l in open(f"{home}/stderr") if l.startswith("{")]
 tot = {k: sum(r.get(k, 0) or 0 for r in runs) for k in ("requests", "prompt", "completion")}
 reason = open(f"{home}/check").read().strip().splitlines()[-1:] if verdict == "fail" else []
+if verdict == "infra":  # the endpoint's own words, so a run of these can be diagnosed from the jsonl
+    pat = re.compile(r"giving up after|HTTP [45][0-9][0-9]|request failed|connection to the model closed|API error|is not set")
+    hits = [l.strip() for f in ("stdout", "stderr") for l in open(f"{home}/{f}", errors="replace") if pat.search(l)]
+    reason = hits[-1:]
 row = {"task": name, "model": model, "rep": int(rep), "verdict": verdict, "secs": int(secs), "sessions": len(runs), **tot, "reason": reason}
 open(out, "a").write(json.dumps(row) + "\n")
 mark = {"pass": "✓", "fail": "✗", "timeout": "⧗", "infra": "⚠"}[verdict]
