@@ -286,6 +286,8 @@ on demand from GitHub with the repository's keys.
 ```bash
 cargo xtask qa           # offline checks
 cargo xtask qa --live    # plus live tests, the terminal check and every eval
+cargo xtask memory-smoke --live --binary target/release/rusty   # the six memory cases on NVIDIA
+cargo xtask memory-bench # memory advice latency with 512 stored lessons (release build)
 scripts/eval.sh multi    # just the multi-turn evals; logs land in target/evals/
 
 # the same tasks on several models, three runs each, compared in one table

@@ -4,7 +4,13 @@
 //!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
+//!     cargo xtask memory-smoke [--live] [--binary PATH] [--report PATH]
+//!                                      memory hooks through the real CLI
+//!     cargo xtask memory-bench [--binary PATH] [--report PATH]
+//!                                      memory advice latency, 512 lessons
+//!     cargo xtask memory-summary FILE  a smoke receipt as a Markdown table
 
+mod memory;
 mod message;
 
 use std::io::Read;
@@ -39,8 +45,14 @@ fn run(args: &[String]) -> Result<ExitCode> {
             Ok(verdict(problem))
         }
         Some("install-hooks") => install_hooks().map(|()| ExitCode::SUCCESS),
+        Some("memory-smoke") => memory::smoke_command(rest),
+        Some("memory-bench") => memory::bench_command(rest),
+        Some("memory-summary") => memory::summary_command(rest),
         _ => {
-            eprintln!("usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks>");
+            eprintln!(
+                "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks \
+                 | memory-smoke [...] | memory-bench [...] | memory-summary FILE>"
+            );
             Ok(ExitCode::from(2))
         }
     }
@@ -95,7 +107,10 @@ fn qa(live: bool) -> Result<()> {
     step("memory hooks (real CLI, offline provider)");
     sh("cargo", &["build", "--bins"])?;
     let report = std::env::temp_dir().join(format!("rusty-memory-offline-{}.json", std::process::id()));
-    sh("python3", &["scripts/memory_smoke.py", "--report", &report.to_string_lossy()])?;
+    let smoke = memory::Smoke::new(root().join("target/debug/rusty"), report);
+    if !memory::smoke(&smoke)? {
+        bail!("the memory smoke failed");
+    }
     step("cloud launcher (offline)");
     sh("python3", &["-m", "unittest", "cloud/test_daytona.py"])?;
     step("hybrid tools + swarms (real Rust CLI, offline SDK/model)");

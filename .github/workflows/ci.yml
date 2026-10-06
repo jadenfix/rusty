@@ -33,7 +33,7 @@ jobs:
       - name: memory hooks, real CLI and offline provider
         run: |
           cargo build --bins --locked
-          python3 scripts/memory_smoke.py --report memory-offline.json
+          cargo xtask memory-smoke --report memory-offline.json
       - name: cloud launcher, offline
         run: python3 -m unittest cloud/test_daytona.py
       - name: hybrid tools and parallel swarms, offline SDK and model
