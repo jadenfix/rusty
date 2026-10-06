@@ -114,13 +114,20 @@ fn run() -> Result<i32> {
         settings.agents.mode = AgentsMode::parse(a).ok_or_else(|| anyhow!("unknown agents mode `{a}`"))?;
     }
 
-    let execution_mode = match &cli.mode {
-        Some(mode) => ExecutionMode::parse(mode)
-            .ok_or_else(|| anyhow!("unknown execution mode `{mode}` (careful, standard, vibe)"))?,
+    // An explicit mode always wins; without one rusty picks per request.
+    let chosen = match cli.mode.as_deref() {
+        Some("auto") => None,
+        Some(mode) => Some(
+            ExecutionMode::parse(mode)
+                .ok_or_else(|| anyhow!("unknown execution mode `{mode}` (auto, careful, standard, vibe)"))?,
+        ),
         None => settings.execution_mode,
     };
-    let model =
-        cli.model.clone().or_else(|| execution_mode.model()).unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
+    let model = cli
+        .model
+        .clone()
+        .or_else(|| chosen.and_then(ExecutionMode::model))
+        .unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
     let client = Arc::new(Client::new(config::base_url(), config::api_keys())?);
     if cli.list_models {
         for m in client.list_models()? {
@@ -147,7 +154,8 @@ fn run() -> Result<i32> {
     agent.model_override = cli.model.clone();
     agent.delegation_override =
         cli.agents.is_some() || settings.delegation_override || settings.agents.mode != AgentsMode::Off;
-    agent.set_execution_mode(execution_mode);
+    agent.set_execution_mode(chosen.unwrap_or(ExecutionMode::Standard));
+    agent.mode_fixed = chosen.is_some();
 
     let sessions = pdir.join("sessions");
     if cli.resume {
@@ -226,6 +234,7 @@ fn print_stats(agent: &Agent, started: Instant) {
         "{}",
         serde_json::json!({
             "execution_mode": agent.execution_mode.name(),
+            "mode_reason": if agent.mode_fixed { "chosen by the user" } else { agent.mode_reason.as_str() },
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
         })
@@ -243,7 +252,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     ui::banner(&ui::BannerInfo {
         model: &agent.model,
         cwd: &tilde(cwd),
-        exec: agent.execution_mode.name(),
+        exec: if agent.mode_fixed { agent.execution_mode.name() } else { "auto" },
         perms: agent.policy.mode.name(),
         agents: agent.agents.mode.name(),
         view: display::view_name(),
@@ -354,30 +363,19 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             println!("  model {}", ui::info(&agent.model));
         }
         "/mode" => {
-            if !rest.is_empty() {
+            if rest == "auto" {
+                agent.mode_fixed = false;
+                settings.execution_mode = None;
+                settings.save();
+            } else if !rest.is_empty() {
                 let mode = ExecutionMode::parse(rest)
-                    .ok_or_else(|| anyhow!("unknown execution mode `{rest}` (careful, standard, vibe)"))?;
+                    .ok_or_else(|| anyhow!("unknown execution mode `{rest}` (auto, careful, standard, vibe)"))?;
                 agent.set_execution_mode(mode);
-                settings.execution_mode = mode;
+                agent.mode_fixed = true;
+                settings.execution_mode = Some(mode);
                 settings.save();
             }
-            let m = agent.execution_mode;
-            let what = match m {
-                ExecutionMode::Careful => "thinks longer, and a read-only checker reviews finished work",
-                ExecutionMode::Standard => "normal effort, checks what it changed",
-                ExecutionMode::Vibe => "quick passes, small checks, may send out a few read-only workers",
-            };
-            println!("  execution {} {}", ui::bold(m.name()), ui::dim(&format!("· {what}")));
-            println!(
-                "  {}",
-                ui::dim(&format!(
-                    "model {} · checker {} · workers {} (≤{})",
-                    agent.model,
-                    m.checker(),
-                    agent.agents.mode.name(),
-                    agent.swarm_cap()
-                ))
-            );
+            print_mode(agent);
         }
         "/models" => {
             for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
@@ -425,7 +423,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 ui::banner(&ui::BannerInfo {
                     model: &agent.model,
                     cwd: &tilde(cwd),
-                    exec: agent.execution_mode.name(),
+                    exec: if agent.mode_fixed { agent.execution_mode.name() } else { "auto" },
                     perms: agent.policy.mode.name(),
                     agents: agent.agents.mode.name(),
                     view: display::view_name(),
@@ -624,11 +622,44 @@ fn swarm_cmd(agent: &mut Agent, rest: &str) {
     );
 }
 
+fn print_mode(agent: &Agent) {
+    if !agent.mode_fixed {
+        let last = if agent.mode_reason.is_empty() {
+            String::new()
+        } else {
+            format!(" · last pick {} ({})", agent.execution_mode.name(), agent.mode_reason)
+        };
+        println!(
+            "  execution {} {}",
+            ui::bold("auto"),
+            ui::dim(&format!("· picks careful, standard or vibe per request{last}"))
+        );
+        return;
+    }
+    let m = agent.execution_mode;
+    let what = match m {
+        ExecutionMode::Careful => "thinks longer, and a read-only checker reviews finished work",
+        ExecutionMode::Standard => "normal effort, checks what it changed",
+        ExecutionMode::Vibe => "quick passes, small checks, may send out a few read-only workers",
+    };
+    println!("  execution {} {}", ui::bold(m.name()), ui::dim(&format!("· {what}")));
+    println!(
+        "  {}",
+        ui::dim(&format!(
+            "model {} · checker {} · workers {} (≤{})",
+            agent.model,
+            m.checker(),
+            agent.agents.mode.name(),
+            agent.swarm_cap()
+        ))
+    );
+}
+
 fn print_settings(agent: &Agent) {
     let a = &agent.agents;
     let rows = [
         ("model", agent.model.clone()),
-        ("execution", agent.execution_mode.name().to_string()),
+        ("execution", if agent.mode_fixed { agent.execution_mode.name().to_string() } else { "auto".to_string() }),
         ("checker", agent.execution_mode.checker().to_string()),
         ("permissions", agent.policy.mode.name().to_string()),
         ("view", display::view_name().to_string()),
@@ -804,7 +835,7 @@ fn print_help(cwd: &Path) {
                 ("/loop [5m] [x10] <prompt>", "repeat on an interval, or let rusty pick the pace"),
                 ("/agents off|sub|swarm|auto", "delegation · default follows /mode · model <id> for subagents"),
                 ("/swarm size|models|spread", "tune parallel workers"),
-                ("/mode careful|standard|vibe", "how hard rusty thinks and checks; permissions stay separate"),
+                ("/mode auto|careful|standard|vibe", "how hard rusty thinks and checks; permissions stay separate"),
                 ("/plan", "the current plan"),
             ],
         ),

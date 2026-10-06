@@ -136,7 +136,7 @@ when rate limited.
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |
 | `/memory` · `/remember` · `/forget` | long-term memory |
 | `/permissions [mode]` | `read-only` `ask` `auto` `yolo` · `allow` · `deny` · `check <cmd>` |
-| `/mode careful\|standard\|vibe` | how hard rusty thinks and checks its work |
+| `/mode auto\|careful\|standard\|vibe` | how hard rusty thinks and checks its work |
 | `/view default\|verbose\|adhd` | how much you see |
 | `/theme` · `/font` | `rust` `neon` `matrix` `amber` `ice` `mono` · `rust` `block` `thin` `classic` |
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
@@ -149,8 +149,9 @@ That's separate from what it's allowed to do.
 
 | | |
 |---|---|
+| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
 | `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal is checked once. |
-| `standard` | The default. Normal effort, and it checks what it changed. |
+| `standard` | Normal effort, and it checks what it changed. |
 | `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
 
 ```bash
@@ -158,8 +159,9 @@ rusty --mode careful --goal "move the sessions table to the new schema without l
 rusty --mode vibe "sketch a settings page"
 ```
 
-Switch with `/mode careful|standard|vibe`; the choice is saved. `--mode` or
-`RUSTY_MODE` sets it for one run. To use a different model per mode, set
+Switch with `/mode auto|careful|standard|vibe`; the choice is saved, and an
+explicit mode always beats auto. `--mode` or `RUSTY_MODE` sets it for one
+run. To use a different model per mode, set
 `RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL` or `RUSTY_VIBE_MODEL`
 (`--model` and `/model` still win). If you choose `/agents` settings
 yourself, they stick; `/agents default` hands delegation back to the mode.

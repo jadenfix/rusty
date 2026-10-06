@@ -83,6 +83,59 @@ impl ExecutionMode {
     }
 }
 
+/// Picks a starting profile for a request when the user hasn't chosen one,
+/// with a short reason. Only clear signals move it off standard.
+pub fn pick(request: &str) -> (ExecutionMode, String) {
+    let lower = request.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let word = |w: &[&str]| words.iter().any(|x| w.contains(x));
+    let stem = |s: &[&str]| words.iter().any(|x| s.iter().any(|p| x.starts_with(p)));
+    let phrase = |p: &[&str]| p.iter().any(|p| lower.contains(p));
+    let careful: [(&str, bool); 9] = [
+        ("production", word(&["prod", "production", "live"]) && !phrase(&["live reload", "live preview"])),
+        ("a migration", stem(&["migrat", "schema", "backfill"])),
+        ("a deploy", stem(&["deploy", "rollout"]) || word(&["release"])),
+        (
+            "data",
+            word(&["database", "db", "sql", "postgres", "mysql", "redis", "mongo"])
+                || phrase(&["data loss", "user data"]),
+        ),
+        ("money", stem(&["payment", "billing", "invoice", "refund", "charge", "stripe", "ledger"])),
+        (
+            "security",
+            stem(&[
+                "auth",
+                "security",
+                "vulnerab",
+                "secret",
+                "credential",
+                "encrypt",
+                "permission",
+                "password",
+                "token",
+            ]),
+        ),
+        ("infrastructure", stem(&["terraform", "kubernetes", "kubectl", "helm", "infra", "k8s", "dns", "iam"])),
+        ("an incident", stem(&["incident", "outage", "rollback", "hotfix", "postmortem"])),
+        (
+            "you asked for care",
+            stem(&["careful", "critical", "irreversib"]) || phrase(&["don't break", "do not break"]),
+        ),
+    ];
+    let hits: Vec<&str> = careful.iter().filter(|(_, hit)| *hit).map(|(why, _)| *why).collect();
+    if !hits.is_empty() {
+        let shown = hits.iter().take(2).copied().collect::<Vec<_>>().join(" and ");
+        return (ExecutionMode::Careful, format!("mentions {shown}"));
+    }
+    if stem(&["prototyp", "sketch", "spike", "throwaway", "mockup", "playground"])
+        || word(&["quick", "quickly", "rough", "poc", "toy", "scratch", "demo"])
+        || phrase(&["mock up", "proof of concept", "just try"])
+    {
+        return (ExecutionMode::Vibe, "sounds like a quick prototype".into());
+    }
+    (ExecutionMode::Standard, "nothing unusual".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +160,22 @@ mod tests {
         assert_eq!(body["max_tokens"], 16384, "unknown models keep the old cap");
         ExecutionMode::Vibe.apply_inference(&mut body, crate::config::DEFAULT_BASE_URL, crate::config::DEFAULT_MODEL);
         assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn picks_a_profile_from_clear_signals_only() {
+        let p = |s: &str| pick(s).0;
+        assert_eq!(p("add a migration for the orders table"), ExecutionMode::Careful);
+        assert_eq!(p("deploy the api to prod"), ExecutionMode::Careful);
+        assert_eq!(p("fix the stripe refund webhook"), ExecutionMode::Careful);
+        assert_eq!(p("rotate the terraform state bucket"), ExecutionMode::Careful);
+        assert_eq!(p("quick prototype of a settings page"), ExecutionMode::Vibe);
+        assert_eq!(p("sketch a landing page"), ExecutionMode::Vibe);
+        assert_eq!(p("fix the failing parser test"), ExecutionMode::Standard);
+        assert_eq!(p("why is this slow?"), ExecutionMode::Standard);
+        assert_eq!(p("add live reload to the dev server"), ExecutionMode::Standard);
+        // Consequential beats quick: a quick prod fix is still prod.
+        assert_eq!(p("quick hotfix in production"), ExecutionMode::Careful);
+        assert_eq!(pick("deploy the db migration").1, "mentions a migration and a deploy");
     }
 }
