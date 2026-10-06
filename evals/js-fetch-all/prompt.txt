@@ -1,0 +1,1 @@
+node test.js fails. Fix fetchAll in fetch_all.js so it meets the contract in its comment. Don't change test.js.

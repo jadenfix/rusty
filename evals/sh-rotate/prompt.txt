@@ -1,0 +1,1 @@
+rotate.sh is deleting the wrong backups. Fix it so `./rotate.sh DIR N` keeps the N newest backups, judged by the date in the file name, and deletes only older backups. Files in DIR that aren't backups must never be touched, and DIR may contain spaces.

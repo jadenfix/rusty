@@ -1,0 +1,1 @@
+cargo test fails. Fix RingBuffer in src/lib.rs so it does what its doc comments say. Keep the existing tests.
