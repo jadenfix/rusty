@@ -6,13 +6,21 @@ as arguments.
 
 ## Daytona
 
+`rusty-cloud` is a second binary in this crate (`cargo build --bins`). It
+talks to Daytona's REST API directly with the same HTTP client rusty uses; no
+SDK, Python or uv is needed. It reads `DAYTONA_API_KEY` (and optionally
+`DAYTONA_TARGET`) from the environment or a private `.env`;
+`DAYTONA_API_URL` (default `https://app.daytona.io/api`) is honoured only
+from the real environment, so a project's `.env` cannot send your key to
+another host.
+
 ### Choose what runs where
 
 | Entry point | Reasoning and workers | Memory | Files, search, Bash, infra probes |
 |---|---|---|---|
 | `rusty --tools local` | local | local | local |
-| `uv run cloud/daytona.py hybrid ...` | local | local | one Daytona workspace |
-| `uv run cloud/daytona.py run ...` | Daytona | Daytona | Daytona |
+| `rusty-cloud hybrid ...` | local | local | one Daytona workspace |
+| `rusty-cloud run ...` | Daytona | Daytona | Daytona |
 
 `--memory off|on|deep` on the CLI, or `--memory-mode` on the launcher,
 chooses the memory behavior at the agent's location. `deep` may make extra
@@ -31,30 +39,28 @@ Local Rusty lead + read-only workers ─── model endpoint
              │
       local memory hooks
              │
-  authenticated localhost SDK bridge
+  authenticated localhost tool bridge (rusty-cloud)
              │
-     Daytona process API
+     Daytona toolbox API (/process/execute)
              │
   Rust tool endpoint in one shared checkout
 ```
 
-Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-a local Rusty binary and its optional memory companion, `DAYTONA_API_KEY`
-and model credentials in your local environment, and an **already started**
-sandbox with a project checkout and this build of the Linux Rusty binary on
-PATH. The launcher automatically installs its pinned Daytona SDK 0.220.0
-through uv; the core Rust binary adds no SDK crate or Python dependency.
+Requirements: a local `rusty` and `rusty-cloud` (plus the optional memory
+companion), `DAYTONA_API_KEY` and model credentials in your local environment,
+and an **already started** sandbox with a project checkout and this build of
+the Linux Rusty binary on PATH.
 
 ```bash
 cargo build --bins
 # Configure credentials in your shell or private .env; never paste them into flags.
-uv run cloud/daytona.py hybrid \
+target/debug/rusty-cloud hybrid \
     --sandbox <existing-id> --workspace /home/daytona/work \
     --local-binary target/debug/rusty \
     --mode standard --agents swarm --swarm-max 3 --memory-mode on
 # Omit --prompt/--goal for the interactive CLI.
 # Headless run with a local receipt:
-uv run cloud/daytona.py hybrid \
+target/debug/rusty-cloud hybrid \
     --sandbox <existing-id> --workspace /home/daytona/work \
     --agents swarm --swarm-max 3 --memory-mode off \
     --prompt "Audit the modules with three read-only workers, then fix and verify." \
@@ -63,7 +69,7 @@ uv run cloud/daytona.py hybrid \
 
 If you need a fresh environment, `prepare --source` below builds the current
 **committed HEAD**. Create/start a sandbox from the printed snapshot with
-Daytona's dashboard or SDK, then clone the project into it. Those operations
+Daytona's dashboard or API, then clone the project into it. Those operations
 consume cloud credits; `hybrid` performs none of them implicitly. Older Rusty
 snapshots lack tool protocol v1 and must be rebuilt. The bridge handshake
 checks compatibility and resolves the real remote workspace before any model
@@ -72,7 +78,7 @@ request. `DAYTONA_TARGET=eu` selects EU as with the full-cloud launcher.
 Placement controls:
 
 - CLI `--tools local|daytona` and `RUSTY_TOOLS` override the saved default.
-  The SDK launcher supplies the localhost connection required by `daytona`.
+  `rusty-cloud hybrid` supplies the localhost connection required by `daytona`.
 - `/tools` and `/settings` show the current backend and remote workspace.
   `/tools local|daytona` saves the default for the **next** session, without
   moving active work. Missing bridge settings fail clearly, with no local fallback.
@@ -83,11 +89,15 @@ Placement controls:
 - `--mode` and `--permissions` stay independent. Hybrid defaults to `auto`
   permissions; it does not inherit the full-cloud launcher's `--yolo` flag.
 
-The bridge binds only to 127.0.0.1 with a random per-session token, bounded
-requests/responses, bounded concurrent RPCs, no HTTP logs, no redirects, and
-no retries of uncertain writes. It reuses one SDK client and the existing
-Rust HTTP client crate. Each RPC starts a small Rust tool process in the
-sandbox, reusing the same filesystem/shell implementations. Permission checks
+The bridge is a small std::net server bound only to 127.0.0.1 with a random
+256-bit per-session token compared in constant time, 1 MiB request/response
+bounds, at most nine concurrent RPCs (the lead plus eight workers), 5-second
+socket timeouts, no HTTP logs, no redirects, and no retries of uncertain
+writes. Transport errors reach rusty only as a generic message, so nothing
+from the API (URLs, credentials) is echoed. Each RPC runs `rusty --tool-rpc`
+in the sandbox through the toolbox's process API, with the request JSON
+shell-quoted as data on stdin and `RUSTY_NO_DOTENV=1`, reusing the same
+filesystem/shell implementations. Permission checks
 inspect **remote** scripts and branch state, and are checked again before
 execution. Infrastructure target detection, dry-run gates, pre-change capture
 and rollout checks use the remote environment; snapshots are retained privately
@@ -102,45 +112,50 @@ sandbox/workspace. These settings contain no credentials.
 
 Hybrid owns only its local bridge. It does not stop, delete, reset or change
 the lifecycle policy of an attached sandbox. Changes stay in that sandbox;
-commit/export them with your normal Git or Daytona workflow. Ctrl-C stops
-waiting locally, but a remote command may continue until its timeout; inspect
-its outcome before retrying. There is no automatic replay or cancellation
-claim. The sandbox can continue consuming compute credits after the CLI exits.
+commit/export them with your normal Git or Daytona workflow. Ctrl-C reaches
+the local rusty, which stops its turn; the bridge keeps serving. A remote
+command may continue until its timeout; inspect its outcome before retrying.
+There is no automatic replay or cancellation claim. The sandbox can continue
+consuming compute credits after the CLI exits.
 
-### Hybrid checks without cloud spending
+### Checks without cloud spending
 
 ```bash
 cargo xtask qa
-# Or only the hybrid journey after building both binaries:
-python3 -m unittest cloud/test_hybrid.py
-# Optional: repeat the same journeys through the real pinned SDK's HTTP
-# serialization/transport against a localhost Toolbox API. No account needed.
-uv run cloud/sdk_smoke.py
+# Or only the cloud suites:
+cargo test --test cloud --test cloud_hybrid
 ```
 
-These tests run the real Rust CLI, real Rust tools and HTTP bridge in separate
-local controller/sandbox directories with stand-ins for the SDK transport and
-model. Three workers overlap in each profile; forged edits are denied; all
-eight file/search/Bash tools operate remotely; the lead edits and verifies;
-careful has one checker; memory on runs on the controller without hook timeouts.
-Additional checks cover remote script inspection, changed approvals, unavailable
-transport, missing/invalid placement settings, authentication, request bounds,
-attach-only lifecycle behavior, and remote infra gates/snapshots/verification.
-The optional SDK smoke test also passed all ten cases through SDK 0.220.0
-against the localhost Toolbox API fixture. These establish local integration
-behavior, **not** fresh hosted or live-model qualification. No new sandbox or paid model run was used for this feature.
+`tests/cloud_hybrid.rs` runs the real Rust CLI, real Rust tools, the bridge
+and the real REST transport in separate local controller/sandbox directories,
+against a fake Daytona toolbox API and a scripted model. Three workers overlap
+in each profile; forged edits are denied; all eight file/search/Bash tools
+operate remotely; the lead edits and verifies; careful has one checker; memory
+on runs on the controller without hook timeouts. Additional checks cover
+remote script inspection, changed approvals, unavailable transport (with a
+credential canary in the API error), missing/invalid placement settings,
+authentication, request bounds, attach-only lifecycle behavior, the Ctrl-C
+shield, and remote infra gates/snapshots/verification.
+
+`tests/cloud.rs` covers the full-cloud launcher: tracking, detaching and
+re-attaching, export, privacy of exports, and every case that keeps the
+sandbox; then `rusty-cloud` itself against a fake control plane, toolbox and
+object store: sandbox creation payloads (keys only as sandbox variables),
+signed context uploads and snapshot builds for `prepare` and
+`prepare --source`, `prune`, and a hosted swarm journey with the real rusty
+and rusty-memoryd in the stand-in sandbox. These establish local integration
+behavior, **not** live Daytona or live-model qualification.
 
 ### Fully cloud agent
 
-[`cloud/daytona.py`](../cloud/daytona.py) runs rusty in a Daytona sandbox
-and brings the results home.
+`rusty-cloud run` runs rusty in a Daytona sandbox and brings the results home.
 
 ```bash
 export DAYTONA_API_KEY=...                       # or put it in .env
-uv run cloud/daytona.py prepare --source --cpu 2 --memory 4
+rusty-cloud prepare --source --cpu 2 --memory 4
 # Copy the printed snapshot name into the run command.
 # --source builds both Rust binaries remotely from tracked HEAD; no local Docker.
-uv run cloud/daytona.py run --snapshot rusty-<printed-hash> \
+rusty-cloud run --snapshot rusty-<printed-hash> \
     --repo https://github.com/you/project --goal "get the test suite green" --mode careful
 ```
 
@@ -148,7 +163,10 @@ uv run cloud/daytona.py run --snapshot rusty-<printed-hash> \
   digest-pinned `debian:bookworm-slim` with git, ripgrep, python3 and make.
   `--source` builds rusty and rusty-memoryd with pinned Rust 1.90 Alpine,
   strips them, and includes MIT and dependency notices. Only archived HEAD
-  runtime inputs are uploaded; `.env`, `.git` and untracked files stay local.
+  runtime inputs (manifests, `src`, `skills`, `xtask` and the notices) are
+  uploaded; `.env`, `.git` and untracked files stay local. Each `COPY` source
+  goes to Daytona's build-context bucket as a tar, signed with the temporary
+  credentials Daytona issues for it.
   The snapshot fingerprint includes source, recipe, resources and region
   (`rusty-<hash>`), so a run always starts from the same environment, and a
   new build gets a new snapshot. `prune` lists old `rusty-*` snapshots and
@@ -177,8 +195,9 @@ environment variables, never on a command line.
 
 ### NVIDIA endpoint access
 
-The launcher checks endpoint transport before starting the agent, without
-sending a model key. This does not validate the key or model availability.
+The launcher checks endpoint transport (with `curl` in the sandbox) before
+starting the agent, without sending a model key. This does not validate the
+key or model availability.
 Daytona Tier 1/2 blocks general outbound internet and rejects sandbox allowlist
 overrides. NVIDIA's `integrate.api.nvidia.com` is blocked on the tested Tier 2
 account. The documented solution is Tier 3, requiring a one-time $500 wallet
@@ -193,7 +212,28 @@ Set `DAYTONA_TARGET=eu` before preparing and running to use EU. Snapshots are
 region specific; reconnect uses the target saved in the run state. Resources
 belong to `prepare`; each run inherits its snapshot's resources. For an
 existing local Linux binary, `prepare --binary out/rusty` also packages the
-sibling `rusty-memoryd`. The adapter pins Daytona SDK 0.220.0.
+sibling `rusty-memoryd` (run it from the repository root, where `LICENSE` and
+`THIRD_PARTY_NOTICES.txt` are read). Snapshot names are the same ones the
+earlier Python launcher computed, so snapshots it prepared are still found,
+and its `cloud-runs/*/run.json` files still load.
+
+### REST endpoints used
+
+The calls mirror what Daytona's Python SDK 0.220.0 sends, read from its
+source, with `Authorization: Bearer $DAYTONA_API_KEY`:
+
+| Purpose | Request |
+|---|---|
+| snapshot lookup, list, delete | `GET /snapshots/{name}`, `GET /snapshots?page=&limit=`, `DELETE /snapshots/{id}` |
+| snapshot build | `GET /object-storage/push-access`; S3 `HEAD`/`PUT <bucket>/<org>/<md5>/context.tar` (SigV4); `POST /snapshots` with `buildInfo.{dockerfileContent,contextHashes}`; poll `GET /snapshots/{id}`; follow `GET /snapshots/{id}/build-logs-url` |
+| sandbox | `POST /sandbox` (`snapshot`, `env`, `labels`, `autoStopInterval: 0`, `target`); poll `GET /sandbox/{id}` until `started`; `GET /sandbox/{id}/toolbox-proxy-url`; `DELETE /sandbox/{id}` |
+| toolbox, at `<toolbox url>/<sandbox id>` | `POST /process/execute` (`command`, `timeout`; never `envs`); `POST /process/session`; `POST /process/session/{id}/exec` (`runAsync`); `POST /files/upload-v2?path=`; `GET /files/download?path=` |
+
+Two choices differ from the SDK's own wrappers, though both endpoints are in
+its 0.220.0 API client: files move with the single-file `upload-v2` (raw
+body) and `download` endpoints instead of the multipart bulk ones, and each
+context is uploaded with one signed `PUT` rather than a multipart upload.
+None of this has been run against live Daytona yet.
 
 ### Swarm and memory
 
@@ -206,25 +246,21 @@ L1 stays in RAM; scoped L2 is exported separately, never as a raw database/WAL.
 `--model` selects a model on the configured `RUSTY_BASE_URL` endpoint.
 
 ```bash
-uv run cloud/daytona.py run --snapshot rusty-<printed-hash> \
+rusty-cloud run --snapshot rusty-<printed-hash> \
     --repo https://github.com/you/project --ref <commit> \
     --agents swarm --memory-mode on --mode standard \
     --prompt "Use three read-only workers to inspect the components, then implement and verify the fix."
 
-# Hosted deterministic integration: real sandbox and real tools, scripted model.
-uv run cloud/swarm_smoke.py --snapshot rusty-<printed-hash> \
-    --ref <commit> --scripted-provider --report hosted.json
-# Live qualification: same journey, real model endpoint and credentials.
-uv run cloud/swarm_smoke.py --snapshot rusty-<printed-hash> \
-    --ref <commit> --report live.json
+# Live qualification: real sandbox, real model endpoint and credentials.
+RUSTY_CLOUD_SNAPSHOT=rusty-<printed-hash> RUSTY_CLOUD_REF=<commit> \
+    cargo test --test cloud -- --ignored live_swarm_journey
 ```
 
-The scripted journey checks three workers overlap, forged worker writes are
-denied, real reads succeed, the lead writes and verifies files, memory hooks
-meet their deadline, and exports are hash-verified before deletion. Its provider
-runs outside the checkout in a separate Daytona session to avoid queuing the
-CLI behind a long-lived server. It is not evidence of live model quality.
-Live qualification remains blocked until endpoint access and credentials work.
+The offline journey (`hosted_swarm_journey_offline`) checks that three workers
+overlap, forged worker writes are denied, real reads succeed, the lead writes
+and verifies files, memory hooks meet their deadline, and exports are
+hash-verified before deletion. It is not evidence of live model quality, and
+live qualification remains blocked until endpoint access and credentials work.
 
 ## Docker (any cloud, CI, Kubernetes)
 

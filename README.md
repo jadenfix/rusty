@@ -333,13 +333,13 @@ providers somewhere else.
 ## Run it anywhere
 
 Keep reasoning and memory local while executing the entire swarm's tools in
-Daytona. `hybrid` uses the pinned Daytona SDK and attaches to an already
-started sandbox; it never creates or wakes one. The snapshot must contain
+Daytona. `rusty-cloud hybrid` talks to Daytona's REST API and attaches to an
+already started sandbox; it never creates or wakes one. The snapshot must contain
 this version of rusty and the remote workspace must already exist.
 
 ```bash
 cargo build --bins
-uv run cloud/daytona.py hybrid --sandbox <id> --workspace /home/daytona/work \
+target/debug/rusty-cloud hybrid --sandbox <id> --workspace /home/daytona/work \
     --mode standard --agents swarm --swarm-max 3 --memory-mode on \
     --prompt "Use three workers to inspect the project, then fix and verify the bug."
 ```
@@ -347,7 +347,7 @@ uv run cloud/daytona.py hybrid --sandbox <id> --workspace /home/daytona/work \
 `--tools local|daytona` (or `RUSTY_TOOLS`) overrides the saved default.
 `/tools` and `/settings` show the current location; `/tools local|daytona`
 changes the next session, so a goal never changes workspaces halfway through.
-The hybrid launcher supplies the ephemeral local SDK connection for
+The hybrid launcher supplies the ephemeral localhost tool bridge for
 `--tools daytona`. Swarm workers remain read-only and share the lead's remote
 checkout; only the lead edits. No model credentials are copied to the sandbox.
 Cloud compute and model usage still consume credits. Full setup, lifecycle,
@@ -361,7 +361,7 @@ RAM-only L1, packed L2, learning from feedback, live checks and cloud transfer.
 dependency and privacy tradeoffs. Redistributed binaries include `LICENSE` and
 `THIRD_PARTY_NOTICES.txt`.
 [docs/CLOUD.md](docs/CLOUD.md) covers Daytona sandboxes
-(`uv run cloud/daytona.py --repo … --goal …`), AWS, Devbox and Docker.
+(`rusty-cloud run --repo … --goal …`), AWS, Devbox and Docker.
 rusty also plugs into Harbor benchmarks with `--goal`, `--trajectory` and
 `--stats`.
 

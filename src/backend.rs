@@ -1,6 +1,7 @@
 //! Tool placement is independent of reasoning, memory and permissions.
-//! The optional localhost bridge owns the Daytona SDK connection. Rusty sends
-//! tool requests to it; neither model credentials nor local files travel with them.
+//! The optional localhost bridge (`rusty-cloud hybrid`) owns the Daytona
+//! connection. Rusty sends tool requests to it; neither model credentials nor
+//! local files travel with them.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -39,7 +40,7 @@ impl Backend {
             "local" => Ok(Self::Local),
             "daytona" => {
                 let missing = || {
-                    anyhow::anyhow!("Daytona tools need the SDK bridge. Run: uv run cloud/daytona.py hybrid --sandbox ID --workspace /home/daytona/work --local-binary PATH")
+                    anyhow::anyhow!("Daytona tools need the tool bridge. Run: rusty-cloud hybrid --sandbox ID --workspace /home/daytona/work --local-binary PATH")
                 };
                 let raw = std::env::var("RUSTY_TOOL_BRIDGE_URL").map_err(|_| missing())?;
                 let url = reqwest::Url::parse(&raw).context("invalid tool bridge URL")?;
@@ -54,7 +55,7 @@ impl Backend {
                     || url.fragment().is_some()
                     || url.path() != "/"
                 {
-                    bail!("the Daytona SDK bridge must be a localhost HTTP origin");
+                    bail!("the Daytona tool bridge must be a localhost HTTP origin");
                 }
                 let token = std::env::var("RUSTY_TOOL_BRIDGE_TOKEN").map_err(|_| missing())?;
                 if token.len() < 32 {
@@ -251,7 +252,7 @@ impl Bridge {
     }
 }
 
-/// Private stdio endpoint invoked by the SDK bridge inside the sandbox. Never
+/// Private stdio endpoint the tool bridge invokes inside the sandbox. Never
 /// loads dotenv, memory, model clients or UI; it uses the very same Rust tools.
 pub fn serve_rpc() -> Result<i32> {
     let mut bytes = Vec::new();

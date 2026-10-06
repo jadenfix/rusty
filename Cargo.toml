@@ -19,6 +19,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 flate2 = { version = "1", default-features = false, features = ["miniz_oxide"] }
+# Already built for TLS; SHA-256, HMAC and randomness for the cloud launcher.
+ring = "0.17"
 
 [workspace]
 # Repository tooling (`cargo xtask ...`); never shipped.

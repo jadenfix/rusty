@@ -1,6 +1,6 @@
 //! Repository tasks: `cargo xtask <command>`.
 //!
-//!     cargo xtask qa [--live]          fmt, clippy, tests and the offline smoke checks
+//!     cargo xtask qa [--live]          fmt, clippy, tests (incl. the offline cloud suites) and smoke checks
 //!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
@@ -153,10 +153,6 @@ fn qa(live: bool) -> Result<()> {
     if !memory::smoke(&smoke)? {
         bail!("the memory smoke failed");
     }
-    step("cloud launcher (offline)");
-    sh("python3", &["-m", "unittest", "cloud/test_daytona.py"])?;
-    step("hybrid tools + swarms (real Rust CLI, offline SDK/model)");
-    sh("python3", &["-m", "unittest", "cloud/test_hybrid.py"])?;
 
     if live {
         sh("cargo", &["build", "--release"])?;
