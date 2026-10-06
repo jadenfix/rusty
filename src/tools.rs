@@ -68,6 +68,19 @@ pub fn tool(name: &str, description: &str, properties: Value, required: &[&str])
     })
 }
 
+/// Whether a shell command does nothing but print text (`echo`, `printf`,
+/// `exit 0`) it already knows: no variables, redirects, substitutions or
+/// pipes into something else.
+pub fn only_prints(cmd: &str) -> bool {
+    if cmd.trim().is_empty() || cmd.contains(['>', '`', '$']) {
+        return false;
+    }
+    cmd.split(['\n', ';', '&', '|'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .all(|seg| matches!(seg.split_whitespace().next(), Some("echo" | "printf" | "exit" | "true" | ":")))
+}
+
 /// One-line description of a call, shown as its header.
 pub fn summary(name: &str, args: &Value) -> String {
     let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
@@ -531,6 +544,24 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_that_only_prints_is_recognised() {
+        assert!(only_prints("echo \"Task completed: all tests pass.\" && exit 0"));
+        assert!(only_prints("echo done\nprintf '%s\\n' ok"));
+        for cmd in [
+            "",
+            "echo hi > notes.txt",
+            "echo $(rm -rf x)",
+            "echo `id`",
+            "echo $PATH",
+            "echo hi | sh",
+            "echo a && python3 test.py",
+            "cat rotate.sh",
+        ] {
+            assert!(!only_prints(cmd), "{cmd}");
+        }
+    }
 
     #[test]
     fn a_script_header_says_how_much_follows_its_first_line() {

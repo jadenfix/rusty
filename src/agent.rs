@@ -514,6 +514,8 @@ impl Agent {
         // The checker only reviews turns that changed something.
         let mut changed = false;
         let mut failures_in_a_row = 0;
+        // Commands that only print text: announcements no one reads.
+        let mut talk_only = 0;
         let mut empty_replies = 0;
 
         for step in 0..max_steps {
@@ -631,6 +633,20 @@ impl Agent {
                         failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
                         if failures_in_a_row == 3 {
                             self.escalate("three commands failed in a row", &mut d);
+                        }
+                        if crate::tools::only_prints(args["command"].as_str().unwrap_or("")) {
+                            talk_only += 1;
+                            out.push_str(
+                                "\n\nnote: this command only printed text, and no one reads tool output but you. \
+                                 When the work is done, give your answer as a plain reply with no tool call; \
+                                 that ends the turn.",
+                            );
+                            if talk_only == 5 {
+                                outcome = Err(anyhow::anyhow!(
+                                    "stopped after five commands that only printed text; the work may be done, \
+                                     but its summary never came as a reply"
+                                ));
+                            }
                         }
                     }
                     if matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
