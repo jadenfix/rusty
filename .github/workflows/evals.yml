@@ -3,6 +3,10 @@ name: evals
 on:
   workflow_dispatch:
     inputs:
+      evals:
+        description: run the evals (turn off to only record a demo)
+        type: boolean
+        default: true
       models:
         description: space-separated model ids (each needs its provider's key as a secret)
         default: nvidia/nemotron-3-super-120b-a12b
@@ -21,7 +25,7 @@ permissions:
 
 jobs:
   evals:
-    if: inputs.models != ''
+    if: inputs.evals
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
