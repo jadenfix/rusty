@@ -13,6 +13,10 @@ cargo clippy --all-targets -- -D warnings
 step "unit + offline end-to-end tests"
 cargo test
 
+step "memory hooks (real CLI, offline provider)"
+cargo build --bins
+python3 scripts/memory_smoke.py --report "${TMPDIR:-/tmp}/rusty-memory-offline-$$.json"
+
 step "cloud launcher (offline)"
 python3 -m unittest cloud/test_daytona.py
 

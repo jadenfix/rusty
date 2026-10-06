@@ -2,3 +2,5 @@
 .env
 /cloud-runs
 /out
+
+/memory-*.json
