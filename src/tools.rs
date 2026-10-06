@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -50,8 +51,9 @@ pub fn definitions() -> Value {
         tool("outline", "List the definitions (functions, types, classes, impls) in a file or directory with line numbers. Use it to understand structure before reading.", json!({
             "path": {"type": "string"}
         }), &["path"]),
-        tool("bash", "Run a shell command in the working directory and return exit code, stdout and stderr. Use for builds, tests, git, etc. Non-interactive only.", json!({
+        tool("bash", "Run a non-interactive shell command. Each call starts a fresh shell: cd and exported variables do NOT persist. To work in another folder, pass cwd on EVERY call or use absolute paths. Returns exit code, stdout and stderr.", json!({
             "command": {"type": "string"},
+            "cwd": {"type": "string", "description": "Directory for this call only; absolute or relative to the project. No tilde or environment expansion. Defaults to the project directory."},
             "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}
         }), &["command"]),
     ])
@@ -281,12 +283,18 @@ fn search(args: &Value) -> Result<String> {
 fn bash(args: &Value) -> Result<String> {
     let command = arg(args, "command")?;
     let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
-    let (status, stdout, stderr) = run(command, timeout)?;
+    let cwd = match args.get("cwd") {
+        None => std::env::current_dir()?,
+        Some(value) => std::env::current_dir()?.join(value.as_str().context("cwd must be a string")?),
+    };
+    let cwd = cwd.canonicalize().context("bash cwd does not exist")?;
+    let (status, stdout, stderr) = run_in(command, timeout, &cwd)?;
     let mut out = match status {
         Some(code) => format!("exit code: {}\n", code.map_or("signal".into(), |c| c.to_string())),
         None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
         None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
     };
+    let _ = writeln!(out, "working directory: {} (this call only)", cwd.display());
     if !stdout.is_empty() {
         let _ = write!(out, "stdout:\n{stdout}");
     }
@@ -301,9 +309,15 @@ fn bash(args: &Value) -> Result<String> {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
+    run_in(command, timeout, &std::env::current_dir()?)
+}
+
+fn run_in(command: &str, timeout: Duration, cwd: &Path) -> Result<(Option<Option<i32>>, String, String)> {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(command)
+        .current_dir(cwd)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -325,12 +339,25 @@ pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, Str
     });
 
     let start = Instant::now();
+    let mut exited = None;
     let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break Some(s.code());
+        if exited.is_none() {
+            if let Some(s) = child.try_wait()? {
+                exited = Some(s.code());
+            }
+        }
+        // A background child can keep a pipe open after the shell exits.
+        // Its drain remains part of this call's deadline.
+        if exited.is_some() && t_out.is_finished() && t_err.is_finished() {
+            break exited;
         }
         signal::poll_keys();
         if start.elapsed() > timeout || signal::interrupted() {
+            // The shell may be waiting on a child that still owns the output
+            // pipes. Kill its process group so joining the drainers is bounded.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;

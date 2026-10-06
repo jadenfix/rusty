@@ -200,7 +200,23 @@ pub fn classify(tool: &str, args: &Value, cwd: &Path) -> Class {
         "read_file" if credential_file(args["path"].as_str().unwrap_or("")) => {
             risky(format!("reads credentials: {}", args["path"].as_str().unwrap_or("")))
         }
-        "bash" => classify_command(args["command"].as_str().unwrap_or(""), cwd),
+        "bash" => {
+            let mut ctx = Ctx::new(cwd);
+            let location = match args.get("cwd") {
+                None => return classify_command(args["command"].as_str().unwrap_or(""), cwd),
+                Some(value) => {
+                    let Some(path) = value.as_str() else { return risky("bash cwd must be a string") };
+                    let Ok(path) = cwd.join(path).canonicalize() else { return risky("bash cwd cannot be resolved") };
+                    ctx.here = Some(path.clone());
+                    if path.starts_with(cwd) || scratch(&path.join("x")) {
+                        Class::ReadOnly
+                    } else {
+                        risky(format!("runs outside the project: {}", path.display()))
+                    }
+                }
+            };
+            location.max(classify_in(args["command"].as_str().unwrap_or(""), &mut ctx))
+        }
         // Reading, searching, memory and planning tools never need a prompt.
         _ => Class::ReadOnly,
     }
@@ -286,7 +302,11 @@ fn normalize(p: &Path) -> PathBuf {
 /// Somewhere under a temp directory (not the temp directory itself), and
 /// never inside the home directory, whatever TMPDIR says.
 fn scratch(p: &Path) -> bool {
-    if std::env::var("HOME").is_ok_and(|h| !h.is_empty() && p.starts_with(normalize(Path::new(&h)))) {
+    if std::env::var("HOME").is_ok_and(|h| {
+        !h.is_empty()
+            && (p.starts_with(normalize(Path::new(&h)))
+                || Path::new(&h).canonicalize().is_ok_and(|home| p.starts_with(home)))
+    }) {
         return false;
     }
     let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp"), PathBuf::from("/var/tmp")];
