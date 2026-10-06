@@ -333,6 +333,8 @@ impl Agent {
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n\
              - Save durable lessons with remember: build and test commands, conventions, traps, user preferences.\n\
              - If a tool call is denied, don't retry it. Find another way or ask.\n\
+             - Bash calls use fresh shells: cd never changes the next call's directory. To work elsewhere, \
+             use absolute file paths and pass cwd on every Bash call. Do not repeat pwd to try to make cd persist.\n\
              - No flattery, no filler, no apologies. When you finish, say what changed and how you checked it.\n\
              \n\
              Token discipline: every token you pull into context is paid for on every later step. Search before \
@@ -1449,9 +1451,9 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));
         let mut prompt = prompt;
         loop {
-            let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+            let line = match signal::approval_line(&prompt) {
                 Ok(l) => l,
-                Err(rustyline::error::ReadlineError::Interrupted) => {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     signal::trip();
                     return Answer::No(Some("the user pressed ctrl-c to stop".into()));
                 }
@@ -1471,9 +1473,9 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
     }
     println!("  {} {}", ui::warn("?"), why);
     let prompt = format!("  {} ", ui::dim("[y]es  [a]lways  [n]o  or say what to do instead ›"));
-    let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+    let line = match signal::approval_line(&prompt) {
         Ok(l) => l,
-        Err(rustyline::error::ReadlineError::Interrupted) => {
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
             signal::trip();
             return Answer::No(Some("the user pressed ctrl-c to stop".into()));
         }

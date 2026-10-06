@@ -98,3 +98,34 @@ pub fn restore_terminal() {
         }
     }
 }
+
+/// Approval uses the terminal's cooked line editing. Creating another
+/// rustyline editor here replaces the REPL's process-wide SIGWINCH handler;
+/// dropping that editor leaves the REPL handler with a closed resize pipe.
+pub fn approval_line(prompt: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    restore_terminal();
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    loop {
+        if interrupted() {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut p, 1, 50) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready > 0 {
+            let mut line = String::new();
+            if std::io::stdin().lock().read_line(&mut line)? == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            return Ok(line);
+        }
+    }
+}
