@@ -72,5 +72,6 @@ The template in `.github/pull_request_template.md` keeps this short.
 ```bash
 cargo xtask qa         # fmt, clippy -D warnings, unit and end-to-end tests
 cargo xtask qa --live  # needs NVIDIA_API_KEY: live tests, terminal checks, evals
+cargo xtask eval TASK  # one eval (or a comma-separated list, or multi)
 cargo xtask tty        # terminal UI changes: real-terminal checks, no key needed
 ```

@@ -4,16 +4,26 @@
 //!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
+//!     cargo xtask eval [TASKS]         run the evals against a live model (see eval.rs)
+//!     cargo xtask eval-report FILE...  summarise eval runs from target/evals/*.jsonl
+//!     cargo xtask memory-smoke [--live] [--binary PATH] [--report PATH]
+//!                                      memory hooks through the real CLI
+//!     cargo xtask memory-bench [--binary PATH] [--report PATH]
+//!                                      memory advice latency, 512 lessons
+//!     cargo xtask memory-summary FILE  a smoke receipt as a Markdown table
 //!     cargo xtask tty [CHECK]...       real-terminal checks (see tty.rs)
 //!     cargo xtask tty-capture | tty-inspect
 //!     cargo xtask record SCENE OUT     a demo session as an asciinema cast
 
+mod eval;
 mod json;
+mod memory;
 mod message;
 mod pattern;
 mod provider;
 mod pty;
 mod record;
+mod report;
 mod screen;
 mod tty;
 
@@ -49,6 +59,11 @@ fn run(args: &[String]) -> Result<ExitCode> {
             Ok(verdict(problem))
         }
         Some("install-hooks") => install_hooks().map(|()| ExitCode::SUCCESS),
+        Some("eval") => eval::run(rest.first().map_or("", String::as_str)).map(passed),
+        Some("eval-report") => report::run(rest).map(passed),
+        Some("memory-smoke") => memory::smoke_command(rest),
+        Some("memory-bench") => memory::bench_command(rest),
+        Some("memory-summary") => memory::summary_command(rest),
         Some("tty") => tty::command(rest),
         Some("tty-capture") => tty::capture(rest),
         Some("tty-inspect") => tty::inspect(rest),
@@ -56,6 +71,8 @@ fn run(args: &[String]) -> Result<ExitCode> {
         _ => {
             eprintln!(
                 "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks\n    \
+                 | eval [TASKS] | eval-report FILE.jsonl...\n    \
+                 | memory-smoke [...] | memory-bench [...] | memory-summary FILE\n    \
                  | tty [ctrl-c|approval|steady]... [--binary PATH] [--live]\n    \
                  | tty-capture --binary PATH --output DIR | tty-inspect DIR\n    \
                  | record SCENE OUT.cast [-- RUSTY ARGS]>"
@@ -72,6 +89,14 @@ fn read_arg(path: &str) -> Result<String> {
         Ok(s)
     } else {
         std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
+    }
+}
+
+fn passed(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -124,7 +149,10 @@ fn qa(live: bool) -> Result<()> {
     step("memory hooks (real CLI, offline provider)");
     sh("cargo", &["build", "--bins"])?;
     let report = std::env::temp_dir().join(format!("rusty-memory-offline-{}.json", std::process::id()));
-    sh("python3", &["scripts/memory_smoke.py", "--report", &report.to_string_lossy()])?;
+    let smoke = memory::Smoke::new(root().join("target/debug/rusty"), report);
+    if !memory::smoke(&smoke)? {
+        bail!("the memory smoke failed");
+    }
     step("cloud launcher (offline)");
     sh("python3", &["-m", "unittest", "cloud/test_daytona.py"])?;
     step("hybrid tools + swarms (real Rust CLI, offline SDK/model)");
@@ -145,7 +173,9 @@ fn qa(live: bool) -> Result<()> {
             bail!("the terminal check failed");
         }
         step("evals");
-        sh("scripts/eval.sh", &[])?;
+        if !eval::run("")? {
+            bail!("the evals failed");
+        }
     }
     println!("\n\x1b[32m✓ qa passed\x1b[0m");
     Ok(())

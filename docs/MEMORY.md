@@ -166,9 +166,13 @@ the exact two-byte note payload, a preserved sentinel, scoped hint injection, me
 hook deadlines and a generous tool/repetition budget.
 
 ```sh
-python3 scripts/memory_smoke.py --live --binary target/release/rusty \
+cargo xtask memory-smoke --live --binary target/release/rusty \
   --report memory-live.json
 ```
+
+`cargo xtask memory-bench` fills a store with 512 lessons and times 100 advice
+calls over the real socket against `target/release/rusty-memoryd`; it passes
+when p95 is under 20 ms and storage under 20 MiB.
 
 The verifiers and receipts stay outside the task directory. Each run records
 wall time, tokens, tools, repeated calls, hook metrics, background model metrics

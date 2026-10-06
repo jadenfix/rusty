@@ -6,7 +6,7 @@
     "scripts": {
       "build": "cargo build --release",
       "test": "cargo test",
-      "qa": "scripts/qa.sh",
+      "qa": "cargo xtask qa",
       "rusty": "cargo run --release --"
     }
   }
