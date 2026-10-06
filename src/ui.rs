@@ -177,22 +177,21 @@ pub fn gradient(s: &str) -> String {
     s.chars().enumerate().map(|(i, c)| fg(lerp(t.from, t.to, i as f32 / n as f32), &c.to_string(), true)).collect()
 }
 
-/// Clears the current terminal line.
-pub fn clear_line() -> &'static str {
-    if tty() {
-        "\r\x1b[2K"
-    } else {
-        ""
-    }
-}
-
 /// Terminal width: the tty's own size, then $COLUMNS, then 100.
 pub fn width() -> usize {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
-        return (ws.ws_col as usize).clamp(40, 300);
+        return (ws.ws_col as usize).clamp(1, 300);
     }
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(100).clamp(40, 300)
+    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(100).clamp(1, 300)
+}
+
+pub fn height() -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0 {
+        return ws.ws_row as usize;
+    }
+    24
 }
 
 // ------------------------------------------------------------------ banner
@@ -517,34 +516,6 @@ pub const VERBS: &[&str] = &[
     "Running the evals",
     "Shipping",
 ];
-
-const FRAMES: &[&str] = &["✶", "✷", "✸", "✹", "✺", "✹", "✸", "✷"];
-
-pub fn spinner_frame(i: usize) -> String {
-    primary(FRAMES[i % FRAMES.len()])
-}
-
-/// A verb with a bright band sweeping across it.
-pub fn shimmer(word: &str, tick: usize) -> String {
-    if level() == 0 {
-        return word.to_string();
-    }
-    let n = word.chars().count();
-    let pos = tick % (n + 8);
-    let t = theme();
-    word.chars()
-        .enumerate()
-        .map(|(i, c)| {
-            let d = (i as isize - pos as isize).unsigned_abs();
-            let color = match d {
-                0 => (255, 255, 255),
-                1 => lerp(t.primary, (255, 255, 255), 0.5),
-                _ => t.primary,
-            };
-            fg(color, &c.to_string(), false)
-        })
-        .collect()
-}
 
 /// Small xorshift seeded from the clock; good enough for picking a verb.
 pub fn rand(n: usize) -> usize {

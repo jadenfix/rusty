@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod display;
 mod execution;
+mod footer;
 mod infra;
 mod llm;
 mod markdown;

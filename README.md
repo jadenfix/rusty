@@ -104,7 +104,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. |
 | **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
 | **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |
-| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a star spinner with rotating verbs, grouped tool lines, rendered markdown. |
+| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a steady geometric status panel with falling diamonds, grouped tool lines, rendered markdown. |
 
 ## Quickstart
 
@@ -342,7 +342,8 @@ src/
   skills.rs       built-in and user skills
   tips.rs         token tips from real usage
   markdown.rs     terminal markdown
-  ui.rs           themes, banner, mission line, spinner
+  ui.rs           themes, banner, mission line
+  footer.rs       steady status panel and falling geometric rail
   execution.rs    careful, standard and vibe profiles, and auto's pick
   infra.rs        live target, dry-run gate, snapshots, audit log, redaction
 ```
@@ -359,3 +360,21 @@ Conventional Commits, and pull requests written by a person, for people. See
 ## License
 
 MIT
+
+The status panel stays beneath the transcript on the normal terminal screen;
+completed output enters ordinary scrollback. The three diamonds fall inside
+the panel instead of moving the entire status line. Terminals narrower than
+31 columns or shorter than eight rows use one compact line. `RUSTY_NO_ANIM=1`
+keeps the rail still; `NO_COLOR=1` and pipes use plain output. No animation
+thread or full-screen terminal framework is involved. Unicode cell measurement
+uses the same `unicode-width` version already used by rustyline.
+
+To capture and inspect the real CLI without model credentials:
+
+```bash
+python3 tests/tty/capture.py --binary target/debug/rusty --output /tmp/rusty-tty
+python3 tests/tty/inspect.py /tmp/rusty-tty
+```
+
+The captures exercise real file writes, Bash results, streamed replies, and
+interactive Ctrl-C recovery through an `expect` PTY at 24/40/80/120 columns.
