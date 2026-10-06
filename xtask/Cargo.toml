@@ -6,4 +6,6 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# killpg: std can only SIGKILL a single child, not SIGTERM its process group.
+libc = "0.2"
 serde_json = "1"
