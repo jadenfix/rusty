@@ -160,7 +160,7 @@ qualification; local shell stand-ins verify the launcher lifecycle.
 
 ## Checks and acceptance evidence
 
-`scripts/qa.sh` includes service tests and a real-CLI offline provider smoke.
+`cargo xtask qa` includes service tests and a real-CLI offline provider smoke.
 The latter verifies `write_file`, `read_file`, `edit_file`, Bash execution,
 the exact two-byte note payload, a preserved sentinel, scoped hint injection, memory off,
 hook deadlines and a generous tool/repetition budget.

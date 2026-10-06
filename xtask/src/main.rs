@@ -1,0 +1,148 @@
+//! Repository tasks: `cargo xtask <command>`.
+//!
+//!     cargo xtask qa [--live]          fmt, clippy, tests and the offline smoke checks
+//!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
+//!     cargo xtask check-body           a pull request description, on stdin
+//!     cargo xtask install-hooks        check every commit message locally
+
+mod message;
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+use anyhow::{bail, Context, Result};
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: &[String]) -> Result<ExitCode> {
+    let rest = args.get(1..).unwrap_or_default();
+    match args.first().map(String::as_str) {
+        Some("qa") => qa(rest.iter().any(|a| a == "--live")).map(|()| ExitCode::SUCCESS),
+        Some("check-message") => {
+            let text = read_arg(rest.first().map_or("-", String::as_str))?;
+            Ok(verdict(message::commit_problem(&text)))
+        }
+        Some("check-body") => {
+            let text = read_arg("-")?;
+            let problem = message::has_attribution(&text)
+                .then(|| "Write the description as yourself; remove tool attribution.".to_string());
+            Ok(verdict(problem))
+        }
+        Some("install-hooks") => install_hooks().map(|()| ExitCode::SUCCESS),
+        _ => {
+            eprintln!("usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks>");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn read_arg(path: &str) -> Result<String> {
+    if path == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
+    }
+}
+
+fn verdict(problem: Option<String>) -> ExitCode {
+    match problem {
+        Some(p) => {
+            eprintln!("{p}");
+            ExitCode::FAILURE
+        }
+        None => ExitCode::SUCCESS,
+    }
+}
+
+pub fn root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the repository").to_path_buf()
+}
+
+fn step(name: &str) {
+    println!("\n\x1b[1m▸ {name}\x1b[0m");
+}
+
+/// Runs a command from the repository root and fails if it does.
+fn sh(program: &str, args: &[&str]) -> Result<()> {
+    let status =
+        Command::new(program).args(args).current_dir(root()).status().with_context(|| format!("starting {program}"))?;
+    if !status.success() {
+        bail!("{program} {} failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
+fn qa(live: bool) -> Result<()> {
+    step("format");
+    sh("cargo", &["fmt", "--all", "--check"])?;
+    step("lint");
+    sh("cargo", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
+    step("unit + offline end-to-end tests");
+    sh("cargo", &["test", "--workspace"])?;
+
+    step("memory hooks (real CLI, offline provider)");
+    sh("cargo", &["build", "--bins"])?;
+    let report = std::env::temp_dir().join(format!("rusty-memory-offline-{}.json", std::process::id()));
+    sh("python3", &["scripts/memory_smoke.py", "--report", &report.to_string_lossy()])?;
+    step("cloud launcher (offline)");
+    sh("python3", &["-m", "unittest", "cloud/test_daytona.py"])?;
+    step("hybrid tools + swarms (real Rust CLI, offline SDK/model)");
+    sh("python3", &["-m", "unittest", "cloud/test_hybrid.py"])?;
+
+    if live {
+        sh("cargo", &["build", "--release"])?;
+        step("live end-to-end tests");
+        sh("cargo", &["test", "--test", "cli", "--", "--ignored", "--test-threads", "4"])?;
+        step("real-terminal ctrl-c");
+        let work = std::env::temp_dir().join(format!("rusty-tty-{}", std::process::id()));
+        std::fs::create_dir_all(&work)?;
+        let script = root().join("tests/tty/ctrl_c.exp");
+        let binary = root().join("target/release/rusty");
+        let status = Command::new("expect").arg(&script).arg(&binary).current_dir(&work).status();
+        let _ = std::fs::remove_dir_all(&work);
+        match status {
+            Ok(s) if !s.success() => bail!("the terminal check failed ({s})"),
+            Ok(_) => {}
+            Err(_) => println!("expect not installed; skipping the terminal check"),
+        }
+        step("evals");
+        sh("scripts/eval.sh", &[])?;
+    }
+    println!("\n\x1b[32m✓ qa passed\x1b[0m");
+    Ok(())
+}
+
+/// Points git at a commit-msg hook that runs `cargo xtask check-message`.
+/// The hook is written into this clone's .git, so nothing but Rust is
+/// committed.
+fn install_hooks() -> Result<()> {
+    let out = Command::new("git").args(["rev-parse", "--git-path", "hooks"]).current_dir(root()).output()?;
+    if !out.status.success() {
+        bail!("not a git checkout");
+    }
+    let dir = root().join(String::from_utf8_lossy(&out.stdout).trim());
+    std::fs::create_dir_all(&dir)?;
+    let hook = dir.join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\nexec cargo xtask check-message \"$1\"\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    }
+    // An older clone may still point at the removed .githooks directory.
+    let _ = Command::new("git").args(["config", "--unset", "core.hooksPath"]).current_dir(root()).status();
+    println!("installed {}", hook.display());
+    Ok(())
+}

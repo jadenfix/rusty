@@ -20,6 +20,10 @@ serde_json = "1"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 flate2 = { version = "1", default-features = false, features = ["miniz_oxide"] }
 
+[workspace]
+# Repository tooling (`cargo xtask ...`); never shipped.
+members = ["xtask"]
+
 [profile.release]
 lto = true
 strip = true
