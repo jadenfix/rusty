@@ -145,15 +145,30 @@ impl Hooks {
         }
         if UnixStream::connect(&socket).is_err() {
             let bin = std::env::current_exe()?.with_file_name("rusty-memoryd");
-            let mut child = Command::new(bin)
+            let mut command = Command::new(bin);
+            command
                 .arg("--home")
                 .arg(home)
                 .process_group(0)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("install rusty-memoryd alongside rusty")?;
+                .stderr(Stdio::null());
+            // A terminal launcher can leave extra pipe descriptors open.
+            // The persistent daemon must not keep those pipes (or terminal
+            // handles) alive after the CLI exits. Only stdio crosses exec.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::sysconf(libc::_SC_OPEN_MAX);
+                    if limit < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for fd in 3..limit.min(i32::MAX as libc::c_long) as i32 {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().context("install rusty-memoryd alongside rusty")?;
             let start = Instant::now();
             loop {
                 if UnixStream::connect(&socket).is_ok() {
