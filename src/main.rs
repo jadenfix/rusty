@@ -4,6 +4,7 @@ mod backend;
 mod config;
 mod context;
 mod display;
+mod doctor;
 mod execution;
 mod footer;
 mod infra;
@@ -93,9 +94,13 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     trajectory: Option<PathBuf>,
 
-    /// List the models your endpoint serves and exit
+    /// List the models your endpoints serve and exit
     #[arg(long)]
     list_models: bool,
+
+    /// Check which providers are set up and reachable, then exit
+    #[arg(long)]
+    doctor: bool,
 
     /// Project directory (defaults to the current directory)
     #[arg(short = 'C', long)]
@@ -157,6 +162,13 @@ fn run() -> Result<i32> {
     };
     let model =
         cli.model.clone().or_else(|| chosen.and_then(ExecutionMode::model)).unwrap_or_else(config::default_model);
+    if cli.doctor {
+        let client = Client::from_env().ok();
+        let rows = doctor::rows(client.as_ref(), &model, true);
+        let (report, ok) = doctor::render(&rows, client.as_ref(), &model);
+        println!("{report}");
+        return Ok(if ok { 0 } else { 1 });
+    }
     let client = Arc::new(Client::from_env()?);
     if cli.list_models {
         for m in client.list_models()? {
@@ -319,6 +331,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         perms: agent.policy.mode.name(),
         agents: agent.agents.mode.name(),
         view: display::view_name(),
+        provider: client.endpoint_for(&agent.model).map(|e| e.provider.name()).unwrap_or("no key"),
         keys: client.key_count(),
         target: &target_line(agent),
     });
@@ -438,7 +451,16 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 agent.model = rest.to_string();
                 agent.model_override = Some(rest.to_string());
             }
-            println!("  model {}", ui::info(&agent.model));
+            match client.endpoint_for(&agent.model) {
+                Ok(ep) => {
+                    println!("  model {} {}", ui::info(&agent.model), ui::dim(&format!("· {}", ep.provider.name())))
+                }
+                Err(_) => {
+                    let p = config::Provider::for_model(&agent.model);
+                    let var = p.key_vars().into_iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or_default();
+                    println!("  model {} {}", ui::info(&agent.model), ui::warn(&format!("· {} needs {var}", p.name())))
+                }
+            }
         }
         "/mode" => {
             if rest == "auto" {
@@ -465,6 +487,10 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 println!("  default tools {rest} · takes effect next session; --tools overrides it");
             }
             println!("  current tools {} · reasoning and memory in this process", agent.backend.summary());
+        }
+        "/doctor" | "/providers" => {
+            let rows = doctor::rows(Some(client), &agent.model, true);
+            println!("{}", doctor::render(&rows, Some(client), &agent.model).0);
         }
         "/models" => {
             for m in client.list_models()?.into_iter().filter(|m| m.contains(rest)) {
@@ -516,6 +542,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                     perms: agent.policy.mode.name(),
                     agents: agent.agents.mode.name(),
                     view: display::view_name(),
+                    provider: client.endpoint_for(&agent.model).map(|e| e.provider.name()).unwrap_or("no key"),
                     keys: client.key_count(),
                     target: &target_line(agent),
                 });
@@ -1016,7 +1043,8 @@ fn print_help(cwd: &Path) {
                 ("/permissions [mode]", "read-only · ask · auto · yolo · allow · deny · check"),
                 ("/target", "the kube context, cloud account, workspace and branch commands will hit"),
                 ("/changes · /audit [n]", "what this session changed in infrastructure · the audit log"),
-                ("/model [id] · /models", "switch or list models"),
+                ("/model [id] · /models", "switch or list models, any provider"),
+                ("/doctor", "which providers are set up and answering"),
                 ("/view default|verbose|adhd", "how much you see"),
                 ("/theme · /font", "themes rust neon matrix amber ice mono · fonts rust block thin classic"),
                 ("/tips · /settings · /exit", ""),

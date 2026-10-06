@@ -16,6 +16,9 @@ use crate::config::Provider;
 use crate::execution::ExecutionMode;
 use crate::ui::truncate;
 
+/// Rounds of retries across every key before a request gives up.
+const ROUNDS: usize = 6;
+
 /// What a background request sends back to the UI thread.
 pub enum Event {
     Reasoning(String),
@@ -98,6 +101,10 @@ impl Client {
 
     pub fn key_count(&self) -> usize {
         self.endpoints.iter().map(|e| e.keys.len()).sum()
+    }
+
+    pub fn endpoints(&self) -> &[Endpoint] {
+        &self.endpoints
     }
 
     /// The endpoint that serves `model`. A model whose provider has no key
@@ -190,23 +197,13 @@ impl Client {
         parse_stream(resp, on)
     }
 
-    /// Model ids from every configured provider, tagged `provider` for the
-    /// non-default ones. A provider that fails to answer is skipped unless
-    /// none answer.
+    /// Model ids from every configured provider. A provider that fails to
+    /// answer is skipped unless none answer.
     pub fn list_models(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut last_err = None;
         for ep in &self.endpoints {
-            let url = match ep.provider {
-                Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
-                _ => format!("{}/models", ep.base_url),
-            };
-            let listed = self.send(ep, &url, None, None).and_then(|resp| {
-                let v: Value = resp.json().context("bad /models response")?;
-                let data = v["data"].as_array().ok_or_else(|| anyhow!("unexpected /models response"))?;
-                Ok(data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect::<Vec<_>>())
-            });
-            match listed {
+            match self.models_of(ep, ROUNDS) {
                 Ok(found) => ids.extend(found),
                 Err(e) => last_err = Some(e),
             }
@@ -221,13 +218,37 @@ impl Client {
         Ok(ids)
     }
 
+    /// One provider's model ids. `rounds` bounds the retries: the doctor
+    /// asks once, so a bad key answers in a second instead of a minute.
+    pub fn models_of(&self, ep: &Endpoint, rounds: usize) -> Result<Vec<String>> {
+        let url = match ep.provider {
+            Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
+            _ => format!("{}/models", ep.base_url),
+        };
+        let v: Value = self.send_rounds(ep, &url, None, None, rounds)?.json().context("bad /models response")?;
+        let data = v["data"].as_array().ok_or_else(|| anyhow!("unexpected /models response"))?;
+        let mut ids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Sends a request, rotating keys and backing off on 429 / 5xx / auth
     /// errors. Rounds wait 2, 4, 8, 16, then 30 seconds (or what the server
     /// asks for in Retry-After), which rides out about a minute of rate limits.
     fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>) -> Result<Response> {
-        const ROUNDS: usize = 6;
+        self.send_rounds(ep, url, body, beta, ROUNDS)
+    }
+
+    fn send_rounds(
+        &self,
+        ep: &Endpoint,
+        url: &str,
+        body: Option<&Value>,
+        beta: Option<&str>,
+        rounds: usize,
+    ) -> Result<Response> {
         let keys = &ep.keys;
-        let attempts = keys.len() * ROUNDS;
+        let attempts = keys.len() * rounds.max(1);
         let mut last_err = String::new();
         let mut retry_after: Option<u64> = None;
         for attempt in 0..attempts {

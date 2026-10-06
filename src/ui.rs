@@ -426,6 +426,8 @@ fn starfield(width: usize) -> String {
 
 pub struct BannerInfo<'a> {
     pub model: &'a str,
+    /// Who serves the model: compatible, anthropic or openai.
+    pub provider: &'a str,
     pub exec: &'a str,
     pub cwd: &'a str,
     pub perms: &'a str,
@@ -463,7 +465,9 @@ pub fn banner(b: &BannerInfo) {
     let sep = dim(" · ");
     println!("  {}", dim(&rule));
     let row = |k: &str, v: String| println!("  {} {}", dim(&format!("{k:<6}")), v);
-    row("model", info(b.model));
+    // The provider tag only when it fits on the row.
+    let fits = 2 + 7 + b.model.chars().count() + 3 + b.provider.chars().count() <= width();
+    row("model", if fits { format!("{}{sep}{}", info(b.model), dim(b.provider)) } else { info(b.model) });
     row("dir", b.cwd.to_string());
     let perms = if b.perms == "yolo" { warn(b.perms) } else { b.perms.to_string() };
     let mut mode = format!("{}{sep}permissions {perms}{sep}agents {}{sep}view {}", bold(b.exec), b.agents, b.view);

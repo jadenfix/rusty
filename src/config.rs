@@ -21,7 +21,7 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::OpenAi, Provider::Anthropic];
+    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::Anthropic, Provider::OpenAi];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -37,7 +37,7 @@ impl Provider {
     /// any other name goes to the compatible endpoint. `RUSTY_PROVIDER`
     /// overrides the guess.
     pub fn for_model(model: &str) -> Provider {
-        if let Some(p) = std::env::var("RUSTY_PROVIDER").ok().and_then(|v| Provider::parse(&v)) {
+        if let Some(p) = env_nonempty("RUSTY_PROVIDER").and_then(|v| Provider::parse(&v)) {
             return p;
         }
         let m = model.trim().to_ascii_lowercase();
@@ -91,8 +91,8 @@ impl Provider {
     pub fn base_url(self) -> String {
         let url = match self {
             Self::Compatible => return base_url(),
-            Self::OpenAi => std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| OPENAI_BASE_URL.to_string()),
-            Self::Anthropic => std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| ANTHROPIC_BASE_URL.to_string()),
+            Self::OpenAi => env_nonempty("OPENAI_BASE_URL").unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
+            Self::Anthropic => env_nonempty("ANTHROPIC_BASE_URL").unwrap_or_else(|| ANTHROPIC_BASE_URL.to_string()),
         };
         url.trim_end_matches('/').to_string()
     }
@@ -110,7 +110,7 @@ impl Provider {
 /// with a key, in the order compatible (NVIDIA), Anthropic, OpenAI, so an
 /// existing NVIDIA setup behaves exactly as before.
 pub fn default_model() -> String {
-    if let Some(p) = std::env::var("RUSTY_PROVIDER").ok().and_then(|v| Provider::parse(&v)) {
+    if let Some(p) = env_nonempty("RUSTY_PROVIDER").and_then(|v| Provider::parse(&v)) {
         return p.default_model().to_string();
     }
     [Provider::Compatible, Provider::Anthropic, Provider::OpenAi]
@@ -143,11 +143,16 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 pub fn base_url() -> String {
-    std::env::var("RUSTY_BASE_URL")
-        .or_else(|_| std::env::var("NVIDIA_API_BASE"))
-        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    env_nonempty("RUSTY_BASE_URL")
+        .or_else(|| env_nonempty("NVIDIA_API_BASE"))
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+/// A variable's value, treating set-but-empty (`RUSTY_BASE_URL=`) as unset.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// How the agent may delegate work.
