@@ -143,8 +143,18 @@ impl Drop for Slot<'_> {
 
 impl Shared {
     fn acquire(&self) -> Option<Slot<'_>> {
-        self.busy.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < SLOTS).then_some(n + 1)).ok()?;
-        Some(Slot(&self.busy))
+        // A compare-exchange loop: fetch_update is deprecated on newer
+        // toolchains and its replacement is missing on older ones.
+        let mut n = self.busy.load(Ordering::SeqCst);
+        loop {
+            if n >= SLOTS {
+                return None;
+            }
+            match self.busy.compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Slot(&self.busy)),
+                Err(current) => n = current,
+            }
+        }
     }
 
     /// One request per connection. Nothing is logged: no commands, tokens or
