@@ -112,7 +112,8 @@ def run(a,mode,endpoint,requests):
             trace=Path(tmp)/'trajectory.json';before=len(requests);start=time.monotonic()
             args=['--model','offline-scripted','--mode','auto','--agents','off','--memory',mode,'--yolo','--stats','--trajectory',str(trace)]
             if a.cast and mode=='on':
-                recording=dict(env,RUSTY_BIN=str(a.binary),RUSTY_RECORD_TYPE_DELAY='0.008')
+                recording=dict(env,RUSTY_BIN=str(a.binary),RUSTY_RECORD_TYPE_DELAY='0.008',RUSTY_RECORD_TIMEOUT='30')
+                recording.pop('NO_COLOR', None)
                 proc=subprocess.run(['python3',str(ROOT/'scripts/record.py'),'fullstack',str(a.cast.resolve()),'--',*args],cwd=project,env=recording,capture_output=True,text=True,timeout=60)
             else:
                 env['NO_COLOR']='1'

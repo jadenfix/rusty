@@ -136,7 +136,7 @@ def main() -> int:
     for kind, arg in steps:
         if kind == "wait":
             # Match output produced since the last Enter or the last match.
-            deadline = time.time() + float(os.environ.get("RUSTY_RECORD_TIMEOUT", "60"))
+            deadline = time.time() + float(os.environ.get("RUSTY_RECORD_TIMEOUT", "300"))
             while True:
                 raw = re.search(arg, screen[since:])
                 if raw or re.search(arg, ANSI.sub("", screen[since:])):
