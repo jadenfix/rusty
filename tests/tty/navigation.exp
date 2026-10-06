@@ -69,6 +69,17 @@ switch -- $case {
         send -- "instant\r";watch {DONE};ready model-recovered
         send -- "/exit\r"
     }
+    mode-navigation {
+        local "/mode careful"
+        send -- "/models\r"
+        watch {◇ careful/|careful ·}
+        send -- "\x1b";watch {stopped};ready models-cancelled
+        send -- "/loop 30s x2 instant\r";watch {next run in 30s}
+        watch {◇ careful/|careful ·}
+        send -- "\x1b";watch {loop stopped};ready loop-cancelled
+        local "/settings"
+        send -- "/exit\r"
+    }
     quit - quit-short - eof - double-cancel - exit - busy-quit - busy-eof - approval-cancel {
         local "/settings"
         switch -- $case {

@@ -485,6 +485,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 let _ = tx.send(c.list_models());
             });
             let mut d = display::Display::new(false);
+            d.mode(agent.execution_mode);
             d.set_status("listing models".into());
             loop {
                 signal::poll_keys();

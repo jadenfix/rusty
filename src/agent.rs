@@ -1232,6 +1232,7 @@ impl Agent {
             let delay = interval.or(ctl.next_delay).unwrap_or(300);
             println!("{}", ui::dim(&format!("  next run in {delay}s · ctrl-c to stop")));
             let mut wait = Display::new(false);
+            wait.mode(self.execution_mode);
             wait.set_status(format!("next run in {delay}s · Enter to steer"));
             let end = std::time::Instant::now() + std::time::Duration::from_secs(delay);
             while std::time::Instant::now() < end && !signal::interrupted() {
@@ -1280,6 +1281,7 @@ impl Agent {
     /// `/compact [focus]`: summarise now, steered by what the user wants kept.
     pub fn compact(&mut self, focus: Option<&str>) -> Result<()> {
         let mut d = Display::new(false);
+        d.mode(self.execution_mode);
         self.compact_with(&mut d, focus, true)
     }
 

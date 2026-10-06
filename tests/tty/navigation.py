@@ -9,7 +9,7 @@ import subprocess
 import threading
 from input import Provider
 
-CASES=['settings','resume-settings','corrupt-settings','completion-escape','completion-cancel','completion-back','completion-cycle','settings-after-stop','quit','quit-short','eof','double-cancel','exit','busy-quit','busy-eof','approval-cancel']
+CASES=['settings','resume-settings','corrupt-settings','completion-escape','completion-cancel','completion-back','completion-cycle','settings-after-stop','mode-navigation','quit','quit-short','eof','double-cancel','exit','busy-quit','busy-eof','approval-cancel']
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -50,7 +50,7 @@ def main():
                 (dest/'driver.txt').write_text(proc.stdout+proc.stderr)
                 if proc.returncode:raise AssertionError(f'{case}-{cols}x{rows}: {proc.stdout}{proc.stderr}')
                 prompts=[next(m['content'] for m in reversed(r['messages']) if m['role']=='user') for r in Provider.requests[start:]]
-                expected={'settings':['instant'],'settings-after-stop':['hold','hold','instant'],'busy-quit':['hold'],'busy-eof':['hold'],'approval-cancel':['approve']}.get(case,[])
+                expected={'settings':['instant'],'settings-after-stop':['hold','hold','instant'],'mode-navigation':['instant\n\n(Loop run 1; this prompt repeats every 30s.)'],'busy-quit':['hold'],'busy-eof':['hold'],'approval-cancel':['approve']}.get(case,[])
                 assert prompts==expected,(case,prompts)
                 if case in ['settings','settings-after-stop']:
                     saved=json.loads((dest/'home/settings.json').read_text())
