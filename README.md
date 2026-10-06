@@ -21,8 +21,8 @@
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
 ![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-93%20passing-ec7a34)
-![models](https://img.shields.io/badge/models-any%20OpenAI--compatible-6c757d)
+![tests](https://img.shields.io/badge/tests-118%20passing-ec7a34)
+![models](https://img.shields.io/badge/models-NVIDIA%20%C2%B7%20Anthropic%20%C2%B7%20OpenAI%20%C2%B7%20any%20compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
 <img src="docs/demo/hero.gif" alt="rusty finds and fixes two bugs in a small shop app, then runs the tests" width="100%">
@@ -42,8 +42,9 @@ through `rm -rf`. Their memory turns into a junk drawer pasted into every
 prompt. And you find out what they cost when the bill arrives.
 
 rusty is built around fixing exactly those problems. It's one static binary
-with no telemetry, it works with any OpenAI-compatible endpoint, and by default
-it runs on open models hosted by NVIDIA.
+with no telemetry. It runs on open models hosted by NVIDIA by default, talks
+to Claude and GPT models directly, and works with any OpenAI-compatible
+endpoint.
 
 ## See it work
 
@@ -110,7 +111,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 
 ```bash
 git clone https://github.com/jadenfix/rusty && cd rusty
-cp .env.example .env        # add NVIDIA_API_KEY (free at build.nvidia.com)
+cp .env.example .env        # add NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY
 cargo install --path .
 ```
 
@@ -122,9 +123,9 @@ rusty -c                                      # resume the last session here
 ```
 
 Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
-to rusty's `Cargo.toml`. With several keys set (`NVIDIA_API_KEY`,
-`NVIDIA_API_KEY_2`, …), rusty rotates through them and backs off politely
-when rate limited.
+to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
+`OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,
+…), rusty rotates through them and backs off politely when rate limited.
 
 ## Commands
 
@@ -244,7 +245,7 @@ scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `scripts/qa.sh`: fmt, clippy `-D warnings`, 93 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
+| `scripts/qa.sh`: fmt, clippy `-D warnings`, 118 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |
@@ -276,7 +277,29 @@ Anything your endpoint serves, chosen with `--model`, `RUSTY_MODEL` or `/model`.
 | `z-ai/glm-5.3` | strong coder, slow to first token |
 | `openai/gpt-oss-20b` | small and quick; a good swarm worker |
 
+| Anthropic and OpenAI | |
+|---|---|
+| `claude-opus-5-5` | the default when `ANTHROPIC_API_KEY` is the only key; adaptive thinking, effort follows the execution mode |
+| `claude-sonnet-5-5`, `claude-haiku-4-5` | faster and cheaper; Haiku makes a quick swarm worker |
+| `gpt-5` | the default when `OPENAI_API_KEY` is the only key; reasoning effort follows the execution mode |
+
+rusty picks the provider from the model id, per request, so one session can
+mix them: `/model claude-opus-5-5` for the lead and
+`/agents model openai/gpt-oss-20b` for the workers. Bare `claude-*` ids go to
+Anthropic's Messages API, bare `gpt-*` and `o4`-style ids to OpenAI, and
+anything else (including `openai/...` ids on NVIDIA) to the compatible
+endpoint. `RUSTY_PROVIDER=anthropic|openai|compatible` overrides the guess.
+
+On Claude, thinking blocks go back to the API unchanged between turns, and
+since compaction rewrites history, rusty asks the API to drop a thinking
+block whose conversation changed instead of failing the request. On the
+models that support it, a request Claude's safety checks decline is retried
+on Anthropic's recommended fallback model inside the same call.
+
 To use another endpoint, set `RUSTY_BASE_URL`, for example `http://localhost:11434/v1`.
+A `claude-*` or `gpt-*` model with no key of its own goes there too, so a local
+router keeps working. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` point those
+providers somewhere else.
 
 ## Run it anywhere
 

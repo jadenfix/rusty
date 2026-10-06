@@ -73,7 +73,12 @@ impl Sandbox {
             .env_remove("RUSTY_STANDARD_MODEL")
             .env_remove("RUSTY_VIBE_MODEL")
             .env_remove("RUSTY_AGENTS")
-            .env_remove("RUSTY_PERMISSIONS");
+            .env_remove("RUSTY_PERMISSIONS")
+            .env_remove("RUSTY_PROVIDER")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL");
         c
     }
 
@@ -808,13 +813,22 @@ fn execution_mode_cli_and_model_precedence() {
 
 /// A scripted SSE endpoint drives the real loop without paying for inference.
 fn scripted_endpoint(replies: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+    let bodies = replies.into_iter().map(|r| format!("data: {r}\n\ndata: [DONE]\n\n")).collect();
+    let (url, handle) = scripted_sse(bodies);
+    (url, std::thread::spawn(move || handle.join().unwrap().into_iter().map(|(_, body)| body).collect()))
+}
+
+/// Serves each SSE body in turn; returns every request's headers (lower-cased
+/// names) and JSON body.
+#[allow(clippy::type_complexity)]
+fn scripted_sse(bodies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<(String, serde_json::Value)>>) {
     use std::io::{BufRead, BufReader, Read};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for reply in replies {
+        for sse in bodies {
             let start = Instant::now();
             let (mut stream, _) = loop {
                 match listener.accept() {
@@ -830,12 +844,14 @@ fn scripted_endpoint(replies: Vec<serde_json::Value>) -> (String, std::thread::J
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut size = 0;
+            let mut headers = String::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line == "\r\n" {
                     break;
                 }
+                headers.push_str(&line.to_ascii_lowercase());
                 if let Some((key, value)) = line.split_once(':') {
                     if key.eq_ignore_ascii_case("content-length") {
                         size = value.trim().parse().unwrap();
@@ -844,8 +860,7 @@ fn scripted_endpoint(replies: Vec<serde_json::Value>) -> (String, std::thread::J
             }
             let mut body = vec![0; size];
             reader.read_exact(&mut body).unwrap();
-            requests.push(serde_json::from_slice(&body).unwrap());
-            let sse = format!("data: {}\n\ndata: [DONE]\n\n", reply);
+            requests.push((headers, serde_json::from_slice(&body).unwrap()));
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).unwrap();
         }
         requests
@@ -1294,4 +1309,112 @@ fn careful_goal_keeps_its_single_checker_budget_after_resume() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("goal done"));
     assert_eq!(server.join().unwrap().len(), 1, "resume must not purchase a second checker");
+}
+
+/// Anthropic's stream for one turn, from (event type, data) pairs.
+fn anthropic_sse(events: &[serde_json::Value]) -> String {
+    events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
+}
+
+#[test]
+fn claude_models_use_the_messages_api_and_keep_their_thinking() {
+    use serde_json::json;
+    let s = Sandbox::new("anthropic");
+    let first = anthropic_sse(&[
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 50, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "list first"}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-1"}}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"printf from-bash\"}"}}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 20}}),
+        json!({"type": "message_stop"}),
+    ]);
+    let second = anthropic_sse(&[
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 80, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "all done"}}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+    ]);
+    let (url, server) = scripted_sse(vec![first, second]);
+    let out = s
+        .cmd()
+        .env("ANTHROPIC_API_KEY", "offline-anthropic-key")
+        .env("ANTHROPIC_BASE_URL", url.trim_end_matches("/v1"))
+        .args(["--yolo", "--model", "claude-opus-5-5", "--stats", "list the files"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("all done"), "{stdout}");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let (headers, body) = &requests[0];
+    assert!(headers.contains("x-api-key: offline-anthropic-key") && headers.contains("anthropic-version: 2023-06-01"));
+    assert!(!headers.contains("authorization:"), "Anthropic keys never go in a bearer header");
+    assert!(!headers.contains("anthropic-beta"), "betas are only sent to Anthropic's own API");
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["system"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(body["tools"].as_array().unwrap().iter().filter(|t| t["name"] == "bash").count(), 1);
+    let history = &requests[1].1["messages"];
+    let turn = history.as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
+    assert_eq!(turn["content"][0]["signature"], "sig-1", "thinking goes back unchanged");
+    let result = history.as_array().unwrap().last().unwrap();
+    assert_eq!(result["content"][0]["tool_use_id"], "toolu_1");
+    assert!(result["content"][0]["content"].as_str().unwrap().contains("from-bash"));
+    let stats = String::from_utf8_lossy(&out.stderr);
+    assert!(stats.contains("\"prompt\":130"), "{stats}");
+}
+
+#[test]
+fn gpt_models_use_openai_parameters() {
+    let s = Sandbox::new("openai");
+    let bodies = vec![format!("data: {}\n\ndata: [DONE]\n\n", text_reply("hello from gpt"))];
+    let (url, server) = scripted_sse(bodies);
+    let out = s
+        .cmd()
+        .env_remove("NVIDIA_API_KEY")
+        .env("OPENAI_API_KEY", "offline-openai-key")
+        .env("OPENAI_BASE_URL", &url)
+        .args(["--model", "gpt-5", "--mode", "careful", "say hello"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello from gpt"));
+    let requests = server.join().unwrap();
+    let (headers, body) = &requests[0];
+    assert!(headers.contains("authorization: bearer offline-openai-key"));
+    assert_eq!(body["model"], "gpt-5");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("temperature").is_none() && body.get("max_tokens").is_none());
+    assert!(body["max_completion_tokens"].as_u64().unwrap() >= 16384);
+}
+
+#[test]
+fn a_model_without_its_key_says_which_key_to_set() {
+    let s = Sandbox::new("missing-key");
+    let out = s.cmd().args(["--model", "claude-opus-5-5", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+}
+
+#[test]
+fn with_only_an_anthropic_key_claude_is_the_default() {
+    let s = Sandbox::new("default-claude");
+    let mut child = s
+        .cmd()
+        .env_remove("NVIDIA_API_KEY")
+        .env("ANTHROPIC_API_KEY", "offline-anthropic-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/model").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("claude-opus-5-5"), "{text}");
 }

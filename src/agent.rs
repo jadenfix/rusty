@@ -197,11 +197,7 @@ impl Agent {
 
     pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
-        self.model = self
-            .model_override
-            .clone()
-            .or_else(|| mode.model())
-            .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
+        self.model = self.model_override.clone().or_else(|| mode.model()).unwrap_or_else(crate::config::default_model);
         if !self.delegation_override {
             self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
         }
@@ -538,7 +534,7 @@ impl Agent {
             messages.extend(self.history.iter().cloned());
 
             let started = Instant::now();
-            let reply = match self.ask(&mut d, messages, self.tool_defs()) {
+            let mut reply = match self.ask(&mut d, messages, self.tool_defs()) {
                 Ok(r) => r,
                 Err(e) => {
                     // Drop a dangling user message so a retry starts clean.
@@ -575,6 +571,9 @@ impl Agent {
                         .map(|c| json!({"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}))
                         .collect(),
                 );
+            }
+            if let Some(raw) = reply.raw.take() {
+                msg[crate::anthropic::BLOCKS_KEY] = raw;
             }
             self.history.push(msg);
 
