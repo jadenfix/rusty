@@ -623,7 +623,20 @@ impl Agent {
                     let class = crate::permissions::classify(&call.name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
-                        self.escalate(&format!("consequential step ({why})"), &mut d);
+                        // Leaving the project still asks for permission, but a
+                        // pure cd/pwd/list does not justify extra inference.
+                        // Reclassify only the command, with location unrestricted;
+                        // writes, credentials and consequential commands stay risky.
+                        let navigation_only = call.name == "bash"
+                            && (why.starts_with("leaves the project: cd ")
+                                || why.starts_with("runs outside the project: "))
+                            && crate::permissions::classify_command(
+                                args["command"].as_str().unwrap_or(""),
+                                std::path::Path::new("/"),
+                            ) == crate::permissions::Class::ReadOnly;
+                        if !navigation_only {
+                            self.escalate(&format!("consequential step ({why})"), &mut d);
+                        }
                     }
                     let mut out = self.dispatch(call, &mut d);
                     // Only a call that actually ran changes anything.

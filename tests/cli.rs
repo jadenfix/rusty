@@ -1096,6 +1096,24 @@ fn auto_keeps_questions_standard_even_with_a_production_target() {
 }
 
 #[test]
+fn navigation_keeps_standard_inference_without_bypassing_approval() {
+    let s = Sandbox::new("navigation-mode");
+    let (stdout, _, requests) =
+        scripted_run(&s, &["go to the root folder"], vec![bash_reply("cd /"), text_reply("needs approval")]);
+    assert!(stdout.contains("◇ standard") && !stdout.contains("◇ careful"), "{stdout}");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]["messages"].to_string().contains("approval"));
+    assert!(requests[1]["messages"][0]["content"].as_str().unwrap().contains("Execution: standard."));
+    let (stdout, _, requests) = scripted_run(
+        &s,
+        &["inspect the root folder"],
+        vec![tool_reply("bash", serde_json::json!({"command":"pwd", "cwd":"/"})), text_reply("needs approval")],
+    );
+    assert!(!stdout.contains("◇ careful"), "{stdout}");
+    assert!(requests[1]["messages"].to_string().contains("approval"));
+}
+
+#[test]
 fn saved_response_style_reaches_every_request_through_the_real_repl() {
     struct Daemon(std::process::Child, PathBuf);
     impl Drop for Daemon {
