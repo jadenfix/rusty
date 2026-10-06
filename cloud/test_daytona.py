@@ -166,8 +166,30 @@ class LauncherTest(unittest.TestCase):
         self.assertTrue(self.run_quietly(launcher.export, self.remote, self.state)[0])
         dest = Path("cloud-runs/run-1")
         self.assertEqual((dest / "memory.json.gz").read_bytes(), b"compressed-snapshot")
+        self.assertEqual(dest.stat().st_mode & 0o777, 0o700)
+        for item in dest.iterdir():
+            self.assertEqual(item.stat().st_mode & 0o777, 0o600, str(item))
         with tarfile.open(dest / "session.tgz") as t:
             self.assertFalse(any("/memory/" in n for n in t.getnames()))
+
+    def test_missing_trajectory_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        self.run_quietly(launcher.follow, self.remote, self.state, poll=.05)
+        (self.remote.home / "rusty-run/trajectory.json").unlink()
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertFalse(self.state["exported"])
+
+    def test_unknown_exit_preserves_memory_sandbox(self):
+        self.state["memory_mode"] = "on"
+        self.remote.env["FAKE_RUSTY_SLEEP"] = "1"
+        launcher.setup_and_start(self.remote, self.state, ["x"])
+        d = FakeDaytona()
+        self.run_quietly(launcher.finish, d, self.remote, self.state, False)
+        self.assertEqual(d.deleted, [])
+        self.assertEqual(self.state["status"], "running")
 
     def test_missing_memory_export_preserves_cloud_sandbox(self):
         self.state["memory_mode"] = "on"

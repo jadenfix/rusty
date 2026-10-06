@@ -102,10 +102,19 @@ def state_path(run_id: str) -> Path:
     return RUNS / run_id / "run.json"
 
 
+def private_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def save(state: dict) -> None:
     p = state_path(state["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, indent=2) + "\n")
+    private_write(p, (json.dumps(state, indent=2) + "\n").encode())
 
 
 def load(run_id: str) -> dict:
@@ -301,10 +310,10 @@ def export(remote, state: dict) -> bool:
         data = remote.download(f"{RUN}/{name}")
         if data is None:
             continue
-        (dest / name).write_bytes(data)
+        private_write(dest / name, data)
         manifest[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    ok = "patch.diff" in manifest and "out.log" in manifest and memory_ok
+    private_write(dest / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
+    ok = all(name in manifest for name in ["patch.diff", "out.log", "stderr.log", "trajectory.json", "exit"]) and memory_ok
     if state.get("memory_mode") in ("on", "deep"):
         ok = ok and "memory.json.gz" in manifest
     state["exported"] = ok
@@ -316,7 +325,7 @@ def export(remote, state: dict) -> bool:
 def finish(d, remote, state: dict, keep: bool) -> int:
     code = exit_code(remote)
     state["exit_code"] = code
-    state["status"] = "finished"
+    state["status"] = "finished" if code is not None else "running"
     save(state)
     ok = export(remote, state)
     dest = RUNS / state["id"]
@@ -326,8 +335,11 @@ def finish(d, remote, state: dict, keep: bool) -> int:
         reason = "kept (--keep)" if keep else "kept because the export failed"
         print(f"☾ sandbox {state['sandbox']} {reason}", file=sys.stderr)
         return code if code is not None else 1
+    if code is None:
+        print("☾ sandbox kept: no confirmed exit receipt", file=sys.stderr)
+        return 1
     delete_sandbox(d, remote, state)
-    return code if code is not None else 1
+    return code
 
 
 def delete_sandbox(d, remote, state: dict) -> None:
