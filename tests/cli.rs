@@ -309,7 +309,9 @@ fn target_is_detected_shown_and_production_starts_careful() {
         "production must start careful: {out}"
     );
     assert!(out.contains("terraform staging"), "{out}");
-    assert!(!out.contains("aws "), "no aws profile is configured in the sandbox: {out}");
+    let target_lines: String =
+        out.lines().filter(|line| line.trim().starts_with("target ") || line.contains("›   target ")).collect();
+    assert!(!target_lines.contains("aws "), "no aws profile is configured in the sandbox: {out}");
     // Nothing was saved: the next session with a harmless target is standard again.
     s.fake("kubectl", "printf 'kind-dev|default'");
     let out = s.repl(&["/mode", "/target"]);

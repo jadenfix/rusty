@@ -28,8 +28,9 @@ impl Pty {
         let (mut master, mut slave) = (-1, -1);
         // SAFETY: openpty writes two descriptors; the null name, termios and
         // winsize arguments are allowed.
-        let rc =
-            unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+        let rc = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
         if rc != 0 {
             return Err(io::Error::last_os_error()).context("openpty");
         }
