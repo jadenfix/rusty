@@ -17,6 +17,7 @@ mod skills;
 mod tips;
 mod tools;
 mod ui;
+mod verification;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -85,6 +86,14 @@ struct Cli {
     /// Work on this goal until it's done, then exit
     #[arg(long)]
     goal: Option<String>,
+
+    /// Fixed local acceptance command, run before the goal can close
+    #[arg(long, requires = "goal", value_name = "COMMAND")]
+    verify: Option<String>,
+
+    /// Deadline for the fixed acceptance command (1..600 seconds)
+    #[arg(long, requires = "verify", default_value = "120", value_parser = clap::value_parser!(u64).range(1..=600))]
+    verify_timeout: u64,
 
     /// Print a JSON line with token and timing stats to stderr on exit
     #[arg(long)]
@@ -244,7 +253,17 @@ fn run() -> Result<i32> {
     let headless = cli.goal.is_some() || !cli.prompt.is_empty();
     if headless {
         let result = match &cli.goal {
-            Some(goal) => agent.run_goal(Some(goal)),
+            Some(goal) => {
+                if let Some(command) = &cli.verify {
+                    if agent.backend.name() != "local" {
+                        return Err(anyhow!(
+                            "--verify currently requires local tools; remote acceptance is not qualified"
+                        ));
+                    }
+                    agent.goal_check = Some(verification::CheckSpec::new(command, cli.verify_timeout)?);
+                }
+                agent.run_goal(Some(goal))
+            }
             None => {
                 let input = cli.prompt.join(" ");
                 let input = expand_skill(&cwd, &input).unwrap_or(input);
@@ -260,7 +279,14 @@ fn run() -> Result<i32> {
             write_trajectory(&agent, path)?;
         }
         result?;
-        return Ok(if signal::interrupted() { 130 } else { 0 });
+        return Ok(if signal::interrupted() {
+            130
+        } else if cli.verify.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
+        {
+            2
+        } else {
+            0
+        });
     }
 
     repl(&mut agent, &client, &cwd, &mut settings)?;
@@ -285,6 +311,8 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
         "execution_mode": agent.execution_mode.name(),
         "tools_location": agent.backend.summary(),
         "messages": agent.history,
+        "goal": agent.goal,
+        "verification": agent.verification_records,
         "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
     });
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {

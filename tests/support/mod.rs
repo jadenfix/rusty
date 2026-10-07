@@ -25,11 +25,11 @@ pub struct TempDir(pub PathBuf);
 impl TempDir {
     pub fn new(name: &str) -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rusty-cloud-{name}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
+        // macOS's per-user temp path plus the stand-in home exceeds the
+        // Unix socket limit. Use a short root for these offline fixtures.
+        let parent = if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+        let dir =
+            parent.join(format!("rusty-cloud-{name}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir.canonicalize().unwrap())

@@ -336,45 +336,71 @@ fn only_changes_directory(cmd: &str) -> bool {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn bash")?;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = OwnedShell(cmd.spawn().context("failed to spawn bash")?);
 
     // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    let t_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b);
-        b
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
-        b
-    });
+    let so = child.0.stdout.take().unwrap();
+    let se = child.0.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || drain(so));
+    let t_err = std::thread::spawn(move || drain(se));
 
     let start = Instant::now();
     let status = loop {
-        if let Some(s) = child.try_wait()? {
+        if let Some(s) = child.0.try_wait()? {
             break Some(s.code());
         }
         signal::poll_keys();
         if start.elapsed() > timeout || signal::interrupted() {
-            let _ = child.kill();
-            let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    // Kill descendants even when the shell exited first, before joining pipe
+    // readers. A background child must not keep verification alive forever.
+    drop(child);
     let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
     let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
     Ok((status, stdout, stderr))
+}
+
+struct OwnedShell(std::process::Child);
+
+impl Drop for OwnedShell {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn drain(mut pipe: impl Read) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buffer = [0; 8192];
+    let mut truncated = false;
+    while let Ok(n) = pipe.read(&mut buffer) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buffer[..n]);
+        if out.len() > MAX_OUTPUT {
+            out.drain(MAX_OUTPUT / 2..out.len() - MAX_OUTPUT / 2);
+            truncated = true;
+        }
+    }
+    if truncated {
+        out.splice(MAX_OUTPUT / 2..MAX_OUTPUT / 2, b"\n[output truncated]\n".iter().copied());
+    }
+    out
 }
 
 fn has_rg() -> bool {
@@ -559,6 +585,26 @@ fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_is_drained_with_bounded_head_and_tail() {
+        let mut input = std::io::Cursor::new([b"start".as_slice(), &vec![b'x'; 1_000_000], b"end"].concat());
+        let out = drain(&mut input);
+        assert_eq!(input.position(), 1_000_008);
+        assert!(out.starts_with(b"start") && out.ends_with(b"end"));
+        assert!(out.len() < MAX_OUTPUT + 100);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_shell_and_timeout_cannot_leave_descendants_holding_pipes() {
+        for (command, expected) in [("sleep 30 & printf done", Some(Some(0))), ("sleep 30 & wait", None)] {
+            let started = Instant::now();
+            let (status, _, _) = run(command, Duration::from_millis(100)).unwrap();
+            assert_eq!(status, expected);
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+    }
 
     #[test]
     fn a_lone_cd_is_recognised() {

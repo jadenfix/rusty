@@ -130,7 +130,7 @@ cargo install --path .
 ```bash
 rusty                                         # interactive
 rusty "why does the build fail?"              # one shot
-rusty --goal "get cargo test green" --yolo    # unattended until verifiably done
+rusty --goal "get cargo test green" --verify "cargo test" --yolo
 rusty -c                                      # resume the last session here
 rusty --doctor                                # which providers are set up and answering
 ```
@@ -144,6 +144,21 @@ it keeps retrying rate limits and server errors for up to five minutes
 gives up quickly on a key that is refused.
 
 ## Commands
+
+`--goal ... --verify 'command'` pins a local acceptance command chosen by you.
+Rusty runs it after the completion proposal's remaining tools and any careful
+review. A failure, timeout, interruption, denied permission, or source-input
+change keeps the goal open. Use `--verify-timeout 120` to set its deadline
+(1–600 seconds). An unfinished verified goal exits with code 2; Ctrl-C remains
+130. Goals without `--verify` retain their existing completion policy.
+
+The command still obeys permissions. It establishes that the chosen check ran
+successfully, not that it covers every requirement. For criterion integrity,
+use inline assertions or a checker outside the editable workspace. Records in
+sessions and `--trajectory` include observed status and workspace hashes;
+resuming reruns verification rather than trusting saved receipts. See
+[docs/VERIFICATION.md](docs/VERIFICATION.md) for input exclusions, scope, and
+the staged repair/search roadmap.
 
 | | |
 |---|---|

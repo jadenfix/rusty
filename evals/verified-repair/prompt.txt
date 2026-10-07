@@ -1,0 +1,1 @@
+Repair calc.py so add(a, b) adds both numbers. Preserve its name and arguments, handle negative and zero inputs, and keep ordinary integer arithmetic exact. Verify the result before proposing completion.

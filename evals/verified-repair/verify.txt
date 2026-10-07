@@ -1,0 +1,1 @@
+python3 -c 'from pathlib import Path; scope={}; exec(Path("calc.py").read_text(),scope); assert scope["add"](2,3)==5 and scope["add"](-2,3)==1'
