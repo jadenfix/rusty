@@ -97,6 +97,36 @@ fn serve(stream: TcpStream) -> Result<()> {
         } else {
             sse.content("CAPTURE_COMPLETE\n", Some("stop"))?;
         }
+    } else if prompt == "owned-capture" {
+        pause(0.1);
+        if tools == 0 {
+            sse.call(
+                "start",
+                "bash_start",
+                r#"{"command":"sleep 1.5; printf ready > owned-result.txt", "timeout_secs":10}"#,
+            )?;
+        } else if tools < 8 {
+            let handle = messages
+                .iter()
+                .filter(|m| role(m) == "tool")
+                .find_map(|m| {
+                    let record = serde_json::from_str::<serde_json::Value>(&text(m)).ok()?;
+                    record["id"].as_str().map(str::to_string)
+                })
+                .context("no executor activity handle")?;
+            let wait = if tools < 7 { 0 } else { 3 };
+            sse.call(
+                &format!("poll-{tools}"),
+                "bash_wait",
+                &format!("{{\"id\":{},\"wait_secs\":{wait}}}", quote(&handle)),
+            )?;
+        } else {
+            for i in 0..18 {
+                sse.content(&format!("Owned capture line {i:02}: the deadline belongs to the executor.\n"), None)?;
+                pause(0.1);
+            }
+            sse.content("CAPTURE_COMPLETE: collected the actual command result.\n", Some("stop"))?;
+        }
     } else {
         pause(0.35);
         if tools == 0 {

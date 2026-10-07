@@ -1,3 +1,4 @@
+mod activity;
 mod agent;
 mod anthropic;
 mod backend;
@@ -313,6 +314,7 @@ fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
         "messages": agent.history,
         "goal": agent.goal,
         "verification": agent.verification_records,
+        "activities": agent.activities.records(),
         "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
     });
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {

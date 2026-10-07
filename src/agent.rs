@@ -132,6 +132,7 @@ pub struct Agent {
     pub goal_check: Option<CheckSpec>,
     /// Observations are exported, but never reloaded as acceptance authority.
     pub verification_records: Vec<CheckRecord>,
+    pub activities: crate::activity::Activities,
     loop_ctl: Option<LoopCtl>,
     pub agents: AgentsConfig,
     pub tips: bool,
@@ -195,6 +196,7 @@ impl Agent {
             goal: None,
             goal_check: None,
             verification_records: Vec::new(),
+            activities: crate::activity::Activities::default(),
             loop_ctl: None,
             agents: AgentsConfig::default(),
             tips: true,
@@ -400,6 +402,10 @@ impl Agent {
                 s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
             }
         }
+        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
+        if !active.is_empty() {
+            s.push_str(&format!("\nOwned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
+        }
         if !self.plan.is_empty() {
             s.push_str("\nCurrent plan:\n");
             for p in &self.plan {
@@ -429,6 +435,15 @@ impl Agent {
             return Value::Array(defs);
         }
         let t = tools::tool;
+        if self.backend.name() == "local" {
+            defs.push(t("bash_start", "Start a bounded local command while you inspect other files. Returns a session-owned handle. Use bash_wait to collect the real result, or bash_cancel. Pending commands prevent completion and are cancelled at turn end. Same permissions as bash; mutating infrastructure commands must use bash instead.", json!({
+                "command":{"type":"string"}, "timeout_secs":{"type":"integer","minimum":1,"maximum":600,"description":"Fixed lifetime, default 120. Polling cannot extend it."}
+            }), &["command"]));
+            defs.push(t("bash_wait", "Wait for your owned command. Running may legitimately stay unchanged until its fixed deadline. Terminal results include actual exit status and bounded redacted output. This does not start or replay a command.", json!({
+                "id":{"type":"string"}, "wait_secs":{"type":"integer","minimum":0,"maximum":30,"description":"Default 5. Use a nonzero wait to avoid busy polling."}
+            }), &["id"]));
+            defs.push(t("bash_cancel", "Cancel your owned command and reap its ordinary process group. Cannot cancel a foreign process. Completed handles keep their actual result.", json!({"id":{"type":"string"}}), &["id"]));
+        }
         defs.push(t(
             "remember",
             "Save a durable memory for future sessions.",
@@ -634,7 +649,8 @@ impl Agent {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
                     // JSON whitespace/key order must not bypass repeat detection.
                     let signature = format!("{}:{args}", call.name);
-                    let class = crate::permissions::classify(&call.name, &args, &self.cwd);
+                    let policy_name = if call.name == "bash_start" { "bash" } else { &call.name };
+                    let class = crate::permissions::classify(policy_name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
@@ -667,7 +683,9 @@ impl Agent {
                             }
                         }
                     }
-                    if matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
+                    let owned_wait =
+                        call.name == "bash_wait" && self.activities.waiting(args["id"].as_str().unwrap_or(""));
+                    if owned_wait || matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
                         previous_call = None;
                         repeats = 0;
                     } else {
@@ -712,7 +730,10 @@ impl Agent {
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
-                if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
+                let blocked = args["blocked"].as_bool().unwrap_or(false);
+                if !blocked && self.activities.running() > 0 {
+                    self.history.push(json!({"role":"user","content":format!("{}Completion rejected: owned commands are still running. Wait for or cancel them before proposing completion; their output is not verification evidence.", context::NOTE)}));
+                } else if self.checker_owed && !blocked {
                     self.review_completion(&query, &mut d);
                     if signal::interrupted() {
                         outcome = Ok(false);
@@ -733,6 +754,18 @@ impl Agent {
             }
         }
 
+        let cancelled = self.activities.cancel_all(signal::interrupted());
+        if cancelled > 0 {
+            let note = format!("cancelled {cancelled} owned command(s) at turn end; their work is unconfirmed");
+            d.line(&ui::warn(&format!("  {note}")));
+            self.history.push(json!({"role":"user","content":format!("{}{note}. Do not replay a command automatically; inspect its effects before starting again.", context::NOTE)}));
+            if outcome.is_ok()
+                && !signal::interrupted()
+                && !self.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Blocked(_)))
+            {
+                outcome = Err(anyhow::anyhow!(note));
+            }
+        }
         for (tool, n) in &d.stats.tool_tokens {
             *self.totals.by_tool.entry(tool.clone()).or_default() += n;
         }
@@ -812,6 +845,7 @@ impl Agent {
         }
         d.tool(&call.name, &args);
         let result = match call.name.as_str() {
+            "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
             "remember" => Ok(self.remember(
                 args["kind"].as_str().unwrap_or("fact"),
                 args["text"].as_str().unwrap_or(""),
@@ -880,6 +914,37 @@ impl Agent {
             return self.run_bash(args, &approval, d);
         }
         self.backend.execute(name, args, &self.policy, &approval)
+    }
+
+    fn run_activity(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
+        if self.backend.name() != "local" || std::env::current_dir()?.canonicalize()? != self.cwd.canonicalize()? {
+            bail!("owned shell activities need this local workspace; remote lifecycle is not qualified");
+        }
+        let number = |key: &str, default| -> Result<u64> {
+            if args[key].is_null() {
+                return Ok(default);
+            }
+            args[key].as_u64().ok_or_else(|| anyhow::anyhow!("{key} must be a nonnegative integer"))
+        };
+        let record = match name {
+            "bash_start" => {
+                let command = args["command"].as_str().ok_or_else(|| anyhow::anyhow!("missing command"))?;
+                let timeout = number("timeout_secs", 120)?;
+                if command.trim().is_empty() || !(1..=600).contains(&timeout) {
+                    bail!("command must be nonempty and timeout_secs must be 1..600");
+                }
+                if infra::inspect(command).is_some_and(|a| a.mutating) {
+                    bail!("mutating infrastructure commands need the ordinary bash snapshot/verification harness");
+                }
+                if let Authorization::Refused(why) = self.authorize("bash", args, d)? {
+                    return Ok(why);
+                }
+                self.activities.start(command, timeout)?
+            }
+            "bash_wait" => self.activities.wait(args["id"].as_str().unwrap_or(""), number("wait_secs", 5)?)?,
+            _ => self.activities.cancel(args["id"].as_str().unwrap_or(""))?,
+        };
+        Ok(serde_json::to_string(&record)?)
     }
 
     fn authorize(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<Authorization> {
@@ -1463,7 +1528,7 @@ impl Agent {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records});
+        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records()});
         let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {
@@ -1480,6 +1545,10 @@ impl Agent {
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
         self.verification_records.clear();
+        self.activities.cancel_all(false);
+        if v["activities"].as_array().is_some_and(|records| !records.is_empty()) {
+            self.history.push(json!({"role":"user","content":format!("{}Saved shell activity receipts are diagnostic only. No live handles are restored and no command is replayed. Inspect prior effects before explicitly starting new work.", context::NOTE)}));
+        }
         self.session_path = Some(path.to_path_buf());
         Ok(())
     }

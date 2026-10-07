@@ -267,7 +267,7 @@ impl Display {
             }
             "search" | "glob" | "outline" | "list_files" | "recall" => self.stats.searches += 1,
             "edit_file" | "write_file" => self.stats.edits += 1,
-            "bash" => self.stats.commands += 1,
+            "bash" | "bash_start" => self.stats.commands += 1,
             "task" | "swarm" => self.stats.delegated += 1,
             _ => {}
         }
@@ -328,6 +328,21 @@ impl Display {
                 let code = first.trim_start_matches("exit code: ");
                 let mark = if code == "0" { ui::ok("exit 0") } else { ui::err(&format!("exit {code}")) };
                 format!("{mark}{}", ui::dim(&format!(" · {} lines", n.saturating_sub(1))))
+            }
+            "bash_start" | "bash_wait" | "bash_cancel" => {
+                let record: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+                let status = record["status"].as_str().unwrap_or("unknown");
+                if status == "Exited" {
+                    let code = record["exit_code"].as_i64().map_or("signal".into(), |n| n.to_string());
+                    let lines = ["stdout", "stderr"]
+                        .iter()
+                        .map(|k| record[k].as_str().unwrap_or("").lines().count())
+                        .sum::<usize>();
+                    let mark = if code == "0" { ui::ok("exit 0") } else { ui::err(&format!("exit {code}")) };
+                    format!("{mark}{}", ui::dim(&format!(" · {lines} output lines")))
+                } else {
+                    ui::dim(&format!("{} · deadline {}s", status.to_lowercase(), record["timeout_secs"]))
+                }
             }
             _ if n > 1 && v == View::Default => ui::dim(&format!("{} (+{} lines)", ui::truncate(first, 100), n - 1)),
             _ => ui::dim(ui::truncate(first, 140)),
@@ -447,6 +462,9 @@ fn verb_for(name: &str) -> &str {
         "list_files" => "list",
         "task" => "subagent",
         "goal_done" => "goal",
+        "bash_start" => "start",
+        "bash_wait" => "wait",
+        "bash_cancel" => "cancel",
         "loop_next" => "loop",
         other => other,
     }
@@ -464,6 +482,9 @@ fn activity(name: &str, label: &str) -> String {
         "edit_file" => format!("editing {what}"),
         "write_file" => format!("writing {what}"),
         "bash" => format!("running {}", ui::truncate(label, 40)),
+        "bash_start" => format!("starting {}", ui::truncate(label, 40)),
+        "bash_wait" => "waiting for owned command".into(),
+        "bash_cancel" => "cancelling owned command".into(),
         "task" => format!("delegating: {}", ui::truncate(label, 40)),
         "swarm" => "dispatching the swarm".into(),
         "plan" => "planning".into(),

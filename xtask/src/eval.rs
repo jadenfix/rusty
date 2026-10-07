@@ -21,6 +21,8 @@
 //! A single-turn task may include verify.txt with a fixed acceptance command.
 //! It then runs with --goal and --verify; the independent check.sh still
 //! grades the actual result and stays outside the working copy.
+//! EVAL_BINARY selects an already qualified artifact instead of rebuilding it.
+//! Keep its source revision and hash in the experiment's artifact receipt.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -173,17 +175,24 @@ fn number(name: &str, default: u64) -> Result<u64> {
 /// every scored run passed.
 pub fn run(filter: &str) -> Result<bool> {
     let root = crate::root();
-    let status = Command::new("cargo").args(["build", "--release", "-q"]).current_dir(&root).status()?;
-    if !status.success() {
-        bail!("cargo build --release failed ({status})");
-    }
+    let bin = match var("EVAL_BINARY") {
+        Some(path) => std::fs::canonicalize(path).context("EVAL_BINARY must exist")?,
+        None => {
+            let status = Command::new("cargo").args(["build", "--release", "-q"]).current_dir(&root).status()?;
+            if !status.success() {
+                bail!("cargo build --release failed ({status})");
+            }
+            root.join("target/release/rusty")
+        }
+    };
     let limit = number("EVAL_TIMEOUT", 600)?;
     let models = var("EVAL_MODELS").or_else(|| var("RUSTY_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.into());
     let repeats = number("EVAL_REPEATS", 1)?;
     let jobs = number("EVAL_JOBS", 4)?.max(1) as usize;
-    let stamp = stamp(SystemTime::now());
+    let now = SystemTime::now();
+    let stamp = format!("{}-{}-{:09}", stamp(now), std::process::id(), now.duration_since(UNIX_EPOCH)?.subsec_nanos());
     let cfg = Config {
-        bin: root.join("target/release/rusty"),
+        bin,
         limit: Duration::from_secs(limit),
         out: root.join(format!("target/evals/{stamp}.jsonl")),
         logs: root.join(format!("target/evals/{stamp}")),
@@ -191,7 +200,7 @@ pub fn run(filter: &str) -> Result<bool> {
         root,
     };
     std::fs::create_dir_all(&cfg.logs)?;
-    File::create(&cfg.out)?;
+    OpenOptions::new().write(true).create_new(true).open(&cfg.out)?;
 
     let tasks = tasks(&cfg.root.join("evals"), filter)?;
     let mut queue = Vec::new();
@@ -245,6 +254,8 @@ fn agent(
     let (stdout, mut stderr) = (append("stdout")?, append("stderr")?);
     let mut cmd = Command::new(&cfg.bin);
     cmd.args(["--yolo", "--stats"])
+        .arg("--trajectory")
+        .arg(home.join("trajectory.json"))
         .args(args)
         .current_dir(work)
         .env("RUSTY_HOME", home)
@@ -275,6 +286,16 @@ fn agent(
             return Ok(Exit::Done);
         }
         if start.elapsed() >= cfg.limit {
+            // Let the coordinator cancel owned activity groups before a hard
+            // kill. A timeout stays a timeout even if shutdown is graceful.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as i32, libc::SIGINT);
+            }
+            let grace = Instant::now();
+            while grace.elapsed() < Duration::from_secs(3) && child.try_wait()?.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Exit::TimedOut);
@@ -326,9 +347,15 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
 
     let stdout = std::fs::read(home.join("stdout")).unwrap_or_default();
     let stderr = std::fs::read(home.join("stderr")).unwrap_or_default();
+    let functional = check(task, work, home)?;
+    let budget = String::from_utf8_lossy(&stderr)
+        .lines()
+        .any(|l| l.contains("HTTP 402") && l.contains("evaluation budget exhausted"));
     let verdict = if matches!(exit, Exit::TimedOut) {
         "timeout"
-    } else if check(task, work, home)? {
+    } else if budget {
+        "budget"
+    } else if functional {
         "pass"
     } else if [&stdout, &stderr].iter().any(|b| String::from_utf8_lossy(b).split('\n').any(is_infra_line)) {
         "infra"
@@ -338,7 +365,7 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
 
     let dest = cfg.logs.join(model.replace('/', "_")).join(format!("{}.{rep}", task.name));
     std::fs::create_dir_all(&dest)?;
-    for f in ["stdout", "stderr", "check"] {
+    for f in ["stdout", "stderr", "check", "trajectory.json"] {
         let _ = std::fs::copy(home.join(f), dest.join(f));
     }
 
@@ -355,7 +382,7 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
             last_line(&check).into_iter().collect()
         }
         // The endpoint's own words, so a run of these can be diagnosed from the jsonl.
-        "infra" => {
+        "infra" | "budget" => {
             let lines: Vec<String> = [&stdout, &stderr]
                 .iter()
                 .flat_map(|b| {
@@ -366,7 +393,23 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
         }
         _ => Vec::new(),
     };
-    let row = row(&task.name, model, rep, verdict, secs, stats.len(), requests, prompt, completion, &reason);
+    let mut row: Value = serde_json::from_str(&row(
+        &task.name,
+        model,
+        rep,
+        verdict,
+        secs,
+        stats.len(),
+        requests,
+        prompt,
+        completion,
+        &reason,
+    ))?;
+    let goal = stats.last().map(|r| r["goal"].clone()).unwrap_or(Value::Null);
+    row["false_completion"] = Value::Bool(goal == "done" && !functional);
+    row["functional_pass"] = Value::Bool(functional);
+    row["goal"] = goal;
+    row["binary"] = Value::String(cfg.bin.display().to_string());
     {
         let _lock = jsonl.lock().unwrap();
         OpenOptions::new().append(true).open(&cfg.out)?.write_all(format!("{row}\n").as_bytes())?;
