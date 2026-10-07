@@ -17,6 +17,10 @@
 //! EVAL_REPEATS=3 runs each pair three times. EVAL_TIMEOUT (default 600) caps
 //! each rusty process in seconds; EVAL_TRANSCRIPTS=0 drops the miss details
 //! from the log. The summary compares models.
+//!
+//! A single-turn task may include verify.txt with a fixed acceptance command.
+//! It then runs with --goal and --verify; the independent check.sh still
+//! grades the actual result and stays outside the working copy.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -219,6 +223,13 @@ enum Exit {
     TimedOut,
 }
 
+fn single_args<'a>(prompt: &'a str, check: Option<&'a str>) -> Vec<&'a str> {
+    match check {
+        Some(command) => vec!["--goal", prompt, "--verify", command],
+        None => vec![prompt],
+    }
+}
+
 /// Runs one rusty process with a hard time limit, appending to the home's
 /// stdout and stderr. Extra args pass through.
 fn agent(
@@ -303,7 +314,13 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
         run_multi(cfg, task, work, home, model)?
     } else {
         let prompt = std::fs::read_to_string(task.dir.join("prompt.txt"))?;
-        agent(cfg, work, home, model, &[], &[prompt.trim_end_matches('\n')], None)?
+        let check_path = task.dir.join("verify.txt");
+        let check = if check_path.is_file() { Some(std::fs::read_to_string(check_path)?) } else { None };
+        if check.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            bail!("{}: verify.txt must contain a nonempty acceptance command", task.name);
+        }
+        let args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
+        agent(cfg, work, home, model, &[], &args, None)?
     };
     let secs = start.elapsed().as_secs();
 
@@ -566,6 +583,15 @@ pub fn stamp(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_acceptance_uses_goal_mode_without_exposing_the_hidden_check() {
+        assert_eq!(single_args("fix it", None), vec!["fix it"]);
+        assert_eq!(
+            single_args("fix it", Some("python3 test.py")),
+            vec!["--goal", "fix it", "--verify", "python3 test.py"]
+        );
+    }
 
     #[test]
     fn task_selection() {

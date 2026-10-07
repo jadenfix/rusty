@@ -23,6 +23,7 @@ use crate::signal;
 use crate::tips;
 use crate::tools;
 use crate::ui;
+use crate::verification::{self, CheckRecord, CheckSpec};
 use rusty::advisor::{Hooks, Mode as MemoryMode};
 
 const MAX_STEPS: usize = 80;
@@ -49,6 +50,9 @@ pub struct Goal {
     /// One checker attempt per goal, including after saving and resuming.
     #[serde(default)]
     pub checker_used: bool,
+    /// A fixed criterion chosen by the user, not supplied by goal_done.
+    #[serde(default)]
+    pub check: Option<CheckSpec>,
 }
 
 #[derive(Default)]
@@ -56,6 +60,11 @@ struct LoopCtl {
     self_paced: bool,
     next_delay: Option<u64>,
     stop: bool,
+}
+
+enum Authorization {
+    Allowed(Verdict),
+    Refused(String),
 }
 
 /// Token accounting for the session, including delegated work.
@@ -120,6 +129,9 @@ pub struct Agent {
     pub advisor: Option<Hooks>,
     pub plan: Vec<PlanItem>,
     pub goal: Option<Goal>,
+    pub goal_check: Option<CheckSpec>,
+    /// Observations are exported, but never reloaded as acceptance authority.
+    pub verification_records: Vec<CheckRecord>,
     loop_ctl: Option<LoopCtl>,
     pub agents: AgentsConfig,
     pub tips: bool,
@@ -181,6 +193,8 @@ impl Agent {
             advisor: None,
             plan: Vec::new(),
             goal: None,
+            goal_check: None,
+            verification_records: Vec::new(),
             loop_ctl: None,
             agents: AgentsConfig::default(),
             tips: true,
@@ -298,6 +312,7 @@ impl Agent {
         self.history.clear();
         self.plan.clear();
         self.goal = None;
+        self.verification_records.clear();
         self.last_prompt_tokens = 0;
     }
 
@@ -381,6 +396,9 @@ impl Agent {
         }
         if let Some(g) = &self.goal {
             s.push_str(&format!("\nCurrent goal (keep working until it is done and verified): {}\n", g.objective));
+            if let Some(check) = &g.check {
+                s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
+            }
         }
         if !self.plan.is_empty() {
             s.push_str("\nCurrent plan:\n");
@@ -457,7 +475,7 @@ impl Agent {
         if self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active) {
             defs.push(t(
                 "goal_done",
-                "Close the current goal. Call only when it is achieved and verified, or when you are blocked on the user.",
+                "Propose completion after all calls in this reply. A fixed user acceptance command, if set, must pass. Use blocked=true only when you need the user.",
                 json!({
                     "evidence": {"type": "string", "description": "How you verified it, or what you need from the user"},
                     "blocked": {"type": "boolean"}
@@ -694,14 +712,17 @@ impl Agent {
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
-                if self.checker_owed {
+                if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
                     self.review_completion(&query, &mut d);
                     if signal::interrupted() {
                         outcome = Ok(false);
                         break;
                     }
                 } else {
-                    self.close_goal(&args);
+                    let result = self.close_goal(&args, &mut d);
+                    if self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active) {
+                        self.history.push(json!({"role":"user", "content":format!("{}Completion rejected: {result}\nFix the cause before proposing completion again, or explain what blocks the goal.", context::NOTE)}));
+                    }
                 }
             }
             if self.goal.as_ref().is_some_and(|g| g.status != GoalStatus::Active) {
@@ -851,14 +872,25 @@ impl Agent {
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
+        let approval = match self.authorize(name, args, d)? {
+            Authorization::Allowed(approval) => approval,
+            Authorization::Refused(why) => return Ok(why),
+        };
+        if name == "bash" {
+            return self.run_bash(args, &approval, d);
+        }
+        self.backend.execute(name, args, &self.policy, &approval)
+    }
+
+    fn authorize(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<Authorization> {
         let mut approval = self.backend.decide(name, args, &self.policy, &self.cwd)?;
         match approval.clone() {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.refused(name, args, "denied", &why);
-                return Ok(format!(
+                return Ok(Authorization::Refused(format!(
                     "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
-                ));
+                )));
             }
             Verdict::Confirm(why) => {
                 d.pause();
@@ -870,13 +902,15 @@ impl Agent {
                     Answer::Yes | Answer::Always => {}
                     Answer::No(None) => {
                         self.refused(name, args, "declined", &why);
-                        return Ok("the user declined this destructive call. Do not retry it or look for another \
+                        return Ok(Authorization::Refused(
+                            "the user declined this destructive call. Do not retry it or look for another \
                                    route to the same result; ask what they want instead."
-                            .into());
+                                .into(),
+                        ));
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(format!("the user declined this call and said: {fb}"));
+                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
                     }
                 }
             }
@@ -897,19 +931,55 @@ impl Agent {
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
-                        return Ok("the user declined this call. Do not retry it; ask what they want instead.".into());
+                        return Ok(Authorization::Refused(
+                            "the user declined this call. Do not retry it; ask what they want instead.".into(),
+                        ));
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(format!("the user declined this call and said: {fb}"));
+                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
                     }
                 }
             }
         }
-        if name == "bash" {
-            return self.run_bash(args, &approval, d);
+        Ok(Authorization::Allowed(approval))
+    }
+
+    fn check_goal(&mut self, check: &CheckSpec, d: &mut Display) -> Result<CheckRecord> {
+        check.validate()?;
+        if self.backend.name() != "local" || std::env::current_dir()?.canonicalize()? != self.cwd.canonicalize()? {
+            bail!("fixed verification needs the current local workspace; no fallback or replay");
         }
-        self.backend.execute(name, args, &self.policy, &approval)
+        // Infrastructure acceptance already has a separate gate and receipts.
+        // Do not accidentally bypass its dry-run/snapshot/health-check path.
+        if infra::inspect(check.command()).is_some_and(|a| a.mutating) {
+            bail!("fixed acceptance must be a check, not an infrastructure change");
+        }
+        let args = json!({"command":check.command(), "timeout_secs":check.timeout().as_secs()});
+        if let Authorization::Refused(why) = self.authorize("bash", &args, d)? {
+            bail!("{why}");
+        }
+        let before = verification::fingerprint(&self.cwd)?;
+        d.tool("bash", &args);
+        let started = Instant::now();
+        let (status, stdout, stderr) = self.backend.shell(check.command(), check.timeout())?;
+        let output = infra::redact(&format!("stdout:\n{stdout}\nstderr:\n{stderr}")).0;
+        let after = verification::fingerprint(&self.cwd)?;
+        let record = CheckRecord::observed(
+            check,
+            before,
+            after,
+            status,
+            signal::interrupted(),
+            started.elapsed().as_secs_f64(),
+            output,
+        );
+        let summary = record.summary();
+        d.tool_result("bash", &args, &summary, record.passed());
+        self.history.push(
+            json!({"role":"user", "content":format!("{}Runtime acceptance observation:\n{summary}", context::NOTE)}),
+        );
+        Ok(record)
     }
 
     /// A shell command that never ran still gets its audit line.
@@ -1118,16 +1188,28 @@ impl Agent {
     // ------------------------------------------------------------- goal mode
 
     fn finish_goal(&mut self, args: &Value) -> String {
-        if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
-            self.pending_goal = Some(args.clone());
-            return "completion proposed; a read-only checker will review it before the goal closes".into();
-        }
-        self.pending_goal = None;
-        self.close_goal(args)
+        self.pending_goal = Some(args.clone());
+        "completion proposed; acceptance happens after this reply's remaining calls and any required review".into()
     }
 
-    fn close_goal(&mut self, args: &Value) -> String {
+    fn close_goal(&mut self, args: &Value, d: &mut Display) -> String {
         let evidence = args["evidence"].as_str().unwrap_or("").to_string();
+        if !args["blocked"].as_bool().unwrap_or(false) {
+            let check = self.goal.as_ref().and_then(|g| g.check.clone());
+            if let Some(check) = check {
+                match self.check_goal(&check, d) {
+                    Ok(record) => {
+                        let passed = record.passed();
+                        let reason = record.summary();
+                        self.verification_records.push(record);
+                        if !passed {
+                            return reason;
+                        }
+                    }
+                    Err(e) => return format!("fixed verification could not run: {e:#}"),
+                }
+            }
+        }
         let Some(g) = &mut self.goal else { return "no active goal".into() };
         g.status = if args["blocked"].as_bool().unwrap_or(false) {
             GoalStatus::Blocked(evidence)
@@ -1141,11 +1223,13 @@ impl Agent {
     pub fn run_goal(&mut self, objective: Option<&str>) -> Result<()> {
         let mut prompt = match objective {
             Some(obj) => {
+                self.verification_records.clear();
                 self.goal = Some(Goal {
                     objective: obj.to_string(),
                     status: GoalStatus::Active,
                     turns: 0,
                     checker_used: false,
+                    check: self.goal_check.clone(),
                 });
                 format!(
                     "{}New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
@@ -1379,7 +1463,7 @@ impl Agent {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal});
+        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records});
         let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {
@@ -1395,6 +1479,7 @@ impl Agent {
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
+        self.verification_records.clear();
         self.session_path = Some(path.to_path_buf());
         Ok(())
     }

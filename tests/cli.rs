@@ -427,6 +427,219 @@ fn bash_reply(command: &str) -> serde_json::Value {
     tool_reply("bash", serde_json::json!({"command": command}))
 }
 
+const FIXED_CHECK: &str = "python3 -c 'from calc import add; assert add(2,3)==5 and add(-2,3)==1'";
+
+fn verified_run(
+    s: &Sandbox,
+    command: &str,
+    replies: Vec<serde_json::Value>,
+    mode: &str,
+    permissions: &str,
+) -> (Output, serde_json::Value, Vec<serde_json::Value>) {
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        // Same-length edits within one second otherwise reuse Python's
+        // timestamp bytecode cache and confound this runtime counterexample.
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .args([
+            "--mode",
+            mode,
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--permissions",
+            permissions,
+            "--goal",
+            "repair calc.py",
+            "--verify",
+            command,
+            "--verify-timeout",
+            "1",
+            "--stats",
+            "--trajectory",
+        ])
+        .arg(s.home.join("verified.json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(15)))
+        .unwrap();
+    let trace = serde_json::from_str(&std::fs::read_to_string(s.home.join("verified.json")).unwrap()).unwrap();
+    let requests = server.join().unwrap_or_else(|_| {
+        panic!(
+            "script ended early:\n{}\n{}\n{trace}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out, trace, requests)
+}
+
+fn seed_calc(s: &Sandbox) {
+    std::fs::write(s.project.join("calc.py"), "def add(a,b):\n    return a - b\n").unwrap();
+}
+
+fn fix_calc() -> serde_json::Value {
+    tool_reply(
+        "edit_file",
+        serde_json::json!({"path":"calc.py","old_string":"return a - b","new_string":"return a + b"}),
+    )
+}
+
+fn done_reply() -> serde_json::Value {
+    tool_reply("goal_done", serde_json::json!({"evidence":"I verified everything"}))
+}
+
+#[test]
+fn fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
+    let s = Sandbox::new("fixed-goal-positive");
+    seed_calc(&s);
+    let (out, trace, requests) = verified_run(&s, FIXED_CHECK, vec![fix_calc(), done_reply()], "standard", "yolo");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["verification"][0]["input_sha256"], trace["verification"][0]["final_sha256"]);
+    assert_eq!(trace["verification"][0]["exit_code"], 0);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
+    assert!(requests[0]["messages"].to_string().contains("Fixed acceptance command"));
+}
+
+#[test]
+fn fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
+    for case in ["unchecked", "failed", "stale"] {
+        let s = Sandbox::new(&format!("fixed-goal-{case}"));
+        seed_calc(&s);
+        let mut replies = match case {
+            "unchecked" => vec![],
+            "failed" => vec![bash_reply("printf 'exit code: 0\\nall checks passed\\n'; exit 1")],
+            _ => vec![
+                fix_calc(),
+                bash_reply(FIXED_CHECK),
+                tool_reply(
+                    "edit_file",
+                    serde_json::json!({"path":"calc.py","old_string":"return a + b","new_string":"return a - b"}),
+                ),
+            ],
+        };
+        replies.extend([done_reply(), text_reply("Still unresolved")]);
+        let (out, trace, _) = verified_run(&s, FIXED_CHECK, replies, "standard", "yolo");
+        assert_eq!(out.status.code(), Some(2), "{case}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(trace["verification"][0]["outcome"], "Failed", "{case}: {trace}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+    }
+}
+
+#[test]
+fn completion_is_checked_after_all_calls_in_the_same_reply() {
+    let s = Sandbox::new("fixed-goal-batch");
+    seed_calc(&s);
+    let mut batch = done_reply();
+    let regress = serde_json::json!({"index":1,"id":"regress","type":"function","function":{"name":"edit_file","arguments":serde_json::json!({"path":"calc.py","old_string":"return a + b","new_string":"return a - b"}).to_string()}});
+    batch["choices"][0]["delta"]["tool_calls"].as_array_mut().unwrap().push(regress);
+    let (out, trace, _) =
+        verified_run(&s, FIXED_CHECK, vec![fix_calc(), batch, text_reply("unresolved")], "standard", "yolo");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(trace["verification"][0]["outcome"], "Failed");
+}
+
+#[test]
+fn verification_cannot_change_its_inputs_and_then_pass() {
+    let s = Sandbox::new("fixed-goal-mutating-check");
+    seed_calc(&s);
+    let check="python3 -c 'from pathlib import Path; p=Path(\"calc.py\"); p.write_text(p.read_text().replace(\"a - b\",\"a + b\"))'";
+    let (out, trace, _) =
+        verified_run(&s, check, vec![done_reply(), text_reply("needs a fresh check")], "standard", "yolo");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(trace["verification"][0]["outcome"], "WorkspaceChanged");
+    assert_eq!(trace["verification"][0]["exit_code"], 0);
+}
+
+#[test]
+fn fixed_verification_cannot_bypass_permissions() {
+    let s = Sandbox::new("fixed-goal-denied");
+    seed_calc(&s);
+    let (out, trace, _) = verified_run(
+        &s,
+        "printf unauthorized > marker",
+        vec![done_reply(), text_reply("permission denied")],
+        "standard",
+        "read-only",
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!s.project.join("marker").exists());
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 0);
+    assert!(trace["messages"].to_string().contains("denied by permissions"));
+}
+
+#[test]
+fn fixed_verification_is_bounded_and_does_not_accept_timeout() {
+    let s = Sandbox::new("fixed-goal-timeout");
+    seed_calc(&s);
+    let (out, trace, _) =
+        verified_run(&s, "sleep 30 & wait", vec![done_reply(), text_reply("timed out")], "standard", "yolo");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(trace["verification"][0]["outcome"], "TimedOut");
+}
+
+#[test]
+fn blocked_goals_skip_fixed_verification_and_review() {
+    let s = Sandbox::new("fixed-goal-blocked");
+    seed_calc(&s);
+    let blocked = tool_reply("goal_done", serde_json::json!({"evidence":"need input","blocked":true}));
+    let (out, trace, requests) = verified_run(&s, "printf bad > marker", vec![blocked], "careful", "yolo");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(requests.len(), 1);
+    assert!(!s.project.join("marker").exists());
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 0);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"blocked\""));
+}
+
+#[test]
+fn fixed_verification_follows_the_careful_review_and_its_edits() {
+    let s = Sandbox::new("fixed-goal-review");
+    seed_calc(&s);
+    let (out, trace, requests) = verified_run(
+        &s,
+        FIXED_CHECK,
+        vec![done_reply(), text_reply("fix the subtraction"), fix_calc(), done_reply()],
+        "careful",
+        "yolo",
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 4);
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 1);
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+}
+
+#[test]
+fn fixed_verification_rejects_invalid_cli_settings() {
+    let s = Sandbox::new("fixed-goal-flags");
+    for args in [
+        vec!["--verify", "true"],
+        vec!["--goal", "inspect", "--verify", ""],
+        vec!["--goal", "inspect", "--verify", "true", "--verify-timeout", "0"],
+    ] {
+        assert!(!s.cmd().args(args).output().unwrap().status.success());
+    }
+}
+
+#[test]
+fn verified_repair_grader_accepts_oracle_and_rejects_plausible_wrong_patches() {
+    let s = Sandbox::new("verified-repair-grader");
+    let grader = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/verified-repair/hidden.py");
+    for (body, expected) in [("a + b", true), ("a - b", false), ("5", false), ("abs(a) + abs(b)", false)] {
+        std::fs::write(s.project.join("calc.py"), format!("def add(a,b):\n    return {body}\n")).unwrap();
+        let out = Command::new("python3").arg(&grader).current_dir(&s.project).output().unwrap();
+        assert_eq!(out.status.success(), expected, "{body}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!s.project.join("hidden.py").exists());
+    }
+}
+
 #[test]
 fn infrastructure_commands_are_audited_and_summarised() {
     let s = Sandbox::new("audit");
