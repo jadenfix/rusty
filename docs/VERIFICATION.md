@@ -170,9 +170,10 @@ does not restore handles or replay commands. Live runtime state is carried in
 the system prompt independently of compacted conversation text. This increment
 is not a crash-recovery journal: abrupt process death, forced quit, and deliberately
 escaped process groups need an external supervisor/reconciliation boundary.
-It also does not add the planned shared model/token reservation ledger. Those
-foundations and remote activity reconciliation remain required before writable
-candidate search. No general shell isolation is claimed.
+The owned-wait increment by itself does not add model admission accounting;
+the following increment supplies a process-scoped ledger. Durable recovery and
+remote activity reconciliation remain required before writable candidate search.
+No general shell isolation is claimed.
 
 ### Evaluation workflow
 
@@ -208,3 +209,80 @@ Provider errors remain in the all-attempt ledger and are excluded from the
 healthy functional cohort. Development fixtures and host graders do not establish
 held-out repository performance or sandbox containment. A larger search/staging
 experiment still needs matched aggregate budgets and qualified execution isolation.
+
+
+## Shared model admission budget
+
+The client now owns one synchronized ledger across the lead, read-only workers,
+careful reviewer, compaction, all models/providers, key rotations and HTTP/stream
+retries. Each HTTP POST reserves before dispatch. A role or new goal cannot create
+another allowance. `/clear`, `/goal`, `/compact`, mode/model changes and loop turns
+all retain the same process budget. Enable bounded execution with any of
+`--max-requests`, `--max-budget-tokens`, `--budget-secs` or the matching
+`RUSTY_MAX_REQUESTS`, `RUSTY_MAX_BUDGET_TOKENS`, `RUSTY_BUDGET_SECS` variables.
+Unspecified limits in a bounded run default to 256 attempts, 4,000,000 admission
+tokens and 3,600 seconds of provider time. Zero is rejected. Without any budget
+option, legacy execution remains unbounded and its diagnostic snapshot says
+`enabled=false`, `limits=null`. Do not present that snapshot as an enforced cap.
+
+The token reservation is the serialized UTF-8 request size plus the actual
+provider output cap (`max_tokens` or `max_completion_tokens`). This is deliberately
+conservative admission accounting, not an exact tokenizer or a billed-cost cap.
+Only a completed response with both valid nonnegative usage counters refunds the
+unused reservation. Missing/partial usage, HTTP errors, stream failures and
+interruption keep it charged. Known reported usage replaces its reservation;
+unexpected excess is charged, marks an overrun and prevents further dispatch or
+acceptance of that response. Anthropic accounting includes cached input and
+requires final output usage; initial output counters are not treated as final.
+Requests are never refunded. A required careful review that cannot finish within
+the budget halts this root; resuming or replacing the goal cannot skip it.
+Provider-internal processing/fallbacks are not
+separate client HTTP attempts; exact billing remains provider evidence.
+
+The provider deadline bounds retry waits and HTTP response time. The coordinator
+also checks it while waiting for a silent stream and before consuming a reply.
+An error returns through the normal owned-command cleanup path. This is not a
+whole-task wall deadline: tools and the fixed verification command retain their
+own deadlines, and verification consumes no model request. Model catalogue GETs
+are outside the inference budget. Normal local execution or Daytona reasoning
+shares this client ledger; a live Daytona journey has not qualified it.
+
+Stats, trajectories and saved sessions include `model_budget`: admission limits,
+raw requests, known tokens, charged tokens, unknown usage, active attempts,
+role counts, denials, elapsed time and overrun. Existing conversation totals are
+logical successful reply metrics, not all HTTP attempts. Saved budget snapshots
+are diagnostics, not restart authority. A new CLI process (including `--continue`
+or a multi-session eval) starts a new budget. It does not provide a durable
+spending envelope across restarts; use a separate experiment admission bound.
+Durable journal/reconciliation is the next increment.
+
+Deep memory's model runs in another daemon and cannot share this ledger yet.
+A bounded run refuses `--memory deep` rather than allowing unaccounted model
+work; `on`, `off` and legacy memory remain available. Unbounded legacy execution
+retains deep mode, but its daemon usage is outside this ledger. Other already
+running processes are outside this root's scope. Deep mode needs a budget-
+delegation protocol before it can be used with the enforced root budget.
+
+The evaluator now gives timeout, budget and infrastructure outcomes precedence
+over functional passing. A nonzero process exit cannot be `pass` either. The
+independent patch result stays in `functional_pass`, so a correct patch with a
+fatal provider failure remains visible without becoming a healthy success.
+Per-process budget snapshots are retained in eval rows, including multi-session
+runs; they are not summed into a fictitious shared cross-process allowance.
+
+Run the deterministic runtime and scoring counterexamples before live work:
+
+```sh
+cargo xtask qa
+cargo test --test cli root_budget
+RUSTY_MAX_REQUESTS=20 RUSTY_MAX_BUDGET_TOKENS=200000 RUSTY_BUDGET_SECS=120 \
+  EVAL_REPEATS=1 EVAL_JOBS=1 EVAL_TIMEOUT=125 \
+  cargo xtask eval verified-repair,verified-index,verified-invoice
+```
+
+The last command starts paid/provider work with per-process bounds. A whole
+comparison needs a separately declared aggregate request/token admission cap,
+frozen artifacts, randomized order and a ledger preserving every attempt. First
+run small plumbing smokes and a deliberately tiny allowance that must stop with
+an open goal. Require five healthy observations per task/variant before claiming
+architectural benefits, with known and unknown usage reported separately.
