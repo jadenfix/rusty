@@ -219,7 +219,8 @@ fn redact_line(line: &str) -> (String, usize) {
             break;
         }
         let wanted = match expect.take() {
-            Some(Expect::Header) => true,
+            // `Bearer <api key>` in docs is a placeholder, not a credential.
+            Some(Expect::Header) => !sep.is_empty() && sep.trim().is_empty(),
             Some(Expect::Key) => is_assignment(sep),
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
@@ -246,10 +247,11 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '@' | '~' | '%')
 }
 
-/// `=`, `: `, `": "` and the like, ignoring quotes and spaces.
+/// `=`, `: `, `": "` and the like, ignoring quotes and spaces. A bare colon
+/// joins a namespaced name (`secret:access`, `token:read`), not a value.
 fn is_assignment(sep: &str) -> bool {
     let core: String = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
-    core == "=" || core == ":"
+    core == "=" || (core == ":" && sep != ":")
 }
 
 fn secret_key(key: &str) -> bool {
