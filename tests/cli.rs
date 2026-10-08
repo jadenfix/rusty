@@ -2119,3 +2119,37 @@ fn saved_activity_receipts_never_restore_a_live_handle_or_replay_work() {
     assert!(resumed["activities"].as_array().unwrap().is_empty());
     assert!(!s.project.join("marker").exists());
 }
+
+#[test]
+fn a_goal_turn_that_ends_with_a_running_command_continues_the_goal() {
+    let s = Sandbox::new("owned-turn-end-goal");
+    let (url, server) = scripted_endpoint(vec![
+        start_shell("sleep 30; printf late > marker", 30),
+        text_reply("started it; I'll check back"),
+        bash_reply("echo checked"),
+        done_reply(),
+    ]);
+    let path = s.home.join("turn-end.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "2")
+        .args(["--agents", "off", "--memory", "off", "--mode", "standard", "--yolo", "--stats", "--goal", "run it"])
+        .arg("--trajectory")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(15)))
+        .unwrap();
+    let requests = server.join().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2]["messages"].to_string().contains("cancelled 1 owned command(s) at turn end"));
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(trace["activities"][0]["status"], "Cancelled");
+    assert!(!s.project.join("marker").exists());
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
+}

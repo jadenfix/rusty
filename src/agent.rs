@@ -759,9 +759,11 @@ impl Agent {
             let note = format!("cancelled {cancelled} owned command(s) at turn end; their work is unconfirmed");
             d.line(&ui::warn(&format!("  {note}")));
             self.history.push(json!({"role":"user","content":format!("{}{note}. Do not replay a command automatically; inspect its effects before starting again.", context::NOTE)}));
+            // An open goal carries on: its next turn reads the note above. A
+            // plain prompt has no next turn, so its unconfirmed work fails it.
             if outcome.is_ok()
                 && !signal::interrupted()
-                && !self.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Blocked(_)))
+                && !self.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Active | GoalStatus::Blocked(_)))
             {
                 outcome = Err(anyhow::anyhow!(note));
             }
