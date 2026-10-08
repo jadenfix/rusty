@@ -1,6 +1,8 @@
+mod activity;
 mod agent;
 mod anthropic;
 mod backend;
+mod budget;
 mod config;
 mod context;
 mod display;
@@ -95,6 +97,18 @@ struct Cli {
     #[arg(long, requires = "verify", default_value = "120", value_parser = clap::value_parser!(u64).range(1..=600))]
     verify_timeout: u64,
 
+    /// Maximum model HTTP attempts across this process; enables a bounded run (default 256)
+    #[arg(long, env = "RUSTY_MAX_REQUESTS", value_parser = clap::value_parser!(u64).range(1..))]
+    max_requests: Option<u64>,
+
+    /// Conservative token admission cap; enables a bounded run (default 4000000), not a billing cap
+    #[arg(long, env = "RUSTY_MAX_BUDGET_TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    max_budget_tokens: Option<u64>,
+
+    /// Provider deadline; enables a bounded run (default 3600 seconds); tools keep their own deadlines
+    #[arg(long, env = "RUSTY_BUDGET_SECS", value_parser = clap::value_parser!(u64).range(1..=86400))]
+    budget_secs: Option<u64>,
+
     /// Print a JSON line with token and timing stats to stderr on exit
     #[arg(long)]
     stats: bool,
@@ -178,7 +192,16 @@ fn run() -> Result<i32> {
         println!("{report}");
         return Ok(if ok { 0 } else { 1 });
     }
-    let client = Arc::new(Client::from_env()?);
+    let mut client = Client::from_env()?;
+    if cli.max_requests.is_some() || cli.max_budget_tokens.is_some() || cli.budget_secs.is_some() {
+        let defaults = budget::Limits::default();
+        client = client.with_budget(budget::Limits {
+            requests: cli.max_requests.unwrap_or(defaults.requests),
+            tokens: cli.max_budget_tokens.unwrap_or(defaults.tokens),
+            seconds: cli.budget_secs.unwrap_or(defaults.seconds),
+        });
+    }
+    let client = Arc::new(client);
     if cli.list_models {
         for m in client.list_models()? {
             println!("{m}");
@@ -205,6 +228,9 @@ fn run() -> Result<i32> {
     agent.set_backend(backend)?;
     agent.memory_mode = rusty::advisor::Mode::parse(&cli.memory)
         .ok_or_else(|| anyhow!("unknown memory mode `{}` (legacy, off, on, deep)", cli.memory))?;
+    if agent.memory_mode == rusty::advisor::Mode::Deep && client.budget.enabled() {
+        return Err(anyhow!("deep memory runs a separate model process that cannot share this model budget yet; use --memory on, off or legacy"));
+    }
     if matches!(agent.memory_mode, rusty::advisor::Mode::On | rusty::advisor::Mode::Deep) {
         match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_mode) {
             Ok(h) => agent.advisor = Some(h),
@@ -310,6 +336,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "execution_mode": agent.execution_mode.name(),
             "mode_reason": if agent.mode_fixed { "chosen by the user" } else { agent.mode_reason.as_str() },
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
+            "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
             "memory_mode": agent.memory_mode,
             "tools_location": agent.backend.summary(),

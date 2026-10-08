@@ -140,6 +140,7 @@ pub struct Agent {
     pub goal_check: Option<CheckSpec>,
     /// Observations are exported, but never reloaded as acceptance authority.
     pub verification_records: Vec<CheckRecord>,
+    pub activities: crate::activity::Activities,
     loop_ctl: Option<LoopCtl>,
     pub agents: AgentsConfig,
     pub tips: bool,
@@ -151,6 +152,7 @@ pub struct Agent {
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
     is_worker: bool,
+    request_role: &'static str,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -206,6 +208,7 @@ impl Agent {
             goal: None,
             goal_check: None,
             verification_records: Vec::new(),
+            activities: crate::activity::Activities::default(),
             loop_ctl: None,
             agents: AgentsConfig::default(),
             tips: true,
@@ -216,6 +219,7 @@ impl Agent {
             session_path: None,
             infra: infra::Harness::default(),
             is_worker: false,
+            request_role: "lead",
             progress: None,
         }
     }
@@ -290,7 +294,7 @@ impl Agent {
     /// Careful mode's one review: a read-only worker checks the proposed
     /// completion against the real files and the user's constraints. The main
     /// agent owns the fixes; there is no second review.
-    fn review_completion(&mut self, query: &str, d: &mut Display) {
+    fn review_completion(&mut self, query: &str, d: &mut Display) -> Result<()> {
         self.checker_owed = false;
         if let Some(g) = &mut self.goal {
             g.checker_used = true;
@@ -310,13 +314,20 @@ impl Agent {
              Recent steps and the proposed completion:\n{}",
             ui::truncate(&recent, 24_000)
         );
-        let report = self.run_workers(vec![("careful check".into(), prompt)], d);
+        let denied = self.client.budget.denied();
+        let report = self.run_workers(vec![("careful check".into(), prompt)], d, "review");
+        // Ask the ledger, not the report: a reviewer may quote that phrase from a file.
+        if self.client.budget.denied() > denied {
+            self.client.budget.halt();
+            bail!("model budget exhausted: required careful review could not finish");
+        }
         self.history.push(json!({"role": "user", "content": format!(
             "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
              There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
              give your final answer, or call goal_done with evidence.",
             context::NOTE
         )}));
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -411,6 +422,10 @@ impl Agent {
                 s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
             }
         }
+        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
+        if !active.is_empty() {
+            s.push_str(&format!("\nOwned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
+        }
         if !self.plan.is_empty() {
             s.push_str("\nCurrent plan:\n");
             for p in &self.plan {
@@ -440,6 +455,15 @@ impl Agent {
             return Value::Array(defs);
         }
         let t = tools::tool;
+        if self.backend.name() == "local" {
+            defs.push(t("bash_start", "Start a bounded local command while you inspect other files. Returns a session-owned handle. Use bash_wait to collect the real result, or bash_cancel. Pending commands prevent completion and are cancelled at turn end. Same permissions as bash; mutating infrastructure commands must use bash instead.", json!({
+                "command":{"type":"string"}, "timeout_secs":{"type":"integer","minimum":1,"maximum":600,"description":"Fixed lifetime, default 120. Polling cannot extend it."}
+            }), &["command"]));
+            defs.push(t("bash_wait", "Wait for your owned command. Running may legitimately stay unchanged until its fixed deadline. Terminal results include actual exit status and bounded redacted output. This does not start or replay a command.", json!({
+                "id":{"type":"string"}, "wait_secs":{"type":"integer","minimum":0,"maximum":30,"description":"Default 5. Use a nonzero wait to avoid busy polling."}
+            }), &["id"]));
+            defs.push(t("bash_cancel", "Cancel your owned command and reap its ordinary process group. Cannot cancel a foreign process. Completed handles keep their actual result.", json!({"id":{"type":"string"}}), &["id"]));
+        }
         defs.push(t(
             "remember",
             "Save a durable memory for future sessions.",
@@ -627,7 +651,10 @@ impl Agent {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
                 if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal && self.checker_owed {
-                    self.review_completion(&query, &mut d);
+                    if let Err(e) = self.review_completion(&query, &mut d) {
+                        outcome = Err(e);
+                        break;
+                    }
                     if signal::interrupted() {
                         outcome = Ok(false);
                         break;
@@ -645,7 +672,8 @@ impl Agent {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
                     // JSON whitespace/key order must not bypass repeat detection.
                     let signature = format!("{}:{args}", call.name);
-                    let class = crate::permissions::classify(&call.name, &args, &self.cwd);
+                    let policy_name = if call.name == "bash_start" { "bash" } else { &call.name };
+                    let class = crate::permissions::classify(policy_name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
@@ -678,7 +706,9 @@ impl Agent {
                             }
                         }
                     }
-                    if matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
+                    let owned_wait =
+                        call.name == "bash_wait" && self.activities.waiting(args["id"].as_str().unwrap_or(""));
+                    if owned_wait || matches!(call.name.as_str(), "plan" | "recall" | "goal_done" | "loop_next") {
                         previous_call = None;
                         repeats = 0;
                     } else {
@@ -724,8 +754,14 @@ impl Agent {
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
-                if self.checker_owed && !args["blocked"].as_bool().unwrap_or(false) {
-                    self.review_completion(&query, &mut d);
+                let blocked = args["blocked"].as_bool().unwrap_or(false);
+                if !blocked && self.activities.running() > 0 {
+                    self.history.push(json!({"role":"user","content":format!("{}Completion rejected: owned commands are still running. Wait for or cancel them before proposing completion; their output is not verification evidence.", context::NOTE)}));
+                } else if self.checker_owed && !blocked {
+                    if let Err(e) = self.review_completion(&query, &mut d) {
+                        outcome = Err(e);
+                        break;
+                    }
                     if signal::interrupted() {
                         outcome = Ok(false);
                         break;
@@ -745,6 +781,20 @@ impl Agent {
             }
         }
 
+        let cancelled = self.activities.cancel_all(signal::interrupted());
+        if cancelled > 0 {
+            let note = format!("cancelled {cancelled} owned command(s) at turn end; their work is unconfirmed");
+            d.line(&ui::warn(&format!("  {note}")));
+            self.history.push(json!({"role":"user","content":format!("{}{note}. Do not replay a command automatically; inspect its effects before starting again.", context::NOTE)}));
+            // An open goal carries on: its next turn reads the note above. A
+            // plain prompt has no next turn, so its unconfirmed work fails it.
+            if outcome.is_ok()
+                && !signal::interrupted()
+                && !self.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Active | GoalStatus::Blocked(_)))
+            {
+                outcome = Err(anyhow::anyhow!(note));
+            }
+        }
         for (tool, n) in &d.stats.tool_tokens {
             *self.totals.by_tool.entry(tool.clone()).or_default() += n;
         }
@@ -781,7 +831,14 @@ impl Agent {
     /// Sends one request on a background thread and renders it as it streams.
     /// Ctrl-C returns at once with whatever text arrived.
     fn ask(&mut self, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
-        let rx = self.client.start_chat(self.model.clone(), messages, tools, self.temperature, self.execution_mode);
+        let rx = self.client.start_chat(
+            self.model.clone(),
+            messages,
+            tools,
+            self.temperature,
+            self.execution_mode,
+            self.request_role,
+        );
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
             if signal::interrupted() {
@@ -789,12 +846,17 @@ impl Agent {
                 d.end_stream();
                 return Ok(Reply { content, finish_reason: Some("interrupted".into()), ..Default::default() });
             }
+            if let Err(e) = self.client.budget.remaining() {
+                d.end_stream();
+                return Err(e);
+            }
             signal::poll_keys();
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
                 Ok(Event::Done(r)) => {
                     d.end_stream();
+                    self.client.budget.remaining()?;
                     return r;
                 }
                 Err(RecvTimeoutError::Timeout) => d.tick(),
@@ -824,6 +886,7 @@ impl Agent {
         }
         d.tool(&call.name, &args);
         let result = match call.name.as_str() {
+            "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
             "remember" => Ok(self.remember(
                 args["kind"].as_str().unwrap_or("fact"),
                 args["text"].as_str().unwrap_or(""),
@@ -838,13 +901,13 @@ impl Agent {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
                 Ok("plan updated".into())
             }
-            "task" => Ok(self.run_workers(vec![job(&args)], d)),
+            "task" => Ok(self.run_workers(vec![job(&args)], d, "worker")),
             "swarm" => {
                 let jobs: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten().map(job).collect();
                 if jobs.is_empty() {
                     Err(anyhow::anyhow!("swarm needs at least one task"))
                 } else {
-                    Ok(self.run_workers(jobs, d))
+                    Ok(self.run_workers(jobs, d, "worker"))
                 }
             }
             "goal_done" => Ok(self.finish_goal(&args)),
@@ -894,6 +957,37 @@ impl Agent {
         self.backend.execute(name, args, &self.policy, &approval)
     }
 
+    fn run_activity(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
+        if self.backend.name() != "local" || std::env::current_dir()?.canonicalize()? != self.cwd.canonicalize()? {
+            bail!("owned shell activities need this local workspace; remote lifecycle is not qualified");
+        }
+        let number = |key: &str, default| -> Result<u64> {
+            if args[key].is_null() {
+                return Ok(default);
+            }
+            args[key].as_u64().ok_or_else(|| anyhow::anyhow!("{key} must be a nonnegative integer"))
+        };
+        let record = match name {
+            "bash_start" => {
+                let command = args["command"].as_str().ok_or_else(|| anyhow::anyhow!("missing command"))?;
+                let timeout = number("timeout_secs", 120)?;
+                if command.trim().is_empty() || !(1..=600).contains(&timeout) {
+                    bail!("command must be nonempty and timeout_secs must be 1..600");
+                }
+                if infra::inspect(command).is_some_and(|a| a.mutating) {
+                    bail!("mutating infrastructure commands need the ordinary bash snapshot/verification harness");
+                }
+                if let Authorization::Refused(why) = self.authorize("bash", args, d)? {
+                    return Ok(why);
+                }
+                self.activities.start(command, timeout)?
+            }
+            "bash_wait" => self.activities.wait(args["id"].as_str().unwrap_or(""), number("wait_secs", 5)?)?,
+            _ => self.activities.cancel(args["id"].as_str().unwrap_or(""))?,
+        };
+        Ok(serde_json::to_string(&record)?)
+    }
+
     fn authorize(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<Authorization> {
         let mut approval = self.backend.decide(name, args, &self.policy, &self.cwd)?;
         match approval.clone() {
@@ -903,6 +997,9 @@ impl Agent {
                 return Ok(Authorization::Refused(format!(
                     "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
                 )));
+            }
+            Verdict::Confirm(why) if unattended_destructive(self.policy.mode) => {
+                d.line(&ui::warn(&format!("  ‼ {why}: allowed unattended by RUSTY_ALLOW_DESTRUCTIVE")));
             }
             Verdict::Confirm(why) => {
                 d.pause();
@@ -1110,7 +1207,7 @@ impl Agent {
 
     /// Runs read-only workers in parallel threads and collects their reports.
     /// One job is a subagent; several are a swarm.
-    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display) -> String {
+    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display, role: &'static str) -> String {
         let cfg = self.agents.clone();
         let n = jobs.len().min(self.swarm_cap().max(1));
         let label = if n == 1 { "subagent" } else { "swarm" };
@@ -1131,6 +1228,7 @@ impl Agent {
             std::thread::spawn(move || {
                 let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
                 w.is_worker = true;
+                w.request_role = role;
                 w.backend = backend;
                 w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
@@ -1413,7 +1511,10 @@ impl Agent {
             Some(f) if !f.trim().is_empty() => format!("compacting · focus: {}", ui::truncate(f.trim(), 40)),
             _ => "compacting".into(),
         });
+        let role = self.request_role;
+        self.request_role = "compaction";
         let reply = self.ask(&mut Display::new(true), messages, json!([]));
+        self.request_role = role;
         d.set_status(String::new());
         let reply = reply?;
         if let Some(u) = reply.usage {
@@ -1468,6 +1569,8 @@ impl Agent {
             "archived_messages": self.archived.len(),
             "goal": self.goal,
             "verification": self.verification_records,
+            "activities": self.activities.records(),
+            "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
         })
     }
@@ -1514,13 +1617,17 @@ impl Agent {
 
     // --------------------------------------------------------------- session
 
+    pub fn budget_snapshot(&self) -> crate::budget::Snapshot {
+        self.client.budget.snapshot()
+    }
+
     pub fn save_session(&mut self) {
         self.memory.save();
         let Some(path) = &self.session_path else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records});
+        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {
@@ -1537,6 +1644,10 @@ impl Agent {
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
         self.verification_records.clear();
+        self.activities.cancel_all(false);
+        if v["activities"].as_array().is_some_and(|records| !records.is_empty()) {
+            self.history.push(json!({"role":"user","content":format!("{}Saved shell activity receipts are diagnostic only. No live handles are restored and no command is replayed. Inspect prior effects before explicitly starting new work.", context::NOTE)}));
+        }
         self.session_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -1583,6 +1694,17 @@ enum Answer {
     Yes,
     Always,
     No(Option<String>),
+}
+
+/// Destructive calls normally need a person every time. A disposable sandbox
+/// run by a harness can opt out with `RUSTY_ALLOW_DESTRUCTIVE=1`, which only
+/// counts in yolo mode with nobody at the terminal, so it can't weaken an
+/// interactive session or the other permission modes.
+fn unattended_destructive(mode: crate::permissions::Mode) -> bool {
+    use std::io::IsTerminal;
+    mode == crate::permissions::Mode::Yolo
+        && std::env::var("RUSTY_ALLOW_DESTRUCTIVE").is_ok_and(|v| v.trim() == "1")
+        && !std::io::stdin().is_terminal()
 }
 
 /// Asks for approval. Uses line editing so Ctrl-C cleanly means "no, stop".

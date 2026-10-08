@@ -60,6 +60,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "fail" => "✗",
         "timeout" => "⧗",
         "infra" => "⚠",
+        "budget" => "⊘",
         _ => "?",
     }
 }

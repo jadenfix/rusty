@@ -85,7 +85,7 @@ pub fn only_prints(cmd: &str) -> bool {
 pub fn summary(name: &str, args: &Value) -> String {
     let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
     let text = match name {
-        "bash" => {
+        "bash" | "bash_start" => {
             // Hide a redundant `cd <project> &&` so the command itself shows.
             let cmd = s("command");
             let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
@@ -108,6 +108,7 @@ pub fn summary(name: &str, args: &Value) -> String {
         "swarm" => format!("{} tasks", args["tasks"].as_array().map_or(0, Vec::len)),
         "list_files" => args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".").to_string(),
         "task" => s("description"),
+        "bash_wait" | "bash_cancel" => s("id"),
         "remember" => format!("{}: {}", s("kind"), s("text")),
         "recall" => s("query"),
         "forget" => s("id"),
@@ -122,7 +123,7 @@ pub fn summary(name: &str, args: &Value) -> String {
 pub fn preview(name: &str, args: &Value) -> String {
     let mut out = String::new();
     match name {
-        "bash" => {
+        "bash" | "bash_start" => {
             // A short one-liner is already on the tool line above.
             let cmd = args["command"].as_str().unwrap_or("");
             if !cmd.contains('\n') && cmd.chars().count() <= 80 {
@@ -336,6 +337,28 @@ fn only_changes_directory(cmd: &str) -> bool {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
+    run_owned(command, timeout, None)
+}
+
+/// The activity owner may cancel its shell without interrupting unrelated work.
+pub(crate) fn run_cancellable(
+    command: &str,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Option<Option<i32>>, String, String)> {
+    run_owned(command, timeout, Some(cancel))
+}
+
+fn run_owned(
+    command: &str,
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(Option<Option<i32>>, String, String)> {
+    use std::sync::atomic::Ordering;
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+    if cancelled() || signal::interrupted() {
+        return Ok((None, String::new(), String::new()));
+    }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
@@ -356,8 +379,12 @@ pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, Str
         if let Some(s) = child.0.try_wait()? {
             break Some(s.code());
         }
-        signal::poll_keys();
-        if start.elapsed() > timeout || signal::interrupted() {
+        // Only the coordinator reads terminal input. Background owners must
+        // not race its poll/read and accidentally block on the same keystroke.
+        if cancel.is_none() {
+            signal::poll_keys();
+        }
+        if start.elapsed() > timeout || signal::interrupted() || cancelled() {
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
