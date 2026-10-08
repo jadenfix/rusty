@@ -201,6 +201,7 @@ pub fn classify(tool: &str, args: &Value, cwd: &Path) -> Class {
             risky(format!("reads credentials: {}", args["path"].as_str().unwrap_or("")))
         }
         "bash" => classify_command(args["command"].as_str().unwrap_or(""), cwd),
+        t if crate::mcp::Mcp::is_tool(t) => crate::mcp::classify(t),
         // Reading, searching, memory and planning tools never need a prompt.
         _ => Class::ReadOnly,
     }

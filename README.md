@@ -114,6 +114,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
 | **Subagents and swarms** | `/agents sub\|swarm\|auto`. Swarm workers can rotate models and spread their temperatures. Off by default, so you never pay for tokens you didn't ask for. |
 | **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
+| **MCP servers** | Put stdio servers in `.mcp.json` (`{"mcpServers": {...}}`, or point `RUSTY_MCP_CONFIG` at one) and their tools appear as `mcp__server__tool`. Reads run freely, deletes need a typed yes, everything else follows your permission mode. |
 | **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. |
 | **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
 | **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |

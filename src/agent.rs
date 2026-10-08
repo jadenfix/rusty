@@ -153,6 +153,8 @@ pub struct Agent {
     pub session_path: Option<PathBuf>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
+    /// MCP servers' tools, offered to the lead only.
+    pub mcp: crate::mcp::Mcp,
     is_worker: bool,
     request_role: &'static str,
     progress: Option<Arc<AtomicUsize>>,
@@ -221,6 +223,7 @@ impl Agent {
             project_notes,
             session_path: None,
             infra: infra::Harness::default(),
+            mcp: crate::mcp::Mcp::default(),
             is_worker: false,
             request_role: "lead",
             progress: None,
@@ -457,6 +460,7 @@ impl Agent {
         if self.is_worker {
             return Value::Array(defs);
         }
+        defs.extend(self.mcp.definitions());
         let t = tools::tool;
         if self.backend.name() == "local" {
             defs.push(t("bash_start", "Start a bounded local command while you inspect other files. Returns a session-owned handle. Use bash_wait to collect the real result, or bash_cancel. Pending commands prevent completion and are cancelled at turn end. Same permissions as bash; mutating infrastructure commands must use bash instead.", json!({
@@ -935,6 +939,11 @@ impl Agent {
                 }
                 Ok("noted".into())
             }
+            name if crate::mcp::Mcp::is_tool(name) => match self.authorize(name, &args, d) {
+                Ok(Authorization::Allowed(_)) => self.mcp.call(name, &args),
+                Ok(Authorization::Refused(why)) => Ok(why),
+                Err(e) => Err(e),
+            },
             name => self.run_guarded(name, &args, d),
         };
         let (text, ok) = match result {

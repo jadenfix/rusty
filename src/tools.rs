@@ -597,7 +597,7 @@ fn outline_file(path: &Path) -> Result<String> {
 }
 
 /// Keeps the head and tail of long outputs so the model sees both ends.
-fn cap(s: String) -> String {
+pub fn cap(s: String) -> String {
     if s.len() <= MAX_OUTPUT {
         return s;
     }
