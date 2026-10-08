@@ -123,15 +123,18 @@ fn offline(cmd: &mut Command, endpoint: &str, home: &Path) {
 }
 
 /// One run at `cols` columns: twelve real tool calls, then a streamed reply.
-pub fn steady(binary: &Path, endpoint: &str, cols: u16, dest: &Path) -> Result<()> {
+fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: &str) -> Result<()> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(dest).args(["--yolo", "--mode", "standard", "--agents", "off", "--memory", "off", "--trajectory"]);
-    cmd.arg(dest.join(format!("trajectory-{cols}.json"))).arg("capture");
+    cmd.arg(dest.join(format!("trajectory-{cols}.json"))).arg(prompt);
     offline(&mut cmd, endpoint, &dest.join("home"));
     let log = File::create(dest.join(format!("terminal-{cols}.ansi")))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
     s.wait_for(&[Lit("CAPTURE_COMPLETE")], "capture timed out")?;
     s.finish()?;
+    if prompt == "owned-capture" && std::fs::read_to_string(dest.join("owned-result.txt"))? != "ready" {
+        bail!("owned command result missing");
+    }
     println!("PASS: captured real PTY at {cols} columns");
     Ok(())
 }
@@ -220,6 +223,7 @@ enum Check {
     CtrlC,
     Approval,
     Steady,
+    Owned,
 }
 
 /// Runs the checks into `out`, keeping every capture there. False when the
@@ -230,11 +234,12 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
     let out = std::fs::canonicalize(out)?;
     let provider = Provider::start()?;
     let fail = |what: String| move |e: anyhow::Error| e.context(format!("FAIL: {what}"));
-    if checks.contains(&Check::Steady) {
+    if checks.contains(&Check::Steady) || checks.contains(&Check::Owned) {
         for cols in WIDTHS {
             let dest = out.join(format!("width-{cols}"));
             std::fs::create_dir_all(&dest)?;
-            steady(&binary, &provider.endpoint, cols, &dest).map_err(fail(format!("{cols} columns")))?;
+            let prompt = if checks.contains(&Check::Owned) { "owned-capture" } else { "capture" };
+            tools_capture(&binary, &provider.endpoint, cols, &dest, prompt).map_err(fail(format!("{cols} columns")))?;
         }
     }
     if checks.contains(&Check::Approval) {
@@ -274,6 +279,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "ctrl-c" => checks.push(Check::CtrlC),
             "approval" => checks.push(Check::Approval),
             "steady" => checks.push(Check::Steady),
+            "owned" => checks.push(Check::Owned),
             other => bail!("unknown tty check {other:?}; expected ctrl-c, approval or steady"),
         }
     }
@@ -302,7 +308,8 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     let (Some(binary), Some(output)) = (flag(args, "--binary"), flag(args, "--output")) else {
         bail!("usage: cargo xtask tty-capture --binary PATH --output DIR");
     };
-    if !run(&binary, &output, &[Check::Steady, Check::Approval, Check::CtrlC], false)? {
+    let width = if args.iter().any(|a| a == "--owned") { Check::Owned } else { Check::Steady };
+    if !run(&binary, &output, &[width, Check::Approval, Check::CtrlC], false)? {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)

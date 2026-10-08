@@ -132,3 +132,79 @@ Neither cohort is implemented or executed by this PR. Require artifact hashes,
 sandbox qualification, and a spending envelope before admission, followed by a
 held-out real-repository suite. Do not mix those results with scripted-runtime
 tests or promote a tiny public fixture into a benchmark claim.
+
+## Owned local waits
+
+The next increment adds three lead-only tools: `bash_start`, `bash_wait`, and
+`bash_cancel`. Use ordinary `bash` for short work. For a longer command, start
+it once, inspect something useful, then wait on the returned handle. The handle
+belongs to this coordinator; a PID, a saved receipt, model prose, or another
+session's ID cannot construct one. Read-only workers cannot start activities.
+Remote placement exposes no activity tools and refuses fabricated calls.
+
+A start goes through the same permission policy as `bash`. Mutating infrastructure
+commands are refused on this path so they still use the ordinary snapshot and
+verification harness. The lifetime is fixed at start (1–600 seconds, default
+120). `bash_wait` waits 0–30 seconds (default five) without extending that lifetime
+or replaying the command. Four commands may be active, with at most 32 starts per
+session, including cancelled commands. Nonzero waits avoid busy polling.
+
+A registered command may return exactly the same `Running` result for several
+polls. This is justified by a live executor handle and its deadline, not by a
+changing timestamp. Unknown handles, completed handles, and ordinary repeated
+calls still use the stall guard. Running output is withheld; terminal records
+contain actual exit status, elapsed time, and bounded redacted stdout/stderr.
+Each ordinary process group is terminated/reaped before its final result is
+collected, even if its leader exited first.
+
+Completion waits until no owned command is running, before spending a careful
+review or executing the fixed acceptance criterion. Activity output alone is
+not a passing acceptance receipt. Ending a turn with running commands cancels
+them and reports unfinished work; a blocked goal cancels without a review. The
+same cleanup runs on ordinary error, Ctrl-C, and destruction of the owner.
+Cancellation does not undo effects that already happened. Starting the command
+again requires an explicit proposal and authorization.
+
+Sessions and trajectories export diagnostic activity records; loading a session
+does not restore handles or replay commands. Live runtime state is carried in
+the system prompt independently of compacted conversation text. This increment
+is not a crash-recovery journal: abrupt process death, forced quit, and deliberately
+escaped process groups need an external supervisor/reconciliation boundary.
+It also does not add the planned shared model/token reservation ledger. Those
+foundations and remote activity reconciliation remain required before writable
+candidate search. No general shell isolation is claimed.
+
+### Evaluation workflow
+
+`verified-index` and `verified-invoice` add independently graded cross-file
+repairs. The index task includes a slow public checker for exercising a useful
+owned wait. The invoice task checks exact decimal rounding, negative amounts,
+large values and tax applied to the integer subtotal. Graders remain outside
+`files/`; they also reject edits to protected public checkers. Oracle, broken,
+plausibly wrong and checker-tampering controls run offline.
+
+```sh
+EVAL_MODELS=nvidia/nemotron-3-super-120b-a12b EVAL_REPEATS=5 EVAL_JOBS=1 \
+  EVAL_TIMEOUT=120 cargo xtask eval verified-repair,verified-index,verified-invoice
+```
+
+For an artifact comparison, `EVAL_BINARY=/absolute/path/to/qualified/rusty`
+selects an already built binary. Record its hash, source revision, task hashes,
+sampling settings and limits in a separate immutable experiment receipt.
+Both variants must use the same frozen task source and grading runner. The
+runner now uses unique per-process/nanosecond receipt names, exclusive creation,
+and saved trajectories. Functional grading, goal reporting and false completion
+are separate fields; a correct patch can still have an unfinished goal.
+A known HTTP 402 evaluation-budget stop is scored as `budget`, rather than
+excluded as infrastructure. Timed-out processes receive Ctrl-C and a three-second
+cleanup grace before a hard kill; this is cooperative cleanup, not crash isolation.
+
+The accompanying development experiment compares merged PR 28 with this activity
+increment, five attempts per task and variant, using standard mode, memory and
+delegation off. External provider admission counts transport attempts too,
+reserves conservative input-byte-plus-output bounds, preserves unknown usage,
+and paces requests. No automatic replacements or model substitutions occur.
+Provider errors remain in the all-attempt ledger and are excluded from the
+healthy functional cohort. Development fixtures and host graders do not establish
+held-out repository performance or sandbox containment. A larger search/staging
+experiment still needs matched aggregate budgets and qualified execution isolation.
