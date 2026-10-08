@@ -2795,3 +2795,34 @@ fn a_swarm_bigger_than_the_pool_runs_every_task_and_reports_the_overflow() {
     assert!(lead.contains("2 more task(s) were not run"), "{lead}");
     assert_eq!(lead.matches("(done)").count(), 32, "{lead}");
 }
+
+#[test]
+fn a_bounded_run_tells_the_model_what_is_left() {
+    let s = Sandbox::new("budget-status");
+    let mut replies: Vec<_> = ["ls", "ls -a", "ls -la", "pwd"].iter().map(|c| bash_reply(c)).collect();
+    replies.push(serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}));
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--max-requests", "5", "--trajectory", "t.json", "look around"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let last = |r: &serde_json::Value| r["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(last(&requests[0]).contains("Run budget used: 0 of 5 model calls"), "{}", last(&requests[0]));
+    assert!(!last(&requests[0]).contains("Less than a quarter"));
+    assert!(last(&requests[4]).contains("Less than a quarter is left"), "{}", last(&requests[4]));
+    let saved = std::fs::read_to_string(s.project.join("t.json")).unwrap();
+    assert!(!saved.contains("Run budget used"), "the note is never stored in history");
+
+    let s = Sandbox::new("budget-none");
+    let (url, server) = scripted_endpoint(vec![
+        serde_json::json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+    ]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).args(["--yolo", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success());
+    assert!(!server.join().unwrap()[0]["messages"].to_string().contains("Run budget"), "unbounded runs stay quiet");
+}
