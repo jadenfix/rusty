@@ -2795,3 +2795,21 @@ fn a_swarm_bigger_than_the_pool_runs_every_task_and_reports_the_overflow() {
     assert!(lead.contains("2 more task(s) were not run"), "{lead}");
     assert_eq!(lead.matches("(done)").count(), 32, "{lead}");
 }
+
+#[test]
+fn an_auto_pick_uses_that_modes_model_unless_one_was_chosen() {
+    let answer = || serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+    for (explicit, want) in [(None, "nvidia/careful-x"), (Some("nvidia/chosen-y"), "nvidia/chosen-y")] {
+        let s = Sandbox::new("auto-model");
+        let (url, server) = scripted_endpoint(vec![answer()]);
+        let mut cmd = s.cmd();
+        cmd.env("RUSTY_BASE_URL", url).env("RUSTY_CAREFUL_MODEL", "nvidia/careful-x").arg("--yolo");
+        if let Some(m) = explicit {
+            cmd.args(["--model", m]);
+        }
+        let out = cmd.arg("roll back the production deploy").stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("◇ careful"), "auto picked careful");
+        assert_eq!(server.join().unwrap()[0]["model"], want);
+    }
+}
