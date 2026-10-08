@@ -99,6 +99,12 @@ impl Endpoint {
 pub struct Client {
     http: reqwest::blocking::Client,
     endpoints: Vec<Endpoint>,
+    pub budget: Arc<crate::budget::Budget>,
+}
+
+struct Sent {
+    response: Response,
+    reservation: Option<crate::budget::Reservation>,
 }
 
 impl Client {
@@ -123,7 +129,12 @@ impl Client {
             .connect_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(600))
             .build()?;
-        Ok(Self { http, endpoints })
+        Ok(Self { http, endpoints, budget: crate::budget::Budget::unbounded() })
+    }
+
+    pub fn with_budget(mut self, limits: crate::budget::Limits) -> Self {
+        self.budget = crate::budget::Budget::new(limits);
+        self
     }
 
     pub fn key_count(&self) -> usize {
@@ -168,11 +179,12 @@ impl Client {
         tools: Value,
         temperature: f32,
         execution_mode: ExecutionMode,
+        role: &'static str,
     ) -> Receiver<Event> {
         let (tx, rx) = channel();
         let me = self.clone();
         std::thread::spawn(move || {
-            let result = me.chat(&model, &messages, &tools, temperature, execution_mode, &mut |d| {
+            let result = me.chat(&model, &messages, &tools, temperature, (execution_mode, role), &mut |d| {
                 let ev = match d {
                     Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
                     Delta::Content(s) => Event::Content(s.to_string()),
@@ -193,16 +205,20 @@ impl Client {
         messages: &[Value],
         tools: &Value,
         temperature: f32,
-        execution_mode: ExecutionMode,
+        inference: (ExecutionMode, &str),
         on: &mut dyn FnMut(Delta) -> bool,
     ) -> Result<Reply> {
+        let (execution_mode, role) = inference;
         let ep = self.endpoint_for(model)?;
         if ep.provider == Provider::Anthropic {
             let first_party = ep.base_url == crate::config::ANTHROPIC_BASE_URL;
             let (body, beta) = anthropic::request(model, messages, tools, execution_mode, first_party);
             let url = format!("{}/v1/messages", ep.base_url);
             return self.stream_with_retry(on, |on| {
-                anthropic::parse_stream(self.send(ep, &url, Some(&body), beta.as_deref())?, on)
+                let sent = self.send(ep, &url, Some(&body), beta.as_deref(), role)?;
+                let result = anthropic::parse_stream(sent.response, on);
+                settle(sent.reservation, &result);
+                result
             });
         }
         let mut body = json!({
@@ -223,7 +239,12 @@ impl Client {
             body["tool_choice"] = json!("auto");
         }
         let url = format!("{}/chat/completions", ep.base_url);
-        self.stream_with_retry(on, |on| parse_stream(self.send(ep, &url, Some(&body), None)?, on))
+        self.stream_with_retry(on, |on| {
+            let sent = self.send(ep, &url, Some(&body), None, role)?;
+            let result = parse_stream(sent.response, on);
+            settle(sent.reservation, &result);
+            result
+        })
     }
 
     /// Runs one streamed request, and runs it again when the provider reports
@@ -240,6 +261,7 @@ impl Client {
         let budget = retry_budget();
         let mut round = 0u32;
         loop {
+            self.budget.remaining()?;
             let mut shown = false;
             let result = attempt(&mut |d| {
                 shown = true;
@@ -254,7 +276,7 @@ impl Client {
             if started.elapsed() + wait > budget {
                 return Err(err.context(format!("giving up after {round} streamed attempts")));
             }
-            wait_or_interrupt(wait, &format!("{err:#}"))?;
+            self.wait_retry(wait, &format!("{err:#}"))?;
         }
     }
 
@@ -286,7 +308,11 @@ impl Client {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
             _ => format!("{}/models", ep.base_url),
         };
-        let v: Value = self.send_with(ep, &url, None, None, retry)?.json().context("bad /models response")?;
+        let v: Value = self
+            .send_with(ep, &url, (None, "catalog"), None, retry)?
+            .response
+            .json()
+            .context("bad /models response")?;
         let data = v["data"].as_array().ok_or_else(|| anyhow!("unexpected /models response"))?;
         let mut ids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
         ids.sort();
@@ -298,18 +324,20 @@ impl Client {
     /// (`RUSTY_RETRY_SECS`, default five minutes). A key that is refused (401
     /// or 403) twice is not worth waiting on, so auth failures give up once
     /// every key has been refused twice. Ctrl-C ends a wait at once.
-    fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>) -> Result<Response> {
-        self.send_with(ep, url, body, beta, Retry::Patient)
+    fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>, role: &str) -> Result<Sent> {
+        self.send_with(ep, url, (body, role), beta, Retry::Patient)
     }
 
     fn send_with(
         &self,
         ep: &Endpoint,
         url: &str,
-        body: Option<&Value>,
+        request: (Option<&Value>, &str),
         beta: Option<&str>,
         retry: Retry,
-    ) -> Result<Response> {
+    ) -> Result<Sent> {
+        let (body, role) = request;
+        let reserve = body.map(reservation_tokens).transpose()?;
         let keys = &ep.keys;
         let started = std::time::Instant::now();
         let budget = if retry == Retry::Once { Duration::ZERO } else { retry_budget() };
@@ -334,9 +362,13 @@ impl Client {
                 if let Some(b) = beta {
                     req = req.header("anthropic-beta", b);
                 }
+                let mut reservation = reserve.map(|n| self.budget.reserve(role, n)).transpose()?;
+                if reservation.is_some() {
+                    req = req.timeout(self.budget.remaining()?.min(Duration::from_secs(600)));
+                }
                 attempts += 1;
                 match req.send() {
-                    Ok(r) if r.status().is_success() => return Ok(r),
+                    Ok(r) if r.status().is_success() => return Ok(Sent { response: r, reservation }),
                     Ok(r) => {
                         let status = r.status().as_u16();
                         if let Some(secs) = r
@@ -351,7 +383,12 @@ impl Client {
                         last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
                         match status {
                             401 | 403 => refused[idx] += 1,
-                            429 | 500..=599 => {}
+                            429 => {
+                                if let Some(r) = reservation.take() {
+                                    r.refund_rate_limited();
+                                }
+                            }
+                            500..=599 => {}
                             _ => bail!(last_err),
                         }
                     }
@@ -365,7 +402,36 @@ impl Client {
             if all_refused || started.elapsed() + wait > budget {
                 bail!("giving up after {attempts} attempts in {}s: {last_err}", started.elapsed().as_secs());
             }
-            wait_or_interrupt(wait, &last_err)?;
+            if body.is_some() {
+                self.wait_retry(wait, &last_err)?;
+            } else {
+                wait_or_interrupt(wait, &last_err)?;
+            }
+        }
+    }
+    fn wait_retry(&self, wait: Duration, last_err: &str) -> Result<()> {
+        wait_or_interrupt(wait.min(self.budget.remaining()?), last_err)?;
+        self.budget.remaining()?;
+        Ok(())
+    }
+}
+
+fn reservation_tokens(body: &Value) -> Result<u64> {
+    let output = body["max_completion_tokens"]
+        .as_u64()
+        .or_else(|| body["max_tokens"].as_u64())
+        .ok_or_else(|| anyhow!("model request has no output token cap"))?;
+    (serde_json::to_vec(body)?.len() as u64)
+        .checked_add(output)
+        .ok_or_else(|| anyhow!("model budget exhausted: request reservation overflow"))
+}
+
+fn settle(reservation: Option<crate::budget::Reservation>, result: &Result<Reply>) {
+    if let (Some(r), Ok(reply)) = (reservation, result) {
+        if reply.finish_reason.as_deref().is_some_and(|f| f != "interrupted") {
+            if let Some(u) = reply.usage {
+                r.settle(u.prompt, u.completion);
+            }
         }
     }
 }
@@ -451,7 +517,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
             bail!("API error: {err}");
         }
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            reply.usage = Some(usage_of(u));
+            reply.usage = usage_of(u);
         }
         let Some(choice) = v["choices"].get(0) else { continue };
         if let Some(fr) = choice["finish_reason"].as_str() {
@@ -494,7 +560,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
             merge_tool_call(&mut calls, tc);
         }
         reply.finish_reason = v["choices"][0]["finish_reason"].as_str().map(String::from);
-        reply.usage = v.get("usage").map(usage_of);
+        reply.usage = v.get("usage").and_then(usage_of);
     }
 
     calls.retain(|c| !c.name.is_empty());
@@ -507,8 +573,8 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
     Ok(reply)
 }
 
-fn usage_of(u: &Value) -> Usage {
-    Usage { prompt: u["prompt_tokens"].as_u64().unwrap_or(0), completion: u["completion_tokens"].as_u64().unwrap_or(0) }
+fn usage_of(u: &Value) -> Option<Usage> {
+    Some(Usage { prompt: u["prompt_tokens"].as_u64()?, completion: u["completion_tokens"].as_u64()? })
 }
 
 /// Folds one streamed tool-call fragment into the accumulated list.

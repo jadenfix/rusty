@@ -57,7 +57,8 @@ pub fn is_infra_line(line: &str) -> bool {
 /// The lines worth quoting as an infra error's reason:
 /// `giving up after|HTTP [45][0-9][0-9]|request failed|connection to the model closed|API error|is not set`.
 pub fn is_reason_line(line: &str) -> bool {
-    line.contains("giving up after")
+    line.contains("model budget exhausted")
+        || line.contains("giving up after")
         || status_code(line, b"45")
         || line.contains("request failed")
         || line.contains("connection to the model closed")
@@ -228,7 +229,7 @@ pub fn run(filter: &str) -> Result<bool> {
 }
 
 enum Exit {
-    Done,
+    Done(bool),
     TimedOut,
 }
 
@@ -273,7 +274,7 @@ fn agent(
         Ok(c) => c,
         Err(e) => {
             writeln!(stderr, "starting {}: {e}", cfg.bin.display())?;
-            return Ok(Exit::Done);
+            return Ok(Exit::Done(false));
         }
     };
     if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
@@ -282,8 +283,8 @@ fn agent(
     }
     let start = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(Exit::Done);
+        if let Some(status) = child.try_wait()? {
+            return Ok(Exit::Done(status.success()));
         }
         if start.elapsed() >= cfg.limit {
             // Let the coordinator cancel owned activity groups before a hard
@@ -308,6 +309,7 @@ fn agent(
 fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, model: &str) -> Result<Exit> {
     let turns = std::fs::read_to_string(task.dir.join("turns.txt"))?;
     let mut timed_out = false;
+    let mut success = true;
     for s in sessions(&turns) {
         let exit = if s.goal {
             agent(cfg, work, home, model, &s.env, &["--goal", &s.lines[0]], None)?
@@ -316,8 +318,9 @@ fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, model: &str) -
             agent(cfg, work, home, model, &s.env, &[], Some(input))?
         };
         timed_out |= matches!(exit, Exit::TimedOut);
+        success &= matches!(exit, Exit::Done(true));
     }
-    Ok(if timed_out { Exit::TimedOut } else { Exit::Done })
+    Ok(if timed_out { Exit::TimedOut } else { Exit::Done(success) })
 }
 
 fn run_task(cfg: &Config, task: &Task, model: &str, rep: u64, jsonl: &Mutex<()>) -> Result<()> {
@@ -326,6 +329,26 @@ fn run_task(cfg: &Config, task: &Task, model: &str, rep: u64, jsonl: &Mutex<()>)
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&home);
     result
+}
+
+/// Functional correctness is independent of a healthy completed execution.
+/// A passing patch cannot hide a fatal provider error or nonzero process exit.
+fn verdict(exit: &Exit, functional: bool, stdout: &[u8], stderr: &[u8]) -> &'static str {
+    let err = String::from_utf8_lossy(stderr);
+    let budget = err.lines().any(|l| {
+        l.contains("model budget exhausted") || (l.contains("HTTP 402") && l.contains("evaluation budget exhausted"))
+    });
+    if matches!(exit, Exit::TimedOut) {
+        "timeout"
+    } else if budget {
+        "budget"
+    } else if [stdout, stderr].iter().any(|b| String::from_utf8_lossy(b).lines().any(is_infra_line)) {
+        "infra"
+    } else if functional && matches!(exit, Exit::Done(true)) {
+        "pass"
+    } else {
+        "fail"
+    }
 }
 
 fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &Path, jsonl: &Mutex<()>) -> Result<()> {
@@ -348,20 +371,7 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
     let stdout = std::fs::read(home.join("stdout")).unwrap_or_default();
     let stderr = std::fs::read(home.join("stderr")).unwrap_or_default();
     let functional = check(task, work, home)?;
-    let budget = String::from_utf8_lossy(&stderr)
-        .lines()
-        .any(|l| l.contains("HTTP 402") && l.contains("evaluation budget exhausted"));
-    let verdict = if matches!(exit, Exit::TimedOut) {
-        "timeout"
-    } else if budget {
-        "budget"
-    } else if functional {
-        "pass"
-    } else if [&stdout, &stderr].iter().any(|b| String::from_utf8_lossy(b).split('\n').any(is_infra_line)) {
-        "infra"
-    } else {
-        "fail"
-    };
+    let verdict = verdict(&exit, functional, &stdout, &stderr);
 
     let dest = cfg.logs.join(model.replace('/', "_")).join(format!("{}.{rep}", task.name));
     std::fs::create_dir_all(&dest)?;
@@ -409,6 +419,7 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
     row["false_completion"] = Value::Bool(goal == "done" && !functional);
     row["functional_pass"] = Value::Bool(functional);
     row["goal"] = goal;
+    row["model_budgets"] = Value::Array(stats.iter().filter_map(|r| r.get("model_budget").cloned()).collect());
     row["binary"] = Value::String(cfg.bin.display().to_string());
     {
         let _lock = jsonl.lock().unwrap();
@@ -666,6 +677,53 @@ mod tests {
         let two = tasks(&evals, "rust-slugify,undo-one-step").unwrap();
         assert_eq!(two.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["rust-slugify", "undo-one-step"]);
         assert!(tasks(&evals, "no-such-task").unwrap().is_empty());
+    }
+
+    #[test]
+    fn independent_pass_with_fatal_endpoint_error_is_preserved_as_infra() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir().unwrap();
+        let taskdir = root.join("task");
+        std::fs::create_dir_all(taskdir.join("files")).unwrap();
+        std::fs::write(taskdir.join("prompt.txt"), "repair the file").unwrap();
+        std::fs::write(taskdir.join("check.sh"), "test \"$(cat result.txt)\" = correct").unwrap();
+        let bin = root.join("fake-agent");
+        std::fs::write(&bin,"#!/bin/sh\nprintf correct > result.txt\necho 'error: giving up after 3 attempts: HTTP 429 Too Many Requests' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = Config {
+            root: root.clone(),
+            bin,
+            limit: Duration::from_secs(5),
+            out: root.join("results.jsonl"),
+            logs: root.join("logs"),
+            transcripts: false,
+        };
+        let task = Task { name: "passing-patch-fatal".into(), dir: taskdir };
+        let work = root.join("work");
+        let home = root.join("home");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        File::create(&cfg.out).unwrap();
+        score(&cfg, &task, "scripted", 1, &work, &home, &Mutex::new(())).unwrap();
+        let row: Value = serde_json::from_str(std::fs::read_to_string(&cfg.out).unwrap().trim()).unwrap();
+        assert_eq!(row["functional_pass"], true);
+        assert_eq!(row["verdict"], "infra");
+        assert!(!row["reason"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn passing_patch_does_not_hide_unhealthy_execution() {
+        let fatal = b"error: giving up after 4 attempts: HTTP 429 Too Many Requests";
+        assert_eq!(verdict(&Exit::Done(false), true, b"", fatal), "infra");
+        assert_eq!(verdict(&Exit::Done(false), true, b"", b"error: bad request"), "fail");
+        assert_eq!(verdict(&Exit::Done(true), true, b"", b""), "pass");
+        assert_eq!(verdict(&Exit::Done(false), true, b"", b"model budget exhausted: request limit"), "budget");
+        assert_eq!(
+            verdict(&Exit::Done(false), false, b"", b"HTTP 402 development evaluation budget exhausted"),
+            "budget"
+        );
+        assert_eq!(verdict(&Exit::TimedOut, true, b"", fatal), "timeout");
     }
 
     #[test]

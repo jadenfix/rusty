@@ -152,6 +152,7 @@ pub struct Agent {
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
     is_worker: bool,
+    request_role: &'static str,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -218,6 +219,7 @@ impl Agent {
             session_path: None,
             infra: infra::Harness::default(),
             is_worker: false,
+            request_role: "lead",
             progress: None,
         }
     }
@@ -292,7 +294,7 @@ impl Agent {
     /// Careful mode's one review: a read-only worker checks the proposed
     /// completion against the real files and the user's constraints. The main
     /// agent owns the fixes; there is no second review.
-    fn review_completion(&mut self, query: &str, d: &mut Display) {
+    fn review_completion(&mut self, query: &str, d: &mut Display) -> Result<()> {
         self.checker_owed = false;
         if let Some(g) = &mut self.goal {
             g.checker_used = true;
@@ -312,13 +314,20 @@ impl Agent {
              Recent steps and the proposed completion:\n{}",
             ui::truncate(&recent, 24_000)
         );
-        let report = self.run_workers(vec![("careful check".into(), prompt)], d);
+        let denied = self.client.budget.denied();
+        let report = self.run_workers(vec![("careful check".into(), prompt)], d, "review");
+        // Ask the ledger, not the report: a reviewer may quote that phrase from a file.
+        if self.client.budget.denied() > denied {
+            self.client.budget.halt();
+            bail!("model budget exhausted: required careful review could not finish");
+        }
         self.history.push(json!({"role": "user", "content": format!(
             "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
              There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
              give your final answer, or call goal_done with evidence.",
             context::NOTE
         )}));
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -642,7 +651,10 @@ impl Agent {
                     d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
                 }
                 if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal && self.checker_owed {
-                    self.review_completion(&query, &mut d);
+                    if let Err(e) = self.review_completion(&query, &mut d) {
+                        outcome = Err(e);
+                        break;
+                    }
                     if signal::interrupted() {
                         outcome = Ok(false);
                         break;
@@ -746,7 +758,10 @@ impl Agent {
                 if !blocked && self.activities.running() > 0 {
                     self.history.push(json!({"role":"user","content":format!("{}Completion rejected: owned commands are still running. Wait for or cancel them before proposing completion; their output is not verification evidence.", context::NOTE)}));
                 } else if self.checker_owed && !blocked {
-                    self.review_completion(&query, &mut d);
+                    if let Err(e) = self.review_completion(&query, &mut d) {
+                        outcome = Err(e);
+                        break;
+                    }
                     if signal::interrupted() {
                         outcome = Ok(false);
                         break;
@@ -816,7 +831,14 @@ impl Agent {
     /// Sends one request on a background thread and renders it as it streams.
     /// Ctrl-C returns at once with whatever text arrived.
     fn ask(&mut self, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
-        let rx = self.client.start_chat(self.model.clone(), messages, tools, self.temperature, self.execution_mode);
+        let rx = self.client.start_chat(
+            self.model.clone(),
+            messages,
+            tools,
+            self.temperature,
+            self.execution_mode,
+            self.request_role,
+        );
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
             if signal::interrupted() {
@@ -824,12 +846,17 @@ impl Agent {
                 d.end_stream();
                 return Ok(Reply { content, finish_reason: Some("interrupted".into()), ..Default::default() });
             }
+            if let Err(e) = self.client.budget.remaining() {
+                d.end_stream();
+                return Err(e);
+            }
             signal::poll_keys();
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
                 Ok(Event::Done(r)) => {
                     d.end_stream();
+                    self.client.budget.remaining()?;
                     return r;
                 }
                 Err(RecvTimeoutError::Timeout) => d.tick(),
@@ -874,13 +901,13 @@ impl Agent {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
                 Ok("plan updated".into())
             }
-            "task" => Ok(self.run_workers(vec![job(&args)], d)),
+            "task" => Ok(self.run_workers(vec![job(&args)], d, "worker")),
             "swarm" => {
                 let jobs: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten().map(job).collect();
                 if jobs.is_empty() {
                     Err(anyhow::anyhow!("swarm needs at least one task"))
                 } else {
-                    Ok(self.run_workers(jobs, d))
+                    Ok(self.run_workers(jobs, d, "worker"))
                 }
             }
             "goal_done" => Ok(self.finish_goal(&args)),
@@ -1180,7 +1207,7 @@ impl Agent {
 
     /// Runs read-only workers in parallel threads and collects their reports.
     /// One job is a subagent; several are a swarm.
-    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display) -> String {
+    fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display, role: &'static str) -> String {
         let cfg = self.agents.clone();
         let n = jobs.len().min(self.swarm_cap().max(1));
         let label = if n == 1 { "subagent" } else { "swarm" };
@@ -1201,6 +1228,7 @@ impl Agent {
             std::thread::spawn(move || {
                 let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
                 w.is_worker = true;
+                w.request_role = role;
                 w.backend = backend;
                 w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
@@ -1483,7 +1511,10 @@ impl Agent {
             Some(f) if !f.trim().is_empty() => format!("compacting · focus: {}", ui::truncate(f.trim(), 40)),
             _ => "compacting".into(),
         });
+        let role = self.request_role;
+        self.request_role = "compaction";
         let reply = self.ask(&mut Display::new(true), messages, json!([]));
+        self.request_role = role;
         d.set_status(String::new());
         let reply = reply?;
         if let Some(u) = reply.usage {
@@ -1539,6 +1570,7 @@ impl Agent {
             "goal": self.goal,
             "verification": self.verification_records,
             "activities": self.activities.records(),
+            "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
         })
     }
@@ -1585,13 +1617,17 @@ impl Agent {
 
     // --------------------------------------------------------------- session
 
+    pub fn budget_snapshot(&self) -> crate::budget::Snapshot {
+        self.client.budget.snapshot()
+    }
+
     pub fn save_session(&mut self) {
         self.memory.save();
         let Some(path) = &self.session_path else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records()});
+        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         let _ = rusty::privacy::write_json(path, body);
         let changes = self.infra.change_record();
         if !changes.is_empty() {

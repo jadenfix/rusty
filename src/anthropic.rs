@@ -286,6 +286,8 @@ fn parse_lines(
     let mut blocks: Vec<Value> = Vec::new();
     let mut partial: Vec<String> = Vec::new();
     let mut usage = Usage::default();
+    let mut input_known = false;
+    let mut output_known = false;
     let mut stop: Option<String> = None;
     let mut interrupted = false;
     let mut saw_data = false;
@@ -303,10 +305,10 @@ fn parse_lines(
         match v["type"].as_str().unwrap_or("") {
             "message_start" => {
                 let u = &v["message"]["usage"];
-                usage.prompt = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-                    .iter()
-                    .map(|k| u[*k].as_u64().unwrap_or(0))
-                    .sum();
+                if let Some(n) = input_usage(u) {
+                    usage.prompt = n;
+                    input_known = true;
+                }
                 usage.completion = u["output_tokens"].as_u64().unwrap_or(0);
             }
             "content_block_start" => {
@@ -353,6 +355,7 @@ fn parse_lines(
                 }
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() {
                     usage.completion = n;
+                    output_known = true;
                 }
             }
             "error" => bail!("API error: {}", v["error"]),
@@ -367,14 +370,31 @@ fn parse_lines(
         blocks = v["content"].as_array().cloned().unwrap_or_default();
         partial = vec![String::new(); blocks.len()];
         stop = v["stop_reason"].as_str().map(String::from);
-        usage.completion = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
-        usage.prompt = v["usage"]["input_tokens"].as_u64().unwrap_or(0);
+        if let Some(n) = v["usage"]["output_tokens"].as_u64() {
+            usage.completion = n;
+            output_known = true;
+        }
+        if let Some(n) = input_usage(&v["usage"]) {
+            usage.prompt = n;
+            input_known = true;
+        }
         let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
         if !text.is_empty() {
             let _ = on(Delta::Content(&text));
         }
     }
-    Ok(finish(blocks, partial, stop, usage, interrupted))
+    let known = input_known && output_known && stop.is_some() && !interrupted;
+    Ok(finish(blocks, partial, stop, known.then_some(usage), interrupted))
+}
+
+fn input_usage(u: &Value) -> Option<u64> {
+    let mut total = u["input_tokens"].as_u64()?;
+    for k in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
+        if let Some(v) = u.get(k) {
+            total = total.checked_add(v.as_u64()?)?;
+        }
+    }
+    Some(total)
 }
 
 fn append(block: &mut Value, key: &str, s: &str) {
@@ -387,7 +407,7 @@ fn finish(
     mut blocks: Vec<Value>,
     partial: Vec<String>,
     stop: Option<String>,
-    usage: Usage,
+    usage: Option<Usage>,
     interrupted: bool,
 ) -> Reply {
     for (b, json_text) in blocks.iter_mut().zip(&partial) {
@@ -416,7 +436,7 @@ fn finish(
         }
         .to_string()
     };
-    let mut reply = Reply { usage: Some(usage), finish_reason: Some(finish_reason.clone()), ..Default::default() };
+    let mut reply = Reply { usage, finish_reason: Some(finish_reason.clone()), ..Default::default() };
     reply.content =
         blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("");
     reply.tool_calls = blocks

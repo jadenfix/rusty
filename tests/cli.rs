@@ -67,6 +67,9 @@ impl Sandbox {
             .env_remove("TF_WORKSPACE")
             .env_remove("KUBECONFIG")
             .env_remove("RUSTY_INFRA")
+            .env_remove("RUSTY_MAX_REQUESTS")
+            .env_remove("RUSTY_MAX_BUDGET_TOKENS")
+            .env_remove("RUSTY_BUDGET_SECS")
             .env_remove("RUSTY_MODEL")
             .env_remove("RUSTY_MODE")
             .env_remove("RUSTY_CAREFUL_MODEL")
@@ -1140,6 +1143,9 @@ fn careful_goal_gets_one_checker_review_then_closes() {
     assert!(fix.contains("checker's review") && fix.contains("empty-input"), "{fix}");
     assert!(stdout.contains("careful check") && stdout.contains("fixed-and-tested"), "{stdout}");
     assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
+    let stats: serde_json::Value = serde_json::from_str(stderr.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(stats["model_budget"]["by_role"], serde_json::json!({"lead":3,"review":1}));
+    assert_eq!(stats["model_budget"]["requests"], 4);
 }
 
 #[test]
@@ -2118,6 +2124,395 @@ fn saved_activity_receipts_never_restore_a_live_handle_or_replay_work() {
         serde_json::from_str(&std::fs::read_to_string(s.home.join("resumed.json")).unwrap()).unwrap();
     assert!(resumed["activities"].as_array().unwrap().is_empty());
     assert!(!s.project.join("marker").exists());
+}
+
+fn budget_run(
+    s: &Sandbox,
+    args: &[&str],
+    responses: Vec<(u16, String)>,
+) -> (Output, Vec<(String, serde_json::Value)>, serde_json::Value) {
+    let (url, server) = scripted_http(responses);
+    let trajectory = s.project.join("budget-trajectory.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_RETRY_SECS", "60")
+        .env("RUSTY_MODE", "standard")
+        .env("NVIDIA_API_KEY_2", "offline-test-key-2")
+        .args(["--memory", "off", "--stats", "--trajectory"])
+        .arg(&trajectory)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(15)))
+        .unwrap();
+    let requests = server.join().unwrap();
+    let trace = serde_json::from_str(&std::fs::read_to_string(trajectory).unwrap()).unwrap();
+    (out, requests, trace)
+}
+fn sse_reply(v: serde_json::Value) -> (u16, String) {
+    (200, format!("data: {v}\n\ndata: [DONE]\n\n"))
+}
+
+#[test]
+fn root_budget_counts_rotated_keys_and_stream_retries() {
+    for stream_error in [false, true] {
+        let s = Sandbox::new(if stream_error { "budget-stream-retry" } else { "budget-key-retry" });
+        let response = if stream_error {
+            sse_reply(serde_json::json!({"error":{"type":"rate_limit_error"}}))
+        } else {
+            (429, "rate limited".into())
+        };
+        let (out, requests, trace) =
+            budget_run(&s, &["--max-requests", "2", "inspect"], vec![response.clone(), response]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("model budget exhausted"));
+        assert_eq!(requests.len(), 2);
+        let b = &trace["model_budget"];
+        assert_eq!(b["requests"], 2);
+        assert_eq!(b["unknown_usage_requests"], 2);
+        assert_eq!(b["known_tokens"], 0);
+        assert_eq!(b["active_requests"], 0);
+        let reserved: u64 = requests
+            .iter()
+            .map(|(_, r)| serde_json::to_vec(r).unwrap().len() as u64 + r["max_tokens"].as_u64().unwrap())
+            .sum();
+        assert_eq!(b["charged_tokens"], reserved);
+    }
+}
+
+#[test]
+fn root_budget_refuses_before_first_post_and_validates_limits() {
+    let s = Sandbox::new("budget-preflight");
+    let (out, requests, trace) = budget_run(&s, &["--max-budget-tokens", "1", "inspect"], vec![]);
+    assert!(!out.status.success());
+    assert!(requests.is_empty());
+    assert_eq!(trace["model_budget"]["requests"], 0);
+    assert_eq!(trace["model_budget"]["charged_tokens"], 0);
+    for flag in ["--max-requests", "--max-budget-tokens", "--budget-secs"] {
+        let out = s.cmd().args([flag, "0", "inspect"]).output().unwrap();
+        assert!(!out.status.success());
+    }
+}
+
+#[test]
+fn root_budget_retains_missing_or_partial_usage() {
+    for usage in [
+        serde_json::Value::Null,
+        serde_json::json!({"prompt_tokens":1}),
+        serde_json::json!({"prompt_tokens":-1,"completion_tokens":2}),
+    ] {
+        let s = Sandbox::new("budget-partial");
+        let mut response = bash_reply("printf observed");
+        response["usage"] = usage;
+        let (out, requests, trace) = budget_run(&s, &["--max-requests", "1", "inspect"], vec![sse_reply(response)]);
+        assert!(!out.status.success());
+        assert_eq!(requests.len(), 1);
+        let r = &requests[0].1;
+        assert_eq!(
+            trace["model_budget"]["charged_tokens"],
+            serde_json::to_vec(r).unwrap().len() as u64 + r["max_tokens"].as_u64().unwrap()
+        );
+        assert_eq!(trace["model_budget"]["unknown_usage_requests"], 1);
+        assert_eq!(trace["model_budget"]["known_tokens"], 0);
+    }
+}
+
+#[test]
+fn root_budget_settles_known_usage_and_verification_uses_no_model_request() {
+    let s = Sandbox::new("budget-settle");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence":"checked"}));
+    let (out, requests, trace) = budget_run(
+        &s,
+        &["--max-requests", "1", "--goal", "inspect", "--verify", "printf accepted"],
+        vec![sse_reply(done)],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 1);
+    assert!(trace["goal"]["status"].get("Done").is_some());
+    assert_eq!(trace["model_budget"]["charged_tokens"], 15);
+    assert_eq!(trace["model_budget"]["known_tokens"], 15);
+    assert_eq!(trace["model_budget"]["unknown_usage_requests"], 0);
+    assert_eq!(trace["verification"][0]["exit_code"], 0);
+}
+
+#[test]
+fn root_budget_reviewer_and_swarm_cannot_get_independent_allowances() {
+    for review in [true, false] {
+        let s = Sandbox::new(if review { "budget-review" } else { "budget-swarm" });
+        let args = if review {
+            vec!["--mode", "careful", "--max-requests", "1", "--goal", "inspect"]
+        } else {
+            vec!["--agents", "swarm", "--max-requests", "2", "inspect"]
+        };
+        let responses = if review {
+            vec![sse_reply(tool_reply("goal_done", serde_json::json!({"evidence":"checked"})))]
+        } else {
+            vec![
+                sse_reply(tool_reply(
+                    "swarm",
+                    serde_json::json!({"tasks":[{"description":"one","prompt":"inspect"},{"description":"two","prompt":"inspect"},{"description":"three","prompt":"inspect"}]}),
+                )),
+                sse_reply(text_reply("read-only findings")),
+            ]
+        };
+        let (out, requests, trace) = budget_run(&s, &args, responses);
+        assert!(!out.status.success());
+        assert_eq!(requests.len(), if review { 1 } else { 2 });
+        assert_eq!(trace["model_budget"]["requests"], requests.len());
+        assert_eq!(trace["model_budget"]["by_role"]["lead"], 1);
+        if !review {
+            assert_eq!(trace["model_budget"]["by_role"]["worker"], 1);
+        }
+        assert!(trace["goal"]["status"].get("Done").is_none());
+    }
+}
+
+#[test]
+fn root_budget_clear_new_goal_and_compaction_keep_one_allowance() {
+    use serde_json::json;
+    let s = Sandbox::new("budget-clear");
+    let response = text_reply(&"history ".repeat(1600));
+    let (url, server) = scripted_endpoint(vec![response, text_reply("summary")]);
+    let trajectory = s.project.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--max-requests", "2", "--memory", "off", "--mode", "standard", "--trajectory"])
+        .arg(&trajectory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"inspect\n/compact\n/clear\n/goal inspect again\n/exit\n").unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]["messages"].to_string().contains("Summarise the conversation"));
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(trajectory).unwrap()).unwrap();
+    assert_eq!(trace["model_budget"]["by_role"], json!({"lead":1,"compaction":1}));
+    assert_eq!(trace["model_budget"]["requests"], 2);
+    assert!(trace["goal"]["status"].get("Done").is_none());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("model budget exhausted"));
+}
+
+#[test]
+fn root_budget_error_cancels_owned_commands() {
+    let s = Sandbox::new("budget-cancel");
+    let start = tool_reply("bash_start", serde_json::json!({"command":"sleep 30","timeout":60}));
+    let (out, requests, trace) = budget_run(&s, &["--max-requests", "1", "--goal", "inspect"], vec![sse_reply(start)]);
+    assert!(!out.status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(trace["activities"][0]["status"], "Cancelled");
+    assert!(trace["goal"]["status"].get("Done").is_none());
+}
+
+#[test]
+fn root_budget_deadline_stops_a_silent_response() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    let s = Sandbox::new("budget-silent");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut buf = [0; 65536];
+        let _ = stream.read(&mut buf);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    let now = Instant::now();
+    let trajectory = s.project.join("trace.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--budget-secs", "1", "--mode", "standard", "--memory", "off", "--trajectory"])
+        .arg(&trajectory)
+        .arg("inspect")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|c| wait(c, Duration::from_secs(5)))
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(now.elapsed() < Duration::from_millis(2500));
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(trajectory).unwrap()).unwrap();
+    assert_eq!(trace["model_budget"]["requests"], 1);
+    assert_eq!(trace["model_budget"]["unknown_usage_requests"], 1);
+    server.join().unwrap();
+}
+
+#[test]
+fn root_budget_anthropic_requires_final_usage_and_counts_cached_input() {
+    for final_usage in [true, false] {
+        let s = Sandbox::new("budget-anthropic");
+        let mut events = [
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":5,"output_tokens":1}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"inspected"}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        ];
+        if final_usage {
+            events[2]["usage"] = serde_json::json!({"output_tokens":20});
+        }
+        let body: String = events.iter().map(|v| format!("data: {v}\n\n")).collect();
+        let (url, server) = scripted_sse(vec![body]);
+        let tracepath = s.project.join("trace.json");
+        let out = s
+            .cmd()
+            .env("ANTHROPIC_API_KEY", "offline-anthropic-key")
+            .env("ANTHROPIC_BASE_URL", url)
+            .args([
+                "--model",
+                "claude-test",
+                "--max-requests",
+                "1",
+                "--mode",
+                "standard",
+                "--memory",
+                "off",
+                "--trajectory",
+            ])
+            .arg(&tracepath)
+            .arg("inspect")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tracepath).unwrap()).unwrap();
+        let b = &trace["model_budget"];
+        if final_usage {
+            assert_eq!(b["known_tokens"], 125);
+            assert_eq!(b["charged_tokens"], 125);
+            assert_eq!(b["unknown_usage_requests"], 0);
+        } else {
+            assert_eq!(b["known_tokens"], 0);
+            assert_eq!(b["unknown_usage_requests"], 1);
+        }
+    }
+}
+
+#[test]
+fn root_budget_openai_reserves_the_actual_completion_cap() {
+    let s = Sandbox::new("budget-openai");
+    let (url, server) = scripted_endpoint(vec![text_reply("inspected")]);
+    let tracepath = s.project.join("trace.json");
+    let out = s
+        .cmd()
+        .env("OPENAI_API_KEY", "offline-openai-key")
+        .env("OPENAI_BASE_URL", url)
+        .args(["--model", "gpt-5", "--max-requests", "1", "--mode", "careful", "--memory", "off", "--trajectory"])
+        .arg(&tracepath)
+        .arg("inspect")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let requests = server.join().unwrap();
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tracepath).unwrap()).unwrap();
+    let r = &requests[0];
+    assert!(r.get("max_tokens").is_none());
+    assert_eq!(
+        trace["model_budget"]["charged_tokens"],
+        serde_json::to_vec(r).unwrap().len() as u64 + r["max_completion_tokens"].as_u64().unwrap()
+    );
+}
+
+#[test]
+fn root_budget_keeps_usage_unknown_when_the_stream_later_fails() {
+    let s = Sandbox::new("budget-failed-usage");
+    let mut partial = text_reply("partial output");
+    partial["usage"] = serde_json::json!({"prompt_tokens":10,"completion_tokens":5});
+    let raw = format!("data: {}\n\ndata: {}\n\n", partial, serde_json::json!({"error":{"type":"api_error"}}));
+    let (out, requests, trace) = budget_run(&s, &["--max-requests", "1", "inspect"], vec![(200, raw)]);
+    assert!(!out.status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(trace["model_budget"]["unknown_usage_requests"], 1);
+    assert_eq!(trace["model_budget"]["known_tokens"], 0);
+}
+
+#[test]
+fn root_budget_overrun_rejects_completion_and_stops_new_dispatch() {
+    let s = Sandbox::new("budget-overrun");
+    let mut done = tool_reply("goal_done", serde_json::json!({"evidence":"checked"}));
+    done["usage"] = serde_json::json!({"prompt_tokens":5_000_000,"completion_tokens":1});
+    let (out, requests, trace) = budget_run(
+        &s,
+        &["--max-budget-tokens", "4000000", "--goal", "inspect", "--verify", "printf accepted"],
+        vec![sse_reply(done)],
+    );
+    assert!(!out.status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(trace["model_budget"]["overrun"], true);
+    assert!(trace["goal"]["status"].get("Done").is_none());
+    assert!(trace["verification"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn root_budget_refuses_unaccounted_deep_memory() {
+    let s = Sandbox::new("budget-deep");
+    let out = s.cmd().args(["--max-requests", "20", "--memory", "deep", "inspect"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot share this model budget"));
+}
+
+#[test]
+fn root_budget_failed_expensive_review_cannot_be_skipped_on_resume() {
+    let s = Sandbox::new("budget-review-resume");
+    std::fs::write(s.home.join("settings.json"), r#"{"agents":{"sub_model":"claude-test"}}"#).unwrap();
+    let (url, server) = scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"evidence":"checked"}))]);
+    let tracepath = s.project.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("ANTHROPIC_API_KEY", "offline-anthropic-key")
+        .env("ANTHROPIC_BASE_URL", &url)
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "careful", "--memory", "off", "--max-budget-tokens", "65000", "--trajectory"])
+        .arg(&tracepath)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"/goal inspect\n/goal resume\n/clear\n/goal another goal\n/exit\n").unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success());
+    assert_eq!(server.join().unwrap().len(), 1);
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tracepath).unwrap()).unwrap();
+    assert_eq!(trace["model_budget"]["halted"], true);
+    assert_eq!(trace["model_budget"]["requests"], 1);
+    assert!(trace["goal"]["status"].get("Done").is_none());
+}
+
+#[test]
+fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
+    let s = Sandbox::new("budget-rate-limited");
+    let (out, requests, trace) = budget_run(
+        &s,
+        &["--max-requests", "1", "inspect"],
+        vec![(429, r#"{"error":"slow down"}"#.into()), sse_reply(text_reply("looked"))],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(trace["model_budget"]["requests"], 1);
+    assert_eq!(trace["model_budget"]["rate_limited"], 1);
+}
+
+#[test]
+fn a_review_that_quotes_a_budget_error_does_not_halt_the_run() {
+    let s = Sandbox::new("careful-quote");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let (_, stderr, requests) = scripted_run(
+        &s,
+        &["--mode", "careful", "--goal", "check the workspace", "--stats"],
+        vec![done.clone(), text_reply("no issues; the old log line 'model budget exhausted' is only test data"), done],
+    );
+    assert_eq!(requests.len(), 3);
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
 }
 
 #[test]
