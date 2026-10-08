@@ -75,8 +75,8 @@ struct Cli {
     #[arg(short, long, env = "RUSTY_AGENTS")]
     agents: Option<String>,
 
-    /// Maximum parallel workers (1..8); overrides saved swarm size
-    #[arg(long, env = "RUSTY_SWARM_MAX", value_parser = clap::value_parser!(u8).range(1..=8))]
+    /// Workers running at once (1..16); overrides saved swarm size
+    #[arg(long, env = "RUSTY_SWARM_MAX", value_parser = clap::value_parser!(u8).range(1..=16))]
     swarm_max: Option<u8>,
 
     /// View: default, verbose or adhd (overrides saved settings)
@@ -780,8 +780,8 @@ fn swarm_cmd(agent: &mut Agent, rest: &str) {
         "on" => a.mode = AgentsMode::Swarm,
         "off" => a.mode = AgentsMode::Off,
         "size" | "max" => match arg.parse::<usize>() {
-            Ok(n) if (1..=64).contains(&n) => a.swarm_max = n,
-            _ => println!("  size must be 1-64"),
+            Ok(n) if (1..=16).contains(&n) => a.swarm_max = n,
+            _ => println!("  size must be 1-16"),
         },
         "models" => {
             a.swarm_models = arg

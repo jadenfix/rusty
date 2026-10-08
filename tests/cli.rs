@@ -228,7 +228,7 @@ fn settings_persist_across_sessions() {
 fn swarm_validates_input() {
     let s = Sandbox::new("swarm");
     let out = s.repl(&["/swarm size 500", "/swarm spread 3", "/swarm models a/x, b/y", "/swarm"]);
-    assert!(out.contains("size must be 1-64"));
+    assert!(out.contains("size must be 1-16"));
     assert!(out.contains("spread must be between 0 and 1"));
     assert!(out.contains("a/x, b/y"));
 }
