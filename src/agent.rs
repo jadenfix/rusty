@@ -28,6 +28,7 @@ use rusty::advisor::{Hooks, Mode as MemoryMode};
 
 const MAX_STEPS: usize = 80;
 const WORKER_STEPS: usize = 30;
+const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanItem {
@@ -123,6 +124,13 @@ pub struct Agent {
     checker_owed: bool,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
+    /// Messages that compaction or clearing removed from `history`, oldest
+    /// first. Only the exported trajectory reads them.
+    pub archived: Vec<Value>,
+    /// Where `--trajectory` goes; long runs refresh it as they go so a run
+    /// killed from outside still leaves a record.
+    pub trajectory_path: Option<PathBuf>,
+    trajectory_saved: Option<Instant>,
     pub policy: Policy,
     pub memory: Memory,
     pub memory_mode: MemoryMode,
@@ -187,6 +195,9 @@ impl Agent {
             checker_owed: false,
             cwd,
             history: Vec::new(),
+            archived: Vec::new(),
+            trajectory_path: None,
+            trajectory_saved: None,
             policy,
             memory,
             memory_mode: MemoryMode::Legacy,
@@ -309,7 +320,7 @@ impl Agent {
     }
 
     pub fn clear(&mut self) {
-        self.history.clear();
+        self.archived.append(&mut self.history);
         self.plan.clear();
         self.goal = None;
         self.verification_records.clear();
@@ -697,6 +708,7 @@ impl Agent {
                 };
                 self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
             }
+            self.checkpoint_trajectory();
             if outcome.is_err() {
                 self.pending_goal = None;
                 break;
@@ -1425,6 +1437,7 @@ impl Agent {
         }
         // The verbatim user messages go last; later compactions read them back from here.
         block.push_str(&format!("{}\n{carried}", context::USER_MESSAGES_HEADER));
+        self.archived.append(&mut self.history);
         self.history = vec![json!({"role": "user", "content": block})];
         // Keep user/assistant alternation when the kept tail starts with a user turn.
         if tail.first().is_some_and(|m| m["role"] == "user") {
@@ -1438,6 +1451,50 @@ impl Agent {
             if memories.is_empty() { String::new() } else { format!(", {} memories saved", memories.len()) }
         )));
         Ok(())
+    }
+
+    /// The whole run for benchmark harnesses and reviewers: every message in
+    /// order, including the ones compaction summarised away.
+    pub fn trajectory(&self) -> Value {
+        let t = &self.totals;
+        let mut messages = self.archived.clone();
+        messages.extend(self.history.iter().cloned());
+        json!({
+            "agent": "rusty",
+            "version": env!("CARGO_PKG_VERSION"),
+            "model": self.model,
+            "memory_mode": self.memory_mode,
+            "memory": self.advisor.as_ref().map(|h| &h.metrics),
+            "execution_mode": self.execution_mode.name(),
+            "tools_location": self.backend.summary(),
+            "messages": messages,
+            "archived_messages": self.archived.len(),
+            "goal": self.goal,
+            "verification": self.verification_records,
+            "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
+        })
+    }
+
+    pub fn write_trajectory(&self) -> Result<()> {
+        let Some(path) = &self.trajectory_path else { return Ok(()) };
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Write beside it and rename, so a run killed mid-write keeps the last good copy.
+        let tmp = path.with_extension("partial");
+        rusty::privacy::write_json(&tmp, self.trajectory())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Rewrites the trajectory at most every `TRAJECTORY_EVERY` during a run.
+    /// Best effort: the final write on exit still reports errors.
+    fn checkpoint_trajectory(&mut self) {
+        if self.trajectory_path.is_none() || self.trajectory_saved.is_some_and(|t| t.elapsed() < TRAJECTORY_EVERY) {
+            return;
+        }
+        let _ = self.write_trajectory();
+        self.trajectory_saved = Some(Instant::now());
     }
 
     pub fn context_report(&self) -> String {

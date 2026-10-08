@@ -1790,6 +1790,74 @@ fn announcing_completion_through_echo_is_redirected_then_stopped() {
 }
 
 #[test]
+fn trajectory_keeps_commands_that_compaction_summarised_away() {
+    let s = Sandbox::new("trajectory-compaction");
+    let replies = vec![
+        bash_reply("echo first-marker; seq 100000 199999"),
+        bash_reply("echo second"),
+        text_reply("Ran two commands; the second printed filler."),
+        text_reply("finished"),
+    ];
+    let (url, server) = scripted_endpoint(replies);
+    let path = s.home.join("compacted.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .env("RUSTY_CONTEXT_TOKENS", "22000")
+        .args(["--agents", "off", "--memory", "off", "--yolo", "--goal", "print some output", "--trajectory"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(15)))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4, "{}", String::from_utf8_lossy(&out.stdout));
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let messages = trace["messages"].as_array().unwrap();
+    assert!(trace["archived_messages"].as_u64().unwrap() > 0, "{}", String::from_utf8_lossy(&out.stdout));
+    // The last request no longer carries the first command's output; the trajectory still does.
+    assert!(!requests[3]["messages"].to_string().contains("first-marker\\n100000"));
+    let first = messages
+        .iter()
+        .position(|m| m["content"].as_str().is_some_and(|c| c.contains("first-marker\n100000")))
+        .unwrap();
+    let summary = messages.iter().position(|m| m.to_string().contains("[Summary of the conversation so far]")).unwrap();
+    assert!(first < summary);
+    assert!(!s.home.join("compacted.partial").exists());
+}
+
+#[test]
+fn a_killed_run_still_leaves_a_trajectory() {
+    let s = Sandbox::new("trajectory-killed");
+    let (url, server) = scripted_endpoint(vec![bash_reply("echo step-one")]);
+    let path = s.home.join("killed.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--agents", "off", "--memory", "off", "--yolo", "--goal", "run two steps", "--trajectory"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(15), "no trajectory before the kill");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    server.join().unwrap();
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(trace["messages"].to_string().contains("step-one"));
+    assert_eq!(trace["totals"]["requests"], 1);
+}
+
+#[test]
 fn destructive_calls_run_unattended_only_with_the_opt_in_and_yolo() {
     for (case, permissions, opt_in, runs) in
         [("opted-in", "yolo", true, true), ("no-opt-in", "yolo", false, false), ("auto-mode", "auto", true, false)]
