@@ -149,7 +149,7 @@ fn qa(live: bool) -> Result<()> {
     step("memory hooks (real CLI, offline provider)");
     sh("cargo", &["build", "--bins"])?;
     let report = std::env::temp_dir().join(format!("rusty-memory-offline-{}.json", std::process::id()));
-    let smoke = memory::Smoke::new(root().join("target/debug/rusty"), report);
+    let smoke = memory::Smoke::new(target_dir().join("debug/rusty"), report);
     if !memory::smoke(&smoke)? {
         bail!("the memory smoke failed");
     }

@@ -81,7 +81,14 @@ impl Sandbox {
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_BASE_URL")
             .env_remove("OPENAI_API_KEY")
-            .env_remove("OPENAI_BASE_URL");
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("RUSTY_API_KEY")
+            .env_remove("RUSTY_BASE_URL")
+            .env_remove("NVIDIA_API_BASE");
+        // A developer's rotation keys would join the offline key and reach the network.
+        for n in 2..=9 {
+            c.env_remove(format!("NVIDIA_API_KEY_{n}"));
+        }
         c
     }
 
