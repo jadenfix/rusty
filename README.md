@@ -256,6 +256,7 @@ yolo                 run               run                run                nee
   - disk writes.
 
   An allow rule can't skip this. With nobody at the keyboard (a script, CI, a benchmark), it's refused, and the model is told to hand the command to a person.
+  The one exception is a disposable sandbox that a harness runs on purpose: `RUSTY_ALLOW_DESTRUCTIVE=1` together with `--yolo` and no terminal lets these run, each with a warning line. It has no effect in an interactive session or any other permission mode.
 
 rusty looks at what a command will really run, not just its first word:
 - the scripts it calls, `package.json` scripts, `make` targets;
