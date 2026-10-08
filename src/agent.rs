@@ -303,8 +303,10 @@ impl Agent {
              Recent steps and the proposed completion:\n{}",
             ui::truncate(&recent, 24_000)
         );
+        let denied = self.client.budget.denied();
         let report = self.run_workers(vec![("careful check".into(), prompt)], d, "review");
-        if report.contains("model budget exhausted") {
+        // Ask the ledger, not the report: a reviewer may quote that phrase from a file.
+        if self.client.budget.denied() > denied {
             self.client.budget.halt();
             bail!("model budget exhausted: required careful review could not finish");
         }

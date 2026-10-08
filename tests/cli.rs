@@ -2501,3 +2501,16 @@ fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert_eq!(trace["model_budget"]["rate_limited"], 1);
 }
+
+#[test]
+fn a_review_that_quotes_a_budget_error_does_not_halt_the_run() {
+    let s = Sandbox::new("careful-quote");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let (_, stderr, requests) = scripted_run(
+        &s,
+        &["--mode", "careful", "--goal", "check the workspace", "--stats"],
+        vec![done.clone(), text_reply("no issues; the old log line 'model budget exhausted' is only test data"), done],
+    );
+    assert_eq!(requests.len(), 3);
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
+}

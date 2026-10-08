@@ -117,6 +117,10 @@ impl Budget {
         *s.by_role.entry(role.into()).or_default() += 1;
         Ok(Reservation { budget: self.clone(), tokens, role: role.into() })
     }
+    /// Admissions refused so far; a rise across a call means it ran out.
+    pub fn denied(&self) -> u64 {
+        self.state.lock().unwrap().denied_requests
+    }
     /// Required-review budget failure cannot be bypassed by resuming a goal.
     pub fn halt(&self) {
         self.state.lock().unwrap().halted = true;
