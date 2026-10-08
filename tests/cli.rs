@@ -1789,6 +1789,20 @@ fn an_error_after_text_has_streamed_is_not_retried() {
 }
 
 #[test]
+fn a_drop_while_the_model_is_still_reasoning_is_retried() {
+    let s = Sandbox::new("stream-reasoning-drop");
+    let thinking =
+        serde_json::json!({"choices": [{"delta": {"reasoning_content": "let me think"}, "finish_reason": null}]});
+    let dropped = format!("data: {thinking}\n\ndata: {}\n\n", r#"{"error":{"code":503,"message":"overloaded"}}"#);
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "the answer"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_sse(vec![dropped, format!("data: {answer}\n\ndata: [DONE]\n\n")]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the answer"));
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
 fn announcing_completion_through_echo_is_redirected_then_stopped() {
     let s = Sandbox::new("echo-wrapup");
     let replies = (1..=5).map(|i| bash_reply(&format!("echo \"Task completed ({i}).\" && exit 0"))).collect();

@@ -250,8 +250,8 @@ impl Client {
     /// Runs one streamed request, and runs it again when the provider reports
     /// an overload, rate limit or server error inside the stream (an HTTP 200
     /// whose events carry the error) or the stream drops, as long as nothing
-    /// has been shown yet. Once text has streamed, a retry would repeat it, so
-    /// the error stands. Shares the retry budget and backoff with `send`.
+    /// has been shown yet. Once answer text has streamed, a retry would repeat
+    /// it, so the error stands. Shares the retry budget and backoff with `send`.
     fn stream_with_retry(
         &self,
         on: &mut dyn FnMut(Delta) -> bool,
@@ -264,7 +264,9 @@ impl Client {
             self.budget.remaining()?;
             let mut shown = false;
             let result = attempt(&mut |d| {
-                shown = true;
+                // Reasoning is neither kept in history nor shown outside the
+                // verbose view, so a drop while the model thinks is retryable.
+                shown |= matches!(d, Delta::Content(_));
                 on(d)
             });
             let err = match result {
