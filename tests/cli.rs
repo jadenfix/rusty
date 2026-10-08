@@ -1856,3 +1856,35 @@ fn a_killed_run_still_leaves_a_trajectory() {
     assert!(trace["messages"].to_string().contains("step-one"));
     assert_eq!(trace["totals"]["requests"], 1);
 }
+
+#[test]
+fn destructive_calls_run_unattended_only_with_the_opt_in_and_yolo() {
+    for (case, permissions, opt_in, runs) in
+        [("opted-in", "yolo", true, true), ("no-opt-in", "yolo", false, false), ("auto-mode", "auto", true, false)]
+    {
+        let s = Sandbox::new(&format!("unattended-{case}"));
+        s.fake("kubectl", "printf 'kind-dev|default'");
+        let (url, server) =
+            scripted_endpoint(vec![bash_reply("kubectl drain node-2 --ignore-daemonsets"), text_reply("done")]);
+        let mut cmd = s.cmd();
+        cmd.env("RUSTY_BASE_URL", url).env("RUSTY_GOAL_MAX_TURNS", "1");
+        if opt_in {
+            cmd.env("RUSTY_ALLOW_DESTRUCTIVE", "1");
+        }
+        let out = cmd
+            .args(["--agents", "off", "--memory", "off", "--permissions", permissions, "--goal", "retire node-2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(|child| wait(child, Duration::from_secs(15)))
+            .unwrap();
+        let requests = server.join().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(s.calls().contains("kubectl drain node-2"), runs, "{case}: {stdout}");
+        assert_eq!(requests[1]["messages"].to_string().contains("nobody is watching"), !runs, "{case}");
+        if runs {
+            assert!(stdout.contains("allowed unattended by RUSTY_ALLOW_DESTRUCTIVE"), "{stdout}");
+        }
+    }
+}

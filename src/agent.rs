@@ -904,6 +904,9 @@ impl Agent {
                     "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
                 )));
             }
+            Verdict::Confirm(why) if unattended_destructive(self.policy.mode) => {
+                d.line(&ui::warn(&format!("  ‼ {why}: allowed unattended by RUSTY_ALLOW_DESTRUCTIVE")));
+            }
             Verdict::Confirm(why) => {
                 d.pause();
                 if display::view() == View::Adhd {
@@ -1583,6 +1586,17 @@ enum Answer {
     Yes,
     Always,
     No(Option<String>),
+}
+
+/// Destructive calls normally need a person every time. A disposable sandbox
+/// run by a harness can opt out with `RUSTY_ALLOW_DESTRUCTIVE=1`, which only
+/// counts in yolo mode with nobody at the terminal, so it can't weaken an
+/// interactive session or the other permission modes.
+fn unattended_destructive(mode: crate::permissions::Mode) -> bool {
+    use std::io::IsTerminal;
+    mode == crate::permissions::Mode::Yolo
+        && std::env::var("RUSTY_ALLOW_DESTRUCTIVE").is_ok_and(|v| v.trim() == "1")
+        && !std::io::stdin().is_terminal()
 }
 
 /// Asks for approval. Uses line editing so Ctrl-C cleanly means "no, stop".
