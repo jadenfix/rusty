@@ -362,7 +362,7 @@ impl Client {
                 if let Some(b) = beta {
                     req = req.header("anthropic-beta", b);
                 }
-                let reservation = reserve.map(|n| self.budget.reserve(role, n)).transpose()?;
+                let mut reservation = reserve.map(|n| self.budget.reserve(role, n)).transpose()?;
                 if reservation.is_some() {
                     req = req.timeout(self.budget.remaining()?.min(Duration::from_secs(600)));
                 }
@@ -383,7 +383,12 @@ impl Client {
                         last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
                         match status {
                             401 | 403 => refused[idx] += 1,
-                            429 | 500..=599 => {}
+                            429 => {
+                                if let Some(r) = reservation.take() {
+                                    r.refund_rate_limited();
+                                }
+                            }
+                            500..=599 => {}
                             _ => bail!(last_err),
                         }
                     }

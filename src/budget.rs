@@ -25,6 +25,7 @@ struct State {
     settled_requests: u64,
     active_requests: u64,
     denied_requests: u64,
+    rate_limited: u64,
     overrun: bool,
     halted: bool,
     by_role: BTreeMap<String, u64>,
@@ -114,7 +115,7 @@ impl Budget {
         s.charged_tokens += tokens;
         s.active_requests += 1;
         *s.by_role.entry(role.into()).or_default() += 1;
-        Ok(Reservation { budget: self.clone(), tokens })
+        Ok(Reservation { budget: self.clone(), tokens, role: role.into() })
     }
     /// Required-review budget failure cannot be bypassed by resuming a goal.
     pub fn halt(&self) {
@@ -137,6 +138,7 @@ impl Budget {
                 settled_requests: s.settled_requests,
                 active_requests: s.active_requests,
                 denied_requests: s.denied_requests,
+                rate_limited: s.rate_limited,
                 overrun: s.overrun,
                 halted: s.halted,
                 by_role: s.by_role.clone(),
@@ -147,6 +149,7 @@ impl Budget {
 pub struct Reservation {
     budget: Arc<Budget>,
     tokens: u64,
+    role: String,
 }
 impl Reservation {
     /// Consume once, only for a complete response with both usage counters.
@@ -159,6 +162,20 @@ impl Reservation {
         s.known_tokens = s.known_tokens.saturating_add(actual);
         s.settled_requests += 1;
         s.overrun |= s.charged_tokens > self.budget.limits.tokens;
+    }
+}
+impl Reservation {
+    /// A complete HTTP 429 means the provider refused before doing any work,
+    /// so the attempt is returned rather than spending the run's allowance on
+    /// someone else's rate limit. The retry window and deadline still bound it.
+    pub fn refund_rate_limited(self) {
+        let mut s = self.budget.state.lock().unwrap();
+        s.requests -= 1;
+        s.charged_tokens = s.charged_tokens.saturating_sub(self.tokens);
+        if let Some(n) = s.by_role.get_mut(&self.role) {
+            *n -= 1;
+        }
+        s.rate_limited += 1;
     }
 }
 impl Drop for Reservation {
@@ -202,6 +219,17 @@ mod tests {
         let s = b.snapshot();
         assert_eq!((s.state.charged_tokens, s.state.known_tokens, s.unknown_usage_requests), (100, 15, 1));
         assert_eq!(s.state.by_role["review"], 1);
+    }
+    #[test]
+    fn rate_limited_attempts_are_returned() {
+        let b = Budget::new(Limits { requests: 1, tokens: 100, seconds: 30 });
+        b.reserve("lead", 100).unwrap().refund_rate_limited();
+        let r = b.reserve("lead", 100).unwrap();
+        assert!(b.reserve("lead", 1).is_err());
+        drop(r);
+        let s = b.snapshot();
+        assert_eq!((s.state.requests, s.state.charged_tokens, s.state.rate_limited), (1, 100, 1));
+        assert_eq!((s.state.by_role["lead"], s.state.active_requests, s.unknown_usage_requests), (1, 0, 1));
     }
     #[test]
     fn overrun_overflow_and_expired_deadlines_fail_closed() {

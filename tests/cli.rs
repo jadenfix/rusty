@@ -2487,3 +2487,17 @@ fn root_budget_failed_expensive_review_cannot_be_skipped_on_resume() {
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert!(trace["goal"]["status"].get("Done").is_none());
 }
+
+#[test]
+fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
+    let s = Sandbox::new("budget-rate-limited");
+    let (out, requests, trace) = budget_run(
+        &s,
+        &["--max-requests", "1", "inspect"],
+        vec![(429, r#"{"error":"slow down"}"#.into()), sse_reply(text_reply("looked"))],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(trace["model_budget"]["requests"], 1);
+    assert_eq!(trace["model_budget"]["rate_limited"], 1);
+}
