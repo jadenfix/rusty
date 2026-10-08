@@ -1728,9 +1728,9 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));
         let mut prompt = prompt;
         loop {
-            let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+            let line = match signal::approval_line(&prompt) {
                 Ok(l) => l,
-                Err(rustyline::error::ReadlineError::Interrupted) => {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     signal::trip();
                     return Answer::No(Some("the user pressed ctrl-c to stop".into()));
                 }
@@ -1749,19 +1749,20 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         }
     }
     println!("  {} {}", ui::warn("?"), why);
-    let prompt = format!("  {} ", ui::dim("[y]es  [a]lways  [n]o  or say what to do instead ›"));
-    let line = match rustyline::DefaultEditor::new().and_then(|mut rl| rl.readline(&prompt)) {
+    let prompt = format!("  {} ", ui::dim("[y]es  [a]lways  [N]o  or say what to do instead ›"));
+    let line = match signal::approval_line(&prompt) {
         Ok(l) => l,
-        Err(rustyline::error::ReadlineError::Interrupted) => {
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
             signal::trip();
             return Answer::No(Some("the user pressed ctrl-c to stop".into()));
         }
         Err(_) => return Answer::No(None),
     };
     match line.trim() {
-        "" | "y" | "Y" | "yes" => Answer::Yes,
+        "y" | "Y" | "yes" => Answer::Yes,
         "a" | "A" | "always" => Answer::Always,
-        "n" | "N" | "no" => Answer::No(None),
+        // A stray Enter must not approve a call that asked first.
+        "" | "n" | "N" | "no" => Answer::No(None),
         other => Answer::No(Some(other.to_string())),
     }
 }

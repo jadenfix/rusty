@@ -64,6 +64,11 @@ impl Pty {
         Ok(Pty { master, child, eof: false })
     }
 
+    /// Changes the terminal size; the kernel sends the child SIGWINCH.
+    pub fn set_size(&self, rows: u16, cols: u16) -> Result<()> {
+        resize(&self.master, rows, cols)
+    }
+
     /// Waits up to `timeout` for output.
     pub fn read(&mut self, timeout: Duration) -> Result<Chunk> {
         if self.eof {

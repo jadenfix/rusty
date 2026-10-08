@@ -98,3 +98,37 @@ pub fn restore_terminal() {
         }
     }
 }
+
+/// Reads one approval answer in the terminal's own cooked line editing.
+/// A second rustyline editor here would replace the REPL's process-wide
+/// resize handler, and dropping it leaves that handler writing to a closed
+/// pipe, so the next terminal resize aborted rusty. Ctrl-C (SIGINT in cooked
+/// mode) comes back as `ErrorKind::Interrupted`.
+pub fn approval_line(prompt: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    restore_terminal();
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    loop {
+        if interrupted() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        // SAFETY: poll reads one pollfd for up to 50 ms.
+        let ready = unsafe { libc::poll(&mut p, 1, 50) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready > 0 {
+            let mut line = String::new();
+            if std::io::stdin().lock().read_line(&mut line)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            return Ok(line);
+        }
+    }
+}
