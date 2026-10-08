@@ -17,6 +17,7 @@ mod memory;
 mod permissions;
 mod signal;
 mod skills;
+mod swarm;
 mod tips;
 mod tools;
 mod ui;

@@ -157,6 +157,8 @@ pub struct Agent {
     pub mcp: crate::mcp::Mcp,
     is_worker: bool,
     request_role: &'static str,
+    /// A swarm worker's board, its index, how many notes it has seen and its label.
+    board: Option<(crate::swarm::Board, usize, usize, String)>,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -226,6 +228,7 @@ impl Agent {
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
             request_role: "lead",
+            board: None,
             progress: None,
         }
     }
@@ -352,8 +355,15 @@ impl Agent {
                 "You are a research worker for a coding agent, working in {}. Investigate the task you are given \
                  with read-only tools and report back: findings first, with path:line references, then anything \
                  uncertain. You cannot edit files. Prefer search, glob and outline over reading whole files. Stop \
-                 as soon as you can answer; your report should be under 400 words.\n",
-                self.cwd.display()
+                 as soon as you can answer; your report should be under 400 words.\n{}",
+                self.cwd.display(),
+                if self.board.is_some() {
+                    "Other workers are investigating other parts at the same time. When you find something they \
+                     could use, call share with one line. Their findings arrive as notes: build on them and don't \
+                     redo what they have covered.\n"
+                } else {
+                    ""
+                }
             );
             return (s, Vec::new());
         }
@@ -387,14 +397,18 @@ impl Agent {
                  report. Use it for a focused investigation that would take many reads; do small lookups yourself.\n",
             ),
             AgentsMode::Swarm => s.push_str(&format!(
-                "\nDelegation: the swarm tool runs up to {} read-only workers in parallel, each with its own \
-                 context, and returns their reports. Use it for broad work that splits cleanly, such as surveying \
-                 several modules or checking many files for the same problem. Give each worker a self-contained \
-                 prompt and its own slice.\n",
-                self.swarm_cap()
+                "\nDelegation: the swarm tool runs up to {} read-only workers at a time (at most {} tasks per call), \
+                 each with its own context. Workers share findings with each other while they run, and you get \
+                 every report plus what they shared. Use it for broad work that splits cleanly, such as surveying \
+                 several modules or checking many files for the same problem: one task per slice, so together they \
+                 cover everything. Give each worker a self-contained prompt and its own slice. You make every change \
+                 and verify it yourself.\n",
+                self.swarm_cap(),
+                crate::swarm::MAX_JOBS
             )),
             AgentsMode::Auto => s.push_str(&format!(
-                "\nDelegation: task runs one read-only subagent; swarm runs up to {} in parallel. Pick the lightest \
+                "\nDelegation: task runs one read-only subagent; swarm runs read-only workers, {} at a time, that \
+                 share findings with each other. Pick the lightest \
                  option that works: do it yourself if it takes fewer than about five reads, use task for one deep \
                  investigation, and use swarm only when the work splits into three or more independent parts.\n",
                 self.swarm_cap()
@@ -458,6 +472,14 @@ impl Agent {
             .cloned()
             .collect();
         if self.is_worker {
+            if self.board.is_some() {
+                defs.push(tools::tool(
+                    "share",
+                    "Share one finding with the other workers now: a root cause, a file that matters to them, or a dead end they can skip. One line with path:line.",
+                    json!({"finding": {"type": "string"}}),
+                    &["finding"],
+                ));
+            }
             return Value::Array(defs);
         }
         defs.extend(self.mcp.definitions());
@@ -509,8 +531,8 @@ impl Agent {
         if matches!(self.agents.mode, AgentsMode::Swarm | AgentsMode::Auto) {
             defs.push(t(
                 "swarm",
-                "Run several read-only workers in parallel, one per task, and get all their reports.",
-                json!({"tasks": {"type": "array", "items": job, "maxItems": self.swarm_cap()}}),
+                "Run read-only workers in parallel, one per task, and get all their reports plus the findings they shared with each other.",
+                json!({"tasks": {"type": "array", "items": job, "maxItems": crate::swarm::MAX_JOBS}}),
                 &["tasks"],
             ));
         }
@@ -585,6 +607,13 @@ impl Agent {
             if signal::interrupted() {
                 outcome = Ok(false);
                 break;
+            }
+            if let Some((board, me, seen, _)) = &mut self.board {
+                let notes = board.unseen(*me, seen);
+                if !notes.is_empty() {
+                    let text = format!("{}Other workers shared:\n- {}", context::NOTE, notes.join("\n- "));
+                    self.history.push(json!({"role": "user", "content": text}));
+                }
             }
             self.manage_context(&mut d);
             let (mut system, mem_ids) = self.system_prompt(&query);
@@ -891,7 +920,10 @@ impl Agent {
 
     fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
         if self.is_worker
-            && !matches!(call.name.as_str(), "read_file" | "list_files" | "search" | "glob" | "outline" | "bash")
+            && !matches!(
+                call.name.as_str(),
+                "read_file" | "list_files" | "search" | "glob" | "outline" | "bash" | "share"
+            )
         {
             return "denied: a read-only worker can only inspect files and run read-only commands".into();
         }
@@ -932,6 +964,10 @@ impl Agent {
                 }
             }
             "goal_done" => Ok(self.finish_goal(&args)),
+            "share" => Ok(match &self.board {
+                Some((board, me, _, label)) => board.post(*me, label, args["finding"].as_str().unwrap_or("")).into(),
+                None => "there are no other workers to share with".into(),
+            }),
             "loop_next" => {
                 if let Some(l) = &mut self.loop_ctl {
                     l.stop = args["stop"].as_bool().unwrap_or(false);
@@ -1233,35 +1269,55 @@ impl Agent {
 
     /// Runs read-only workers in parallel threads and collects their reports.
     /// One job is a subagent; several are a swarm.
+    /// Runs read-only workers through a pool, `swarm_cap` at a time. Workers in
+    /// a swarm share findings on a board; the lead gets every report and the board.
     fn run_workers(&mut self, jobs: Vec<(String, String)>, d: &mut Display, role: &'static str) -> String {
         let cfg = self.agents.clone();
-        let n = jobs.len().min(self.swarm_cap().max(1));
+        let skipped = jobs.len().saturating_sub(crate::swarm::MAX_JOBS);
+        let jobs: Vec<_> = jobs.into_iter().take(crate::swarm::MAX_JOBS).enumerate().collect();
+        let n = jobs.len();
+        let parallel = self.swarm_cap().max(1).min(n);
         let label = if n == 1 { "subagent" } else { "swarm" };
+        let board = (n > 1).then(crate::swarm::Board::default);
+        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(jobs)));
+        let counters: Arc<Vec<AtomicUsize>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut counters = Vec::new();
-        for (i, (desc, prompt)) in jobs.into_iter().take(n).enumerate() {
-            let model = if !cfg.swarm_models.is_empty() && n > 1 {
-                cfg.swarm_models[i % cfg.swarm_models.len()].clone()
-            } else {
-                cfg.sub_model.clone().unwrap_or_else(|| self.model.clone())
-            };
-            let temperature = if n > 1 { 0.2 + cfg.spread * i as f32 / (n - 1) as f32 } else { 0.2 };
-            let counter = Arc::new(AtomicUsize::new(0));
-            counters.push(counter.clone());
-            let execution_mode = self.execution_mode;
-            let backend = self.backend.clone();
-            let (client, cwd, deny, tx) = (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), tx.clone());
-            std::thread::spawn(move || {
-                let mut w = Agent::new(client, model.clone(), cwd, Policy::new(Mode::ReadOnly), Memory::empty());
+        for _ in 0..parallel {
+            let (queue, counters, board, tx) = (queue.clone(), counters.clone(), board.clone(), tx.clone());
+            let (client, cwd, deny, backend) =
+                (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), self.backend.clone());
+            let (cfg, lead_model, execution_mode) = (cfg.clone(), self.model.clone(), self.execution_mode);
+            std::thread::spawn(move || loop {
+                if signal::interrupted() {
+                    break;
+                }
+                let Some((i, (desc, prompt))) = queue.lock().unwrap().pop_front() else { break };
+                let model = if !cfg.swarm_models.is_empty() && n > 1 {
+                    cfg.swarm_models[i % cfg.swarm_models.len()].clone()
+                } else {
+                    cfg.sub_model.clone().unwrap_or_else(|| lead_model.clone())
+                };
+                let temperature = if n > 1 { 0.2 + cfg.spread * i as f32 / (n - 1) as f32 } else { 0.2 };
+                let counter = Arc::new(AtomicUsize::new(0));
+                let mut w = Agent::new(
+                    client.clone(),
+                    model.clone(),
+                    cwd.clone(),
+                    Policy::new(Mode::ReadOnly),
+                    Memory::empty(),
+                );
                 w.is_worker = true;
                 w.request_role = role;
-                w.backend = backend;
+                w.backend = backend.clone();
                 w.execution_mode = execution_mode;
                 w.temperature = temperature.min(1.2);
-                w.progress = Some(counter);
-                w.policy.deny = deny;
+                w.progress = Some(counter.clone());
+                w.policy.deny = deny.clone();
+                w.board = board.clone().map(|b| (b, i, 0, desc.clone()));
                 let t0 = Instant::now();
-                let result = w.run_turn(&prompt);
+                // A panicking worker is one failed report, not a lost swarm.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.run_turn(&prompt)));
+                counters[i].store(counter.load(Ordering::Relaxed), Ordering::Relaxed);
                 let answer = w
                     .history
                     .iter()
@@ -1271,11 +1327,14 @@ impl Agent {
                     .unwrap_or("")
                     .to_string();
                 let report = match result {
-                    Err(e) => format!("failed: {e:#}"),
-                    Ok(_) if answer.is_empty() => "returned nothing".to_string(),
-                    Ok(_) => answer,
+                    Err(_) => "failed: the worker crashed".to_string(),
+                    Ok(Err(e)) => format!("failed: {e:#}"),
+                    Ok(Ok(_)) if answer.is_empty() => "returned nothing".to_string(),
+                    Ok(Ok(_)) => answer,
                 };
-                let _ = tx.send((i, desc, model, report, w.totals, t0.elapsed()));
+                if tx.send((i, desc, model, report, w.totals.clone(), t0.elapsed())).is_err() {
+                    break;
+                }
             });
         }
         drop(tx);
@@ -1305,20 +1364,31 @@ impl Agent {
                     if signal::interrupted() {
                         break;
                     }
-                    let calls: usize = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-                    d.set_status(format!("{label} {done}/{n} · {calls} tool calls"));
+                    d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     d.tick();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         d.set_status(String::new());
+        let shared = board.map(|b| b.summary()).filter(|s| !s.is_empty());
+        let mut out = Vec::new();
         if done < n {
-            return format!("{label} interrupted after {done} of {n} workers finished.\n\n{}", reports.join("\n\n"));
+            out.push(format!("{label} interrupted after {done} of {n} workers finished."));
         }
-        // Split a fixed budget across workers so a big swarm can't flood the context.
-        let per = (24_000 / n).max(2_000);
-        reports.iter().map(|r| ui::truncate(r, per).to_string()).collect::<Vec<_>>().join("\n\n")
+        if skipped > 0 {
+            out.push(format!(
+                "{skipped} more task(s) were not run: one swarm runs at most {}. Call swarm again for them.",
+                crate::swarm::MAX_JOBS
+            ));
+        }
+        // One fixed budget for all reports, so a big swarm can't flood the context.
+        let per = (24_000 / n.max(1)).max(600);
+        out.extend(reports.iter().filter(|r| !r.is_empty()).map(|r| ui::truncate(r, per).to_string()));
+        if let Some(shared) = shared {
+            out.push(format!("## Findings the workers shared\n{}", ui::truncate(&shared, 6_000)));
+        }
+        out.join("\n\n")
     }
 
     // ------------------------------------------------------------- goal mode

@@ -1175,7 +1175,7 @@ fn standard_and_vibe_finish_without_extra_reviews() {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["max_tokens"], if mode == "vibe" { 8192 } else { 16384 });
         let tools = requests[0]["tools"].to_string();
-        assert_eq!(tools.contains("Run several read-only workers"), mode == "vibe");
+        assert_eq!(tools.contains("Run read-only workers in parallel"), mode == "vibe");
     }
 }
 
@@ -2734,4 +2734,64 @@ fn unattended_mcp_deletes_are_refused_before_reaching_the_server() {
     let seen = server.join().unwrap()[1]["messages"].to_string();
     assert!(seen.contains("nobody is watching"), "{seen}");
     assert!(!s.calls().contains("delete_flag\""), "{}", s.calls());
+}
+
+fn swarm_call(jobs: usize) -> serde_json::Value {
+    let tasks: Vec<_> = (0..jobs)
+        .map(|i| serde_json::json!({"description": format!("slice {i}"), "prompt": format!("inspect slice {i}")}))
+        .collect();
+    tool_reply("swarm", serde_json::json!({ "tasks": tasks }))
+}
+
+fn say(text: &str) -> serde_json::Value {
+    serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+}
+
+#[test]
+fn swarm_workers_share_findings_and_the_lead_gets_them_all() {
+    let s = Sandbox::new("swarm-board");
+    let share = tool_reply("share", serde_json::json!({"finding": "root cause at api.rs:42"}));
+    // One worker at a time, so the order is fixed: lead, worker 0 (shares, then
+    // reports), worker 1 (sees the note, reports), lead again.
+    let replies = vec![swarm_call(2), share, say("report zero"), say("report one"), say("done")];
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--agents", "swarm", "--swarm-max", "1", "survey"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert!(requests[1]["tools"].to_string().contains("\"share\""), "workers get the share tool");
+    let second_worker = requests[3]["messages"].to_string();
+    assert!(second_worker.contains("Other workers shared") && second_worker.contains("root cause at api.rs:42"));
+    let lead = requests[4]["messages"].to_string();
+    for part in ["report zero", "report one", "Findings the workers shared", "[slice 0] root cause at api.rs:42"] {
+        assert!(lead.contains(part), "{part} missing from {lead}");
+    }
+}
+
+#[test]
+fn a_swarm_bigger_than_the_pool_runs_every_task_and_reports_the_overflow() {
+    let s = Sandbox::new("swarm-pool");
+    let mut replies = vec![swarm_call(34)];
+    replies.extend((0..32).map(|_| say("checked")));
+    replies.push(say("done"));
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--agents", "swarm", "--swarm-max", "2", "survey everything"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 34, "32 workers ran through a pool of 2, then the lead");
+    let lead = requests[33]["messages"].to_string();
+    assert!(lead.contains("2 more task(s) were not run"), "{lead}");
+    assert_eq!(lead.matches("(done)").count(), 32, "{lead}");
 }
