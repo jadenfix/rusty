@@ -12,6 +12,7 @@ mod footer;
 mod infra;
 mod llm;
 mod markdown;
+mod mcp;
 mod memory;
 mod permissions;
 mod signal;
@@ -226,6 +227,12 @@ fn run() -> Result<i32> {
         agent.infra.target = infra::Target::detect(&cwd);
     }
     agent.set_backend(backend)?;
+    if agent.backend.name() == "local" {
+        agent.mcp = mcp::Mcp::load(&cwd)?;
+        if !agent.mcp.is_empty() {
+            println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));
+        }
+    }
     agent.memory_mode = rusty::advisor::Mode::parse(&cli.memory)
         .ok_or_else(|| anyhow!("unknown memory mode `{}` (legacy, off, on, deep)", cli.memory))?;
     if agent.memory_mode == rusty::advisor::Mode::Deep && client.budget.enabled() {
