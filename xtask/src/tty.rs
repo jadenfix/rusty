@@ -136,23 +136,57 @@ pub fn steady(binary: &Path, endpoint: &str, cols: u16, dest: &Path) -> Result<(
     Ok(())
 }
 
-/// The panel pauses for a write approval, and the turn resumes after it.
+/// A blank answer declines an approval. Then, in the interactive REPL, an
+/// approved write lets the turn resume, and the terminal can still be resized
+/// and used afterwards: a second line editor at the prompt used to replace the
+/// REPL's resize handler, so the next resize aborted rusty.
 pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
+    let approved = dest.join("approved.txt");
     let mut cmd = Command::new(binary);
     cmd.current_dir(dest);
     cmd.args(["--permissions", "ask", "--mode", "standard", "--agents", "off", "--memory", "off", "approval"]);
     offline(&mut cmd, endpoint, &dest.join("home"));
+    let log = File::create(dest.join("terminal-declined.ansi"))?;
+    let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(15))?;
+    s.wait_for(&[Lit("[y]es")], "approval prompt missing")?;
+    s.send("\r")?;
+    s.wait_for(&[Lit("CAPTURE_COMPLETE")], "a declined approval did not resume the turn")?;
+    s.finish()?;
+    if approved.exists() {
+        bail!("a blank answer approved the write");
+    }
+    println!("PASS: a blank answer declines an approval");
+
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest);
+    cmd.args(["--permissions", "ask", "--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &dest.join("home"));
     let log = File::create(dest.join("terminal.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(15))?;
+    let ready = |s: &mut Session| -> Result<()> {
+        s.wait_for(&[Lit("?2004h")], "no prompt")?;
+        s.drain(0.4)
+    };
+    ready(&mut s)?;
+    s.send("approval\r")?;
     s.wait_for(&[Lit("[y]es")], "approval prompt missing")?;
     s.send("yes\r")?;
     s.wait_for(&[Lit("CAPTURE_COMPLETE")], "approval did not resume turn")?;
-    s.finish()?;
-    let written = std::fs::read_to_string(dest.join("approved.txt")).unwrap_or_default();
+    ready(&mut s)?;
+    s.pty.set_size(ROWS, 100)?;
+    s.drain(0.3)?;
+    s.pty.set_size(ROWS, 80)?;
+    s.drain(0.3)?;
+    s.send("reply with just the word pong\r")?;
+    s.wait_for(&[Lit("pong"), Space], "the turn after a resize did not run")?;
+    ready(&mut s)?;
+    s.send("/exit\r")?;
+    s.finish().context("rusty did not exit cleanly after a resize")?;
+    let written = std::fs::read_to_string(&approved).unwrap_or_default();
     if written != "approved" {
         bail!("the approved write did not happen: approved.txt holds {written:?}");
     }
-    println!("PASS: panel paused for approval and turn resumed");
+    println!("PASS: panel paused for approval, turn resumed, and the terminal survived a resize");
     Ok(())
 }
 
