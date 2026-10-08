@@ -219,7 +219,8 @@ fn redact_line(line: &str) -> (String, usize) {
             break;
         }
         let wanted = match expect.take() {
-            Some(Expect::Header) => true,
+            // `Bearer <api key>` in docs is a placeholder, not a credential.
+            Some(Expect::Header) => !sep.is_empty() && sep.trim().is_empty(),
             Some(Expect::Key) => is_assignment(sep),
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
@@ -246,10 +247,11 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '@' | '~' | '%')
 }
 
-/// `=`, `: `, `": "` and the like, ignoring quotes and spaces.
+/// `=`, `: `, `": "` and the like, ignoring quotes and spaces. A bare colon
+/// joins a namespaced name (`secret:access`, `token:read`), not a value.
 fn is_assignment(sep: &str) -> bool {
     let core: String = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
-    core == "=" || core == ":"
+    core == "=" || (core == ":" && sep != ":")
 }
 
 fn secret_key(key: &str) -> bool {
@@ -313,7 +315,9 @@ fn redact_url(url: &str) -> Option<String> {
 pub fn redaction_note(n: usize) -> String {
     format!(
         "\n[rusty redacted {n} secret value{} from this output before you saw it. Never try to print or copy a \
-         secret. To change one, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
+         secret, and don't re-run the command hoping to see it: the value works, you just can't read it. To use \
+         one, pass it inside a single command without printing it (DSN=$(...) && psql \"$DSN\" -c ...). To change \
+         one in a file, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
         if n == 1 { "" } else { "s" }
     )
 }

@@ -1356,6 +1356,8 @@ mod tests {
             ("postgres://app:pa55w0rd@db.internal:5432/app", "postgres://app:[redacted]@db.internal:5432/app"),
             ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijklmnop", "jwt [redacted]"),
             ("client-key-data: LS0tLS1CRUdJTi==", "client-key-data: [redacted]"),
+            ("{\"password\":\"hunter22\"}", "{\"password\":\"[redacted]\"}"),
+            ("password:\thunter22", "password:\t[redacted]"),
         ];
         for (input, want) in cases {
             let (got, n) = redact(input);
@@ -1384,6 +1386,10 @@ mod tests {
             "sha256:abcdef0123456789abcdef0123456789",
             "the user said: sk-ip the test",
             "- name: GITHUB_TOKEN\n  valueFrom:",
+            "- secret:access",
+            "actions: [secret:read, token:create, credentials:rotate]",
+            "action=secret:access resource=srn:simcloud:shop:prod:secret/payments-signing",
+            "Authenticate with `Authorization: Bearer <api key>`.",
         ] {
             let (got, n) = redact(text);
             assert_eq!(n, 0, "{text} -> {got}");

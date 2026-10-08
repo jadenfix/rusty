@@ -147,6 +147,8 @@ pub struct Agent {
     tips_shown: HashSet<&'static str>,
     pub totals: Totals,
     pub last_prompt_tokens: u64,
+    /// The last turn ended on a repetition or talk-only stall.
+    last_turn_stalled: bool,
     project_notes: String,
     pub session_path: Option<PathBuf>,
     /// Target, audit log and change record; inert for workers.
@@ -215,6 +217,7 @@ impl Agent {
             tips_shown: HashSet::new(),
             totals: Totals::default(),
             last_prompt_tokens: 0,
+            last_turn_stalled: false,
             project_notes,
             session_path: None,
             infra: infra::Harness::default(),
@@ -570,6 +573,9 @@ impl Agent {
         // Commands that only print text: announcements no one reads.
         let mut talk_only = 0;
         let mut empty_replies = 0;
+        // A repetition or talk-only stall: an open goal retries in a fresh turn.
+        let mut stalled = false;
+        self.last_turn_stalled = false;
 
         for step in 0..max_steps {
             if signal::interrupted() {
@@ -699,6 +705,7 @@ impl Agent {
                                  that ends the turn.",
                             );
                             if talk_only == 5 {
+                                stalled = true;
                                 outcome = Err(anyhow::anyhow!(
                                     "stopped after five commands that only printed text; the work may be done, \
                                      but its summary never came as a reply"
@@ -723,6 +730,7 @@ impl Agent {
                         self.escalate("the same call keeps repeating", &mut d);
                     }
                     if repeats == 4 {
+                        stalled = true;
                         outcome = Err(anyhow::anyhow!(
                             "stopped after four consecutive identical tool calls with unchanged results; \
                              task completion is unconfirmed. Inspect the result and try a different approach."
@@ -741,6 +749,15 @@ impl Agent {
             self.checkpoint_trajectory();
             if outcome.is_err() {
                 self.pending_goal = None;
+                if stalled && in_goal {
+                    // Ending the whole run here throws away an open goal's remaining
+                    // turns and its verification; run_goal bounds repeated stalls.
+                    let why = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+                    d.line(&ui::warn(&format!("  turn stalled: {why}")));
+                    self.history.push(json!({"role":"user","content":format!("{}This turn was stopped: {why} Re-read the last results, then change approach (a different command, interface or source of information) instead of repeating it.", context::NOTE)}));
+                    self.last_turn_stalled = true;
+                    outcome = Ok(true);
+                }
                 break;
             }
             if signal::interrupted() {
@@ -1369,9 +1386,14 @@ impl Agent {
         self.checker_owed =
             self.execution_mode == ExecutionMode::Careful && !self.goal.as_ref().is_some_and(|g| g.checker_used);
         let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+        let mut stalls_in_a_row = 0;
         loop {
             let finished = self.run_turn(&prompt)?;
             self.save_session();
+            stalls_in_a_row = if self.last_turn_stalled { stalls_in_a_row + 1 } else { 0 };
+            if stalls_in_a_row == 3 {
+                anyhow::bail!("the goal stalled three turns in a row; task completion is unconfirmed");
+            }
             let Some(g) = &mut self.goal else { return Ok(()) };
             g.turns += 1;
             if !finished || signal::interrupted() {

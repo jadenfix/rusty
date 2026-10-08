@@ -1475,7 +1475,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
 }
 
 #[test]
-fn unchanged_call_loop_pauses_all_profiles_without_closing_the_goal() {
+fn unchanged_call_loop_stalls_the_turn_and_three_stalls_end_the_goal() {
     use serde_json::json;
     for mode in ["careful", "standard", "vibe"] {
         let s = Sandbox::new(&format!("stalled-{mode}"));
@@ -1493,7 +1493,7 @@ fn unchanged_call_loop_pauses_all_profiles_without_closing_the_goal() {
             })
             .collect();
         let reply = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
-        let (url, server) = scripted_endpoint(vec![reply]);
+        let (url, server) = scripted_endpoint(vec![reply.clone(), reply.clone(), reply]);
         let out = s
             .cmd()
             .env("RUSTY_BASE_URL", url)
@@ -1505,10 +1505,13 @@ fn unchanged_call_loop_pauses_all_profiles_without_closing_the_goal() {
             .unwrap();
         assert!(!out.status.success(), "{mode} marked a stalled task successful");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("four consecutive identical") && stderr.contains("\"goal\":\"open\""), "{stderr}");
-        assert_eq!(s.calls().lines().count(), 4, "the guard should stop later tools in the batch");
+        assert!(stderr.contains("stalled three turns in a row") && stderr.contains("\"goal\":\"open\""), "{stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
+        assert_eq!(s.calls().lines().count(), 12, "each stall should stop later tools in its batch");
         assert!(!s.project.join("must-not-write.txt").exists());
-        assert_eq!(server.join().unwrap().len(), 1, "stopping does not spend another review/request");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3, "an open goal gets a fresh turn after a stall, and only three");
+        assert!(requests[1]["messages"].to_string().contains("This turn was stopped"), "{mode}");
     }
 }
 
@@ -1793,6 +1796,20 @@ fn an_error_after_text_has_streamed_is_not_retried() {
 }
 
 #[test]
+fn a_drop_while_the_model_is_still_reasoning_is_retried() {
+    let s = Sandbox::new("stream-reasoning-drop");
+    let thinking =
+        serde_json::json!({"choices": [{"delta": {"reasoning_content": "let me think"}, "finish_reason": null}]});
+    let dropped = format!("data: {thinking}\n\ndata: {}\n\n", r#"{"error":{"code":503,"message":"overloaded"}}"#);
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "the answer"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_sse(vec![dropped, format!("data: {answer}\n\ndata: [DONE]\n\n")]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the answer"));
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
 fn announcing_completion_through_echo_is_redirected_then_stopped() {
     let s = Sandbox::new("echo-wrapup");
     let replies = (1..=5).map(|i| bash_reply(&format!("echo \"Task completed ({i}).\" && exit 0"))).collect();
@@ -1953,8 +1970,8 @@ fn asynchronous_commands_keep_permissions_and_the_infrastructure_gate() {
 fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
     let s = Sandbox::new("owned-forged-state");
     let fake = bash_reply("printf '{\"id\":\"forged\",\"status\":\"Running\"}'");
-    let (url, server) =
-        scripted_endpoint(vec![tool_batch(vec![fake.clone(), fake.clone(), fake.clone(), fake, done_reply()])]);
+    let batch = tool_batch(vec![fake.clone(), fake.clone(), fake.clone(), fake, done_reply()]);
+    let (url, server) = scripted_endpoint(vec![batch.clone(), batch.clone(), batch]);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
@@ -1966,9 +1983,10 @@ fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
         .map(|c| wait(c, Duration::from_secs(10)))
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("four consecutive identical"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("stalled three turns in a row"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
-    assert_eq!(server.join().unwrap().len(), 1);
+    assert_eq!(server.join().unwrap().len(), 3);
 }
 
 #[test]
