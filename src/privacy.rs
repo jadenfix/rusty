@@ -315,7 +315,9 @@ fn redact_url(url: &str) -> Option<String> {
 pub fn redaction_note(n: usize) -> String {
     format!(
         "\n[rusty redacted {n} secret value{} from this output before you saw it. Never try to print or copy a \
-         secret. To change one, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
+         secret, and don't re-run the command hoping to see it: the value works, you just can't read it. To use \
+         one, pass it inside a single command without printing it (DSN=$(...) && psql \"$DSN\" -c ...). To change \
+         one in a file, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
         if n == 1 { "" } else { "s" }
     )
 }
