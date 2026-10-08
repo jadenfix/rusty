@@ -248,6 +248,7 @@ fn run() -> Result<i32> {
     if agent.session_path.is_none() {
         agent.session_path = Some(new_session_path(&sessions));
     }
+    agent.trajectory_path = cli.trajectory.clone();
 
     // Headless modes.
     let started = Instant::now();
@@ -276,9 +277,7 @@ fn run() -> Result<i32> {
         if cli.stats {
             print_stats(&agent, started);
         }
-        if let Some(path) = &cli.trajectory {
-            write_trajectory(&agent, path)?;
-        }
+        agent.write_trajectory()?;
         result?;
         return Ok(if signal::interrupted() {
             130
@@ -294,34 +293,8 @@ fn run() -> Result<i32> {
     if cli.stats {
         print_stats(&agent, started);
     }
-    if let Some(path) = &cli.trajectory {
-        write_trajectory(&agent, path)?;
-    }
+    agent.write_trajectory()?;
     Ok(0)
-}
-
-/// The whole conversation for benchmark harnesses and reviewers.
-fn write_trajectory(agent: &Agent, path: &Path) -> Result<()> {
-    let t = &agent.totals;
-    let body = serde_json::json!({
-        "agent": "rusty",
-        "version": env!("CARGO_PKG_VERSION"),
-            "model": agent.model,
-            "memory_mode": agent.memory_mode,
-            "memory": agent.advisor.as_ref().map(|h| &h.metrics),
-        "execution_mode": agent.execution_mode.name(),
-        "tools_location": agent.backend.summary(),
-        "messages": agent.history,
-        "goal": agent.goal,
-        "verification": agent.verification_records,
-        "activities": agent.activities.records(),
-        "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
-    });
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    rusty::privacy::write_json(path, body)?;
-    Ok(())
 }
 
 /// One JSON line on stderr for scripts and evals.

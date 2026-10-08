@@ -292,4 +292,7 @@ ripgrep and Python: `devbox shell`, then `devbox run qa` or
 ## Benchmarks
 
 rusty runs as a Harbor agent: `--yolo --goal` for autonomy, `--trajectory`
-for a reviewer-readable transcript, and `--stats` for token accounting.
+for a reviewer-readable transcript, and `--stats` for token accounting. The
+trajectory keeps every message, including the ones compaction summarised away
+(`archived_messages` counts them), and is refreshed at most every 30 seconds
+during a run, so a harness that kills rusty at its timeout still gets a record.
