@@ -71,7 +71,9 @@ pub fn inline(s: &str) -> String {
                 continue;
             }
         }
-        let next = rest[1..].find(['`', '*']).map_or(rest.len(), |i| i + 1);
+        // Step past the whole first character: a byte offset of 1 splits `✅`.
+        let first = rest.chars().next().map_or(1, char::len_utf8);
+        let next = rest[first..].find(['`', '*']).map_or(rest.len(), |i| i + first);
         out.push_str(&rest[..next]);
         rest = &rest[next..];
     }
@@ -95,6 +97,17 @@ mod tests {
         let s = inline("x * y `z` and **w** end*");
         for part in ["x * y ", "z", " and ", "w", " end*"] {
             assert!(s.contains(part), "{part:?} missing from {s:?}");
+        }
+    }
+
+    #[test]
+    fn inline_handles_lines_that_start_with_wide_characters() {
+        for text in ["✅ tests pass", "→ next", "文 `code` 字", "`a`é **b**", "é"] {
+            let s = inline(text);
+            let plain: String = s.chars().filter(|c| !c.is_control()).collect();
+            for word in text.split(['`', '*', ' ']).filter(|w| !w.is_empty()) {
+                assert!(plain.contains(word), "{word:?} missing from {s:?}");
+            }
         }
     }
 }
