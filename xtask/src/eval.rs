@@ -183,7 +183,7 @@ pub fn run(filter: &str) -> Result<bool> {
             if !status.success() {
                 bail!("cargo build --release failed ({status})");
             }
-            root.join("target/release/rusty")
+            crate::target_dir().join("release/rusty")
         }
     };
     let limit = number("EVAL_TIMEOUT", 600)?;
@@ -212,12 +212,14 @@ pub fn run(filter: &str) -> Result<bool> {
     }
     println!("models {models} · {repeats}x · timeout {limit}s per session");
     let next = AtomicUsize::new(0);
+    let broken = AtomicUsize::new(0);
     let jsonl = Mutex::new(());
     std::thread::scope(|s| {
         for _ in 0..jobs.min(queue.len()) {
             s.spawn(|| {
                 while let Some((task, model, rep)) = queue.get(next.fetch_add(1, Ordering::SeqCst)) {
                     if let Err(e) = run_task(&cfg, task, model, *rep, &jsonl) {
+                        broken.fetch_add(1, Ordering::SeqCst);
                         eprintln!("{} {model} #{rep}: {e:#}", task.name);
                     }
                 }
@@ -225,7 +227,13 @@ pub fn run(filter: &str) -> Result<bool> {
         }
     });
 
-    report::run(&[cfg.out.to_string_lossy().into_owned()])
+    let report = report::run(&[cfg.out.to_string_lossy().into_owned()]);
+    // Runs the harness could not carry out are missing from the report, so
+    // they must not let an eval pass by omission.
+    match broken.into_inner() {
+        0 => report,
+        n => bail!("{n} run(s) could not be carried out; see the errors above"),
+    }
 }
 
 enum Exit {
@@ -252,7 +260,7 @@ fn agent(
     input: Option<String>,
 ) -> Result<Exit> {
     let append = |name: &str| OpenOptions::new().create(true).append(true).open(home.join(name));
-    let (stdout, mut stderr) = (append("stdout")?, append("stderr")?);
+    let (stdout, stderr) = (append("stdout")?, append("stderr")?);
     let mut cmd = Command::new(&cfg.bin);
     cmd.args(["--yolo", "--stats"])
         .arg("--trajectory")
@@ -270,13 +278,8 @@ fn agent(
             cmd.env(k, v);
         }
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            writeln!(stderr, "starting {}: {e}", cfg.bin.display())?;
-            return Ok(Exit::Done(false));
-        }
-    };
+    // A binary that cannot start is a broken harness, not a failed agent run.
+    let mut child = cmd.spawn().with_context(|| format!("starting {}", cfg.bin.display()))?;
     if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
         // A thread, so a child that stops reading can't stall the time limit.
         std::thread::spawn(move || pipe.write_all(text.as_bytes()));
