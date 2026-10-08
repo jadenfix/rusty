@@ -166,7 +166,7 @@ the staged repair/search roadmap.
 | `/goal <objective>` | autonomous until done and verified · `status` · `resume` · `clear` |
 | `/loop [5m] [x10] <prompt>` | repeat on an interval, or self-paced |
 | `/agents off\|sub\|swarm\|auto` | delegation · `/agents model <id>` sets the subagent model |
-| `/swarm size\|models\|spread` | worker count (up to 64), model rotation, temperature spread |
+| `/swarm size\|models\|spread` | workers at once (up to 16; a swarm call takes up to 32 tasks and workers share findings), model rotation, temperature spread |
 | `/compact [focus]` | summarise now, keeping what you name in detail |
 | `/target` · `/audit [n]` · `/changes` | where infra commands will land · the infra audit log · what this session changed |
 | `/triage` `/change` `/postmortem` | infra skills: incident triage, a change plan with rollback, a blameless write-up |
