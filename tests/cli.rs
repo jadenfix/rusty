@@ -2799,14 +2799,17 @@ fn destructive_calls_run_unattended_only_with_the_opt_in_and_yolo() {
     }
 }
 
-/// A stdio MCP server in shell: one read tool and one delete tool. Each
-/// request line is logged, so a test can tell what reached the server.
+/// A stdio MCP server in shell: a read tool on the first page of its tool
+/// list, and on the second a delete tool and one only its annotation marks
+/// destructive. Each request line is logged, so a test can tell what reached
+/// the server.
 const FAKE_MCP: &str = r#"while IFS= read -r line; do
   echo "mcp> $line" >> "$RUSTY_TEST_CALLS"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"initialize"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}" ;;
-    *'"tools/list"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"get_flag\",\"description\":\"Read a flag\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}}}},{\"name\":\"delete_flag\",\"description\":\"Delete a flag\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *'"tools/list"'*'"cursor":"p2"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"delete_flag\",\"description\":\"Delete a flag\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"reset_flags\",\"description\":\"Reset all flags\",\"annotations\":{\"destructiveHint\":true}}]}}" ;;
+    *'"tools/list"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"get_flag\",\"description\":\"Read a flag\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}}}}],\"nextCursor\":\"p2\"}}" ;;
     *'"tools/call"'*) echo "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}"; echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"flag checkout.engine = v2\"}]}}" ;;
   esac
 done"#;
@@ -2816,7 +2819,8 @@ fn mcp_sandbox(name: &str) -> Sandbox {
     s.fake("flags-mcp", FAKE_MCP);
     std::fs::write(
         s.project.join(".mcp.json"),
-        r#"{"mcpServers": {"flags": {"command": "flags-mcp"}, "broken": {"command": "no-such-mcp-server"}}}"#,
+        r#"{"mcpServers": {"flags": {"command": "flags-mcp"}, "broken": {"command": "no-such-mcp-server"},
+            "remote": {"url": "https://mcp.example.com/sse"}}}"#,
     )
     .unwrap();
     s
@@ -2869,8 +2873,10 @@ fn mcp_tools_are_offered_and_called() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("mcp") && stdout.contains("flags (2 tools)"), "{stdout}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("mcp server `broken` unavailable"));
+    assert!(stdout.contains("mcp") && stdout.contains("flags (3 tools)"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("mcp server `broken` unavailable"), "{stderr}");
+    assert!(stderr.contains("mcp server `remote` unavailable: only stdio"), "{stderr}");
     let requests = server.join().unwrap();
     let offered = requests[0]["tools"].to_string();
     assert!(offered.contains("mcp__flags__get_flag") && offered.contains("[flags MCP] Read a flag"), "{offered}");
@@ -2881,16 +2887,54 @@ fn mcp_tools_are_offered_and_called() {
 
 #[test]
 fn unattended_mcp_deletes_are_refused_before_reaching_the_server() {
-    let s = mcp_sandbox("mcp-delete");
-    let answer = serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
-    let call = tool_reply("mcp__flags__delete_flag", serde_json::json!({}));
-    let (url, server) = scripted_endpoint(vec![call, answer]);
-    let out =
-        s.cmd().env("RUSTY_BASE_URL", url).args(["--yolo", "delete the flag"]).stdin(Stdio::null()).output().unwrap();
+    // `reset_flags` is a delete only by its annotation.
+    for tool in ["delete_flag", "reset_flags"] {
+        let s = mcp_sandbox("mcp-delete");
+        let answer = serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+        let call = tool_reply(&format!("mcp__flags__{tool}"), serde_json::json!({}));
+        let (url, server) = scripted_endpoint(vec![call, answer]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "delete the flag"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let seen = server.join().unwrap()[1]["messages"].to_string();
+        assert!(seen.contains("nobody is watching"), "{tool}: {seen}");
+        assert!(!s.calls().contains(&format!("\"name\":\"{tool}\"")), "{}", s.calls());
+    }
+}
+
+#[test]
+fn required_mcp_servers_and_tools_fail_closed() {
+    let s = mcp_sandbox("mcp-required");
+    let check = || s.cmd().arg("--mcp-check").stdin(Stdio::null()).output().unwrap();
+    let out = check();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let seen = server.join().unwrap()[1]["messages"].to_string();
-    assert!(seen.contains("nobody is watching"), "{seen}");
-    assert!(!s.calls().contains("delete_flag\""), "{}", s.calls());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flags = &report["servers"].as_array().unwrap().iter().find(|r| r["server"] == "flags").unwrap();
+    assert_eq!((flags["status"].as_str(), flags["tools"].as_u64()), (Some("ok"), Some(3)), "{report}");
+    assert_eq!(report["ok"], true, "optional servers that fail don't block: {report}");
+
+    for (config, why) in [
+        (
+            r#"{"mcpServers": {"flags": {"command": "flags-mcp", "requiredTools": ["get_flag", "set_flag"]}}}"#,
+            "set_flag",
+        ),
+        (r#"{"mcpServers": {"gone": {"command": "no-such-mcp-server", "required": true}}}"#, "no-such-mcp-server"),
+        (r#"{"mcpServers": {"remote": {"url": "https://mcp.example.com/sse", "required": true}}}"#, "only stdio"),
+    ] {
+        std::fs::write(s.project.join(".mcp.json"), config).unwrap();
+        let out = check();
+        assert_eq!(out.status.code(), Some(1), "{config}");
+        let report = String::from_utf8_lossy(&out.stdout);
+        assert!(report.contains(r#""ok":false"#) && report.contains(why), "{report}");
+        let out = s.cmd().env("RUSTY_BASE_URL", "http://127.0.0.1:9").args(["--yolo", "hi"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("required MCP server"), "{stderr}");
+    }
 }
 
 fn swarm_call(jobs: usize) -> serde_json::Value {

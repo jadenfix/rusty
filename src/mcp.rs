@@ -3,33 +3,48 @@
 //!
 //! Newline-delimited JSON-RPC 2.0 over the server's stdin/stdout, per the MCP
 //! stdio transport. Only tools are supported; resources and prompts are not.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::permissions::Class;
+
 const PROTOCOL: &str = "2025-06-18";
 const PREFIX: &str = "mcp__";
+/// Longest tool name the model APIs accept.
+const MAX_NAME: usize = 64;
+const MAX_PAGES: usize = 100;
+const MAX_TOOLS: usize = 1000;
 
 #[derive(Deserialize)]
 struct Config {
     #[serde(rename = "mcpServers", default)]
-    servers: BTreeMap<String, ServerConfig>,
+    servers: BTreeMap<String, Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct ServerConfig {
-    command: String,
+    command: Option<String>,
+    url: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// Startup fails unless this server connects.
+    #[serde(default)]
+    required: bool,
+    /// Startup fails unless the server lists each of these tools.
+    #[serde(default)]
+    required_tools: Vec<String>,
 }
 
 /// One tool, under the name the model sees.
@@ -38,6 +53,7 @@ pub struct Tool {
     name: String,
     description: String,
     schema: Value,
+    class: Class,
 }
 
 struct Server {
@@ -49,6 +65,26 @@ struct Server {
     tools: Vec<Tool>,
 }
 
+/// What became of one configured server, for `--mcp-check` and errors.
+#[derive(serde::Serialize)]
+pub struct Report {
+    server: String,
+    required: bool,
+    /// `ok`, `skipped` or `failed`.
+    status: &'static str,
+    tools: usize,
+    missing: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Report {
+    /// A required server that didn't connect, or lacks a required tool.
+    pub fn blocks(&self) -> bool {
+        self.required && (self.status != "ok" || !self.missing.is_empty())
+    }
+}
+
 /// The connected servers. Dropping it stops them.
 #[derive(Default)]
 pub struct Mcp {
@@ -56,26 +92,70 @@ pub struct Mcp {
 }
 
 impl Mcp {
-    /// Connects every configured server. A server that fails to start is
-    /// skipped with a warning, so one broken entry never blocks the session.
+    /// Connects every configured server. A server that fails is skipped with a
+    /// warning, so one broken entry never blocks the session, unless it is
+    /// marked `required` or names `requiredTools`.
     pub fn load(cwd: &Path) -> Result<Self> {
+        let (mcp, reports) = Self::connect(cwd)?;
+        for r in &reports {
+            if r.blocks() {
+                let why = r.error.clone().unwrap_or_else(|| format!("missing tools: {}", r.missing.join(", ")));
+                bail!("required MCP server `{}` unavailable: {why}", r.server);
+            }
+            if let Some(e) = &r.error {
+                eprintln!("mcp server `{}` unavailable: {e}", r.server);
+            }
+        }
+        Ok(mcp)
+    }
+
+    /// Connects what it can and reports on every configured server.
+    pub fn connect(cwd: &Path) -> Result<(Self, Vec<Report>)> {
         let path = match std::env::var_os("RUSTY_MCP_CONFIG") {
             Some(p) => p.into(),
             None => cwd.join(".mcp.json"),
         };
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), Vec::new()));
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let config: Config = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let mut servers = Vec::new();
-        for (name, cfg) in config.servers {
-            match Server::start(&name, &cfg, cwd) {
-                Ok(s) => servers.push(s),
-                Err(e) => eprintln!("mcp server `{name}` unavailable: {e:#}"),
+        let (mut servers, mut reports) = (Vec::new(), Vec::new());
+        for (name, raw) in config.servers {
+            // Each entry parses alone, so one malformed entry can't hide the rest.
+            let parsed = serde_json::from_value::<ServerConfig>(raw.clone());
+            let cfg = parsed.as_ref().ok();
+            let required = cfg.is_some_and(|c| c.required || !c.required_tools.is_empty())
+                || raw["required"].as_bool() == Some(true);
+            let mut report =
+                Report { server: name.clone(), required, status: "failed", tools: 0, missing: Vec::new(), error: None };
+            let started = match (&parsed, cfg.and_then(|c| c.command.as_ref())) {
+                (Err(e), _) => Err(anyhow!("bad entry: {e}")),
+                (Ok(c), None) if c.url.is_some() => {
+                    report.status = "skipped";
+                    Err(anyhow!("only stdio servers are supported, not `url`"))
+                }
+                (Ok(_), None) => Err(anyhow!("no `command`")),
+                (Ok(c), Some(command)) => Server::start(&name, command, c, cwd),
+            };
+            match started {
+                Ok(server) => {
+                    let have: HashSet<&str> = server.tools.iter().map(|t| t.name.as_str()).collect();
+                    report.missing = cfg
+                        .map(|c| c.required_tools.iter().filter(|t| !have.contains(t.as_str())).cloned().collect())
+                        .unwrap_or_default();
+                    report.status = "ok";
+                    report.tools = server.tools.len();
+                    servers.push(server);
+                }
+                Err(e) => report.error = Some(format!("{e:#}")),
             }
+            reports.push(report);
         }
-        Ok(Self { servers })
+        name_tools(&mut servers);
+        let mut classes = CLASSES.write().unwrap_or_else(|e| e.into_inner());
+        *classes = servers.iter().flat_map(|s| &s.tools).map(|t| (t.exposed.clone(), t.class.clone())).collect();
+        Ok((Self { servers }, reports))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -141,8 +221,8 @@ impl Mcp {
 }
 
 impl Server {
-    fn start(name: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
-        let mut child = Command::new(&cfg.command)
+    fn start(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
+        let mut child = Command::new(command)
             .args(&cfg.args)
             .envs(&cfg.env)
             .current_dir(cwd)
@@ -150,7 +230,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("starting `{}`", cfg.command))?;
+            .with_context(|| format!("starting `{command}`"))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         // A reader thread, so a silent server can never block past a deadline.
@@ -172,25 +252,35 @@ impl Server {
             handshake,
         )?;
         server.notify("notifications/initialized")?;
-        let listed = server.request("tools/list", json!({}), handshake)?;
-        server.tools = listed["tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| {
-                let tool = t["name"].as_str()?;
+        // `tools/list` is paginated: follow `nextCursor` until it stops,
+        // within bounds a looping or endless server can't get past.
+        let (mut cursor, mut seen) = (None::<String>, HashSet::new());
+        for page in 1.. {
+            let params = cursor.as_ref().map_or(json!({}), |c| json!({ "cursor": c }));
+            let listed = server.request("tools/list", params, handshake)?;
+            for t in listed["tools"].as_array().into_iter().flatten() {
+                let Some(tool) = t["name"].as_str().filter(|n| !n.is_empty()) else { continue };
                 let mut schema = t["inputSchema"].clone();
                 if !schema.is_object() {
                     schema = json!({"type": "object", "properties": {}});
                 }
-                Some(Tool {
-                    exposed: exposed_name(name, tool),
+                server.tools.push(Tool {
+                    exposed: String::new(),
                     name: tool.to_string(),
                     description: format!("[{name} MCP] {}", t["description"].as_str().unwrap_or("")),
                     schema,
-                })
-            })
-            .collect();
+                    class: tool_class(tool, &t["annotations"]),
+                });
+            }
+            cursor = listed["nextCursor"].as_str().filter(|c| !c.is_empty()).map(str::to_string);
+            let Some(c) = &cursor else { break };
+            if !seen.insert(c.clone()) {
+                bail!("tools/list repeated cursor `{c}`");
+            }
+            if page >= MAX_PAGES || server.tools.len() >= MAX_TOOLS {
+                bail!("tools/list still had more after {page} pages and {} tools", server.tools.len());
+            }
+        }
         Ok(server)
     }
 
@@ -244,20 +334,76 @@ fn call_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// `mcp__server__tool`, limited to the characters and length tool names allow.
+/// `mcp__server__tool`, limited to the characters tool names allow.
 fn exposed_name(server: &str, tool: &str) -> String {
     let clean =
         |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect::<String>();
-    let mut name = format!("{PREFIX}{}__{}", clean(server), clean(tool));
-    name.truncate(64);
-    name
+    format!("{PREFIX}{}__{}", clean(server), clean(tool))
+}
+
+/// Gives every tool a distinct exposed name. A name that is too long, or
+/// that another tool also cleans to (`a.b` and `a_b`), is cut short and ends
+/// in a hash of its server and tool, so it is the same on every run whatever
+/// else is listed. Any tool still clashing is dropped rather than shadowed.
+fn name_tools(servers: &mut [Server]) {
+    let plain: Vec<Vec<String>> =
+        servers.iter().map(|s| s.tools.iter().map(|t| exposed_name(&s.name, &t.name)).collect()).collect();
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    for n in plain.iter().flatten() {
+        *uses.entry(n).or_default() += 1;
+    }
+    let mut taken = HashSet::new();
+    for (server, names) in servers.iter_mut().zip(&plain) {
+        let mut tools = std::mem::take(&mut server.tools);
+        for (tool, plain) in tools.iter_mut().zip(names) {
+            tool.exposed = if plain.len() <= MAX_NAME && uses[plain.as_str()] == 1 {
+                plain.clone()
+            } else {
+                let hash = rusty::fnv(&format!("{}\0{}", server.name, tool.name)) as u32;
+                format!("{}_{hash:08x}", &plain[..plain.len().min(MAX_NAME - 9)])
+            };
+        }
+        tools.retain(|t| {
+            let fresh = taken.insert(t.exposed.clone());
+            if !fresh {
+                eprintln!("mcp tool `{}` of `{}` dropped: its name clashes", t.name, server.name);
+            }
+            fresh
+        });
+        server.tools = tools;
+    }
+}
+
+/// Each loaded tool's permission class, by exposed name. Policy checks see
+/// only a name, and an exposed name can be cut short or hashed, so the class
+/// is decided once from the tool's real name and kept here.
+static CLASSES: RwLock<BTreeMap<String, Class>> = RwLock::new(BTreeMap::new());
+
+/// The permission class of an exposed MCP tool name.
+pub fn classify(exposed: &str) -> Class {
+    let known = CLASSES.read().unwrap_or_else(|e| e.into_inner()).get(exposed).cloned();
+    known.unwrap_or_else(|| verb_class(exposed.rsplit("__").next().unwrap_or(exposed)))
+}
+
+/// A tool's class from its real name, raised (never lowered) by the server's
+/// annotations: `destructiveHint: true` makes it a delete, and
+/// `readOnlyHint: false` stops a read-sounding name running unasked. Hints
+/// only ever add caution, since a server could claim anything.
+fn tool_class(name: &str, annotations: &Value) -> Class {
+    let class = verb_class(name);
+    if annotations["destructiveHint"] == json!(true) && !matches!(class, Class::Destructive(_)) {
+        return Class::Destructive(format!("MCP tool {name} is marked destructive"));
+    }
+    if annotations["readOnlyHint"] == json!(false) && class == Class::ReadOnly {
+        return Class::Risky(format!("MCP tool {name} is marked as changing something"));
+    }
+    class
 }
 
 /// The verb a tool name starts or ends with decides its permission class:
 /// reads run freely, deletes need a person, everything else counts as a change.
-pub fn classify(exposed: &str) -> crate::permissions::Class {
-    use crate::permissions::Class;
-    let tool = exposed.rsplit("__").next().unwrap_or(exposed).to_ascii_lowercase();
+fn verb_class(tool: &str) -> Class {
+    let tool = tool.to_ascii_lowercase();
     let words: Vec<&str> = tool.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let has = |set: &[&str]| words.iter().any(|w| set.contains(w));
     if has(&["delete", "destroy", "purge", "drop", "remove", "revoke", "wipe", "truncate"]) {
@@ -306,22 +452,86 @@ pub fn classify(exposed: &str) -> crate::permissions::Class {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::Class;
+
+    fn server(name: &str, tools: &[&str]) -> Server {
+        let mut child = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let tools = tools
+            .iter()
+            .map(|t| Tool {
+                exposed: String::new(),
+                name: t.to_string(),
+                description: String::new(),
+                schema: json!({}),
+                class: verb_class(t),
+            })
+            .collect();
+        Server { name: name.into(), child, stdin, lines: mpsc::channel().1, next_id: 1, tools }
+    }
+
+    fn names(servers: &[Server]) -> Vec<String> {
+        servers.iter().flat_map(|s| &s.tools).map(|t| t.exposed.clone()).collect()
+    }
 
     #[test]
-    fn names_are_prefixed_and_safe() {
-        assert_eq!(exposed_name("simcloud", "secret.access"), "mcp__simcloud__secret_access");
-        assert!(exposed_name(&"s".repeat(40), &"t".repeat(40)).len() <= 64);
+    fn names_are_prefixed_safe_and_distinct() {
+        let long = "t".repeat(80);
+        let mut servers =
+            vec![server("simcloud", &["secret.access", "a.b", "a_b", &long]), server("simcloud.x", &["get"])];
+        name_tools(&mut servers);
+        let got = names(&servers);
+        assert_eq!(got[0], "mcp__simcloud__secret_access");
+        assert_eq!(got[4], "mcp__simcloud_x__get");
+        // `a.b` and `a_b` clean to the same name, so both carry a hash.
+        assert!(got[1].starts_with("mcp__simcloud__a_b_") && got[2].starts_with("mcp__simcloud__a_b_"));
+        assert_ne!(got[1], got[2]);
+        assert!(got.iter().all(|n| n.len() <= MAX_NAME));
+        assert_eq!(got.iter().collect::<HashSet<_>>().len(), got.len());
+        // The same tool gets the same name whatever else is listed.
+        let mut alone = vec![server("simcloud", &["a.b"])];
+        name_tools(&mut alone);
+        assert_eq!(names(&alone), ["mcp__simcloud__a_b"]);
+        let mut again = vec![server("simcloud", &["a_b", "a.b"])];
+        name_tools(&mut again);
+        assert_eq!(names(&again)[1], got[1]);
         assert!(Mcp::is_tool("mcp__a__b") && !Mcp::is_tool("bash"));
     }
 
     #[test]
+    fn a_duplicate_listing_is_dropped_not_shadowed() {
+        let mut servers = vec![server("s", &["get", "get"])];
+        name_tools(&mut servers);
+        assert_eq!(servers[0].tools.len(), 1);
+    }
+
+    #[test]
     fn verbs_decide_the_permission_class() {
-        assert_eq!(classify("mcp__simcloud__get"), Class::ReadOnly);
-        assert_eq!(classify("mcp__simcloud__simulate_access"), Class::ReadOnly);
-        assert_eq!(classify("mcp__simcloud__pending_iam_changes"), Class::ReadOnly);
-        assert!(matches!(classify("mcp__simcloud__delete"), Class::Destructive(_)));
-        assert!(matches!(classify("mcp__simcloud__kv_put"), Class::Risky(_)));
-        assert!(matches!(classify("mcp__simcloud__deploy"), Class::Risky(_)));
+        assert_eq!(verb_class("get"), Class::ReadOnly);
+        assert_eq!(verb_class("simulate_access"), Class::ReadOnly);
+        assert_eq!(verb_class("pending_iam_changes"), Class::ReadOnly);
+        assert!(matches!(verb_class("delete"), Class::Destructive(_)));
+        assert!(matches!(verb_class("kv_put"), Class::Risky(_)));
+        assert!(matches!(verb_class("deploy"), Class::Risky(_)));
+    }
+
+    #[test]
+    fn the_real_name_decides_even_when_the_exposed_one_is_cut() {
+        let tool = format!("{}_delete", "x".repeat(70));
+        let mut servers = vec![server("s", &[&tool])];
+        name_tools(&mut servers);
+        let exposed = &servers[0].tools[0].exposed;
+        assert!(!exposed.contains("delete"), "{exposed}");
+        assert!(matches!(verb_class(exposed), Class::Risky(_)), "the cut name alone would hide the delete");
+        CLASSES.write().unwrap().insert(exposed.clone(), servers[0].tools[0].class.clone());
+        assert!(matches!(classify(exposed), Class::Destructive(_)));
+    }
+
+    #[test]
+    fn annotations_only_add_caution() {
+        assert!(matches!(tool_class("apply", &json!({"destructiveHint": true})), Class::Destructive(_)));
+        assert!(matches!(tool_class("get_or_create", &json!({"readOnlyHint": false})), Class::Risky(_)));
+        assert!(matches!(tool_class("deploy", &json!({"readOnlyHint": true})), Class::Risky(_)));
+        assert!(matches!(tool_class("drop", &json!({"destructiveHint": false})), Class::Destructive(_)));
+        assert_eq!(tool_class("get", &json!({})), Class::ReadOnly);
     }
 }
