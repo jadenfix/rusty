@@ -2844,3 +2844,17 @@ fn a_bounded_run_tells_the_model_what_is_left() {
     assert!(out.status.success());
     assert!(!server.join().unwrap()[0]["messages"].to_string().contains("Run budget"), "unbounded runs stay quiet");
 }
+
+#[test]
+fn the_first_request_shows_the_workspace() {
+    let s = Sandbox::new("snapshot");
+    std::fs::write(s.project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    std::fs::create_dir_all(s.project.join("src")).unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+    ]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).args(["--yolo", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let system = server.join().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("Workspace snapshot") && system.contains("src/ Cargo.toml"), "{system}");
+}

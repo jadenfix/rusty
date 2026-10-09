@@ -150,6 +150,8 @@ pub struct Agent {
     /// The last turn ended on a repetition or talk-only stall.
     last_turn_stalled: bool,
     project_notes: String,
+    /// The workspace at startup (local lead only), see snapshot.rs.
+    pub snapshot: String,
     pub session_path: Option<PathBuf>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
@@ -223,6 +225,7 @@ impl Agent {
             last_prompt_tokens: 0,
             last_turn_stalled: false,
             project_notes,
+            snapshot: String::new(),
             session_path: None,
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
@@ -423,6 +426,7 @@ impl Agent {
             std::env::consts::ARCH,
             self.policy.mode.name()
         ));
+        s.push_str(&self.snapshot);
         s.push_str(&self.infra.target.prompt_block(self.execution_mode == ExecutionMode::Careful));
         if !self.project_notes.is_empty() {
             s.push_str("\nProject instructions:\n");
