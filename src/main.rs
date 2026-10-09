@@ -363,17 +363,7 @@ fn expand_skill(cwd: &Path, input: &str) -> Option<String> {
 }
 
 fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Settings) -> Result<()> {
-    ui::banner(&ui::BannerInfo {
-        model: &agent.model,
-        cwd: &tilde(cwd),
-        exec: if agent.mode_fixed { agent.execution_mode.name() } else { "auto" },
-        perms: agent.policy.mode.name(),
-        agents: agent.agents.mode.name(),
-        view: display::view_name(),
-        provider: client.endpoint_for(&agent.model).map(|e| e.provider.name()).unwrap_or("no key"),
-        keys: client.key_count(),
-        target: &target_line(agent),
-    });
+    banner(agent, client, cwd);
     let mut rl = rustyline::DefaultEditor::new()?;
     let history_file = config::config_dir().map(|d| d.join("history"));
     if let Some(h) = &history_file {
@@ -574,17 +564,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             } else {
                 settings.font = rest.to_string();
                 settings.save();
-                ui::banner(&ui::BannerInfo {
-                    model: &agent.model,
-                    cwd: &tilde(cwd),
-                    exec: if agent.mode_fixed { agent.execution_mode.name() } else { "auto" },
-                    perms: agent.policy.mode.name(),
-                    agents: agent.agents.mode.name(),
-                    view: display::view_name(),
-                    provider: client.endpoint_for(&agent.model).map(|e| e.provider.name()).unwrap_or("no key"),
-                    keys: client.key_count(),
-                    target: &target_line(agent),
-                });
+                banner(agent, client, cwd);
             }
         }
         "/agents" | "/subagents" if rest == "default" => {
@@ -596,17 +576,13 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             settings.save();
             agents_cmd(agent, "");
         }
-        "/agents" | "/subagents" => {
-            agents_cmd(agent, rest);
-            if !rest.is_empty() {
-                agent.delegation_override = true;
-                settings.delegation_override = true;
-                settings.agents = agent.agents.clone();
-                settings.save();
+        "/agents" | "/subagents" | "/swarm" => {
+            if cmd == "/swarm" {
+                swarm_cmd(agent, rest);
+            } else {
+                agents_cmd(agent, rest);
             }
-        }
-        "/swarm" => {
-            swarm_cmd(agent, rest);
+            // Any change makes delegation the user's choice, kept across sessions.
             if !rest.is_empty() {
                 agent.delegation_override = true;
                 settings.delegation_override = true;
@@ -746,6 +722,21 @@ fn on_off(b: bool) -> String {
     } else {
         ui::dim("off")
     }
+}
+
+/// The startup banner; `/font` shows it again in the new font.
+fn banner(agent: &Agent, client: &Client, cwd: &Path) {
+    ui::banner(&ui::BannerInfo {
+        model: &agent.model,
+        cwd: &tilde(cwd),
+        exec: if agent.mode_fixed { agent.execution_mode.name() } else { "auto" },
+        perms: agent.policy.mode.name(),
+        agents: agent.agents.mode.name(),
+        view: display::view_name(),
+        provider: client.endpoint_for(&agent.model).map(|e| e.provider.name()).unwrap_or("no key"),
+        keys: client.key_count(),
+        target: &target_line(agent),
+    });
 }
 
 fn agents_cmd(agent: &mut Agent, rest: &str) {
