@@ -199,11 +199,79 @@ fn read_file(args: &Value) -> Result<String> {
 fn write_file(args: &Value) -> Result<String> {
     let path = arg(args, "path")?;
     let content = arg(args, "content")?;
+    let before = fs::read_to_string(path).ok();
+    let warning = guard(path, before.as_deref(), content)?;
     if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, content).with_context(|| format!("cannot write {path}"))?;
-    Ok(format!("wrote {} lines to {path}", content.lines().count()))
+    Ok(format!("wrote {} lines to {path}{warning}", content.lines().count()))
+}
+
+/// Refuses a change that breaks a file that parsed before, leaving it as it
+/// was; a file that was already broken (or new) is written with a warning.
+fn guard(path: &str, before: Option<&str>, after: &str) -> Result<String> {
+    let Some(err) = syntax_error(path, after) else { return Ok(String::new()) };
+    if before.is_some_and(|b| syntax_error(path, b).is_none()) {
+        bail!("rejected: {path} would no longer parse ({err}). The file is unchanged; fix the change and retry.");
+    }
+    Ok(format!("\nwarning: {path} does not parse: {err}"))
+}
+
+/// A parse error for the languages rusty can check cheaply: JSON in process,
+/// Python and shell with their own parsers when installed. None means fine
+/// or not checkable.
+pub fn syntax_error(path: &str, text: &str) -> Option<String> {
+    let ext = Path::new(path).extension()?.to_str()?;
+    let check: &[&str] = match ext {
+        "json" => {
+            return serde_json::from_str::<serde::de::IgnoredAny>(text).err().map(|e| e.to_string());
+        }
+        "py" => &["python3", "-c", "import ast,sys; ast.parse(sys.stdin.read(), sys.argv[1])"],
+        "sh" | "bash" => &["bash", "-n"],
+        _ => return None,
+    };
+    let mut cmd = std::process::Command::new(check[0]);
+    cmd.args(&check[1..]);
+    if ext == "py" {
+        cmd.arg(path);
+    }
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = text.to_string();
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return None,
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take()?, &mut err).ok()?;
+    let message = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("syntax error").trim();
+    // Python names the line on a separate traceback line.
+    let at = err.lines().rev().find_map(|l| l.split_once("\", line ").map(|(_, n)| n.trim().to_string()));
+    let text = match at {
+        Some(n) => format!("line {n}: {message}"),
+        None => message.to_string(),
+    };
+    Some(text.chars().take(300).collect())
 }
 
 fn edit_file(args: &Value) -> Result<String> {
@@ -222,8 +290,9 @@ fn edit_file(args: &Value) -> Result<String> {
         _ if replace_all => text.replace(old, new),
         n => bail!("old_string matches {n} times in {path}; add context to make it unique or set replace_all"),
     };
+    let warning = guard(path, Some(&text), &updated)?;
     fs::write(path, updated)?;
-    Ok(format!("edited {path} ({} replacement{})", count, if count == 1 { "" } else { "s" }))
+    Ok(format!("edited {path} ({} replacement{}){warning}", count, if count == 1 { "" } else { "s" }))
 }
 
 fn list_files(args: &Value) -> Result<String> {
@@ -612,6 +681,42 @@ pub fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_that_break_a_parsing_file_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("rusty-guard-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("c.json");
+        fs::write(&json, "{\"a\": 1}").unwrap();
+        let p = json.to_str().unwrap();
+        let err = edit_file(&json!({"path": p, "old_string": "1}", "new_string": "1,"})).unwrap_err().to_string();
+        assert!(err.starts_with("rejected:") && err.contains("unchanged"), "{err}");
+        assert_eq!(fs::read_to_string(&json).unwrap(), "{\"a\": 1}");
+        assert!(edit_file(&json!({"path": p, "old_string": "1", "new_string": "2"})).unwrap().starts_with("edited"));
+        // Already broken: the write goes through with a warning.
+        fs::write(&json, "{").unwrap();
+        let ok = write_file(&json!({"path": p, "content": "{\"b\":"})).unwrap();
+        assert!(ok.contains("warning:") && ok.contains("does not parse"), "{ok}");
+        if which("python3") {
+            let py = dir.join("m.py");
+            fs::write(&py, "def f():\n    return 1\n").unwrap();
+            let err = edit_file(&json!({"path": py.to_str().unwrap(), "old_string": "f():", "new_string": "f(:"}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("line 1") && err.contains("SyntaxError"), "{err}");
+        }
+        if which("bash") {
+            let sh = dir.join("s.sh");
+            let r = write_file(&json!({"path": sh.to_str().unwrap(), "content": "if true; then\n"})).unwrap();
+            assert!(r.contains("warning:"), "a new broken script is written with a warning: {r}");
+        }
+        assert_eq!(syntax_error("notes.txt", "{{{"), None, "unknown types are never checked");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn which(tool: &str) -> bool {
+        std::process::Command::new(tool).arg("--version").output().is_ok()
+    }
 
     #[test]
     fn output_is_drained_with_bounded_head_and_tail() {
