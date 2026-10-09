@@ -88,6 +88,46 @@ pub fn redact_with_handles(text: &str) -> (String, usize) {
     (out, n + count)
 }
 
+/// Redacts one tool's output for the model. A secret store hands back its
+/// secret in a plain field such as `value`, with nothing secret-looking
+/// around it, so when the tool's name says it deals in secrets those fields
+/// count as secrets too. `handles` picks [`redact_with_handles`] over
+/// [`redact`].
+pub fn redact_tool_output(tool: &str, text: &str, handles: bool) -> (String, usize) {
+    let mut hidden = 0;
+    let mut text = std::borrow::Cow::Borrowed(text);
+    let name = tool.to_ascii_lowercase();
+    if name.contains("secret") || name.contains("credential") {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
+            hidden = hide_secret_fields(&mut json, handles);
+            if hidden > 0 {
+                text = serde_json::to_string_pretty(&json).unwrap_or_default().into();
+            }
+        }
+    }
+    let (out, n) = if handles { redact_with_handles(&text) } else { redact(&text) };
+    (out, n + hidden)
+}
+
+fn hide_secret_fields(value: &mut serde_json::Value, handles: bool) -> usize {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter_mut()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s)
+                    if !s.is_empty() && matches!(k.as_str(), "value" | "secret" | "plaintext" | "data") =>
+                {
+                    *s = if handles { handle(s) } else { REDACTED.to_string() };
+                    1
+                }
+                _ => hide_secret_fields(v, handles),
+            })
+            .sum(),
+        serde_json::Value::Array(items) => items.iter_mut().map(|v| hide_secret_fields(v, handles)).sum(),
+        _ => 0,
+    }
+}
+
 /// The handed-out secrets as environment variables for a shell command.
 pub fn secret_env() -> Vec<(String, String)> {
     vault().iter().enumerate().map(|(i, v)| (format!("{HANDLE}{}", i + 1), v.clone())).collect()
@@ -430,6 +470,21 @@ mod tests {
         let secret = "kind: Secret\ndata:\n  \"pw\": \"aGFuZGxlLXNlY3JldA==\",\n";
         let (out, _) = redact_with_handles(secret);
         assert!(out.contains(&format!("  \"pw\": \"{}\",\n", name("aGFuZGxlLXNlY3JldA=="))), "{out}");
+    }
+
+    #[test]
+    fn a_secret_tool_s_value_field_is_a_secret() {
+        let key = ["tp", "live", "shop", "8c41f0e2b7d9"].join("_");
+        let answer = format!("{{\"version\": 1, \"stage\": \"current\", \"value\": \"{key}\"}}");
+        let (out, n) = redact_tool_output("mcp__simcloud__secret_access", &answer, true);
+        assert_eq!(n, 1, "{out}");
+        assert!(!out.contains(&key) && out.contains("\"stage\": \"current\""), "{out}");
+        assert!(secret_env().iter().any(|(_, v)| *v == key));
+        // Shown again later by any tool, it stays hidden.
+        assert!(!redact_with_handles(&format!("key={key}")).0.contains(&key));
+        // Without handles it is plainly redacted; other tools' value fields are data.
+        assert_eq!(redact_tool_output("mcp__x__get_secret", &answer, false).1, 1);
+        assert_eq!(redact_tool_output("mcp__x__get_config", "{\"value\": \"blue\"}", true).1, 0);
     }
 
     #[test]
