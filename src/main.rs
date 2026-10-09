@@ -60,7 +60,7 @@ struct Cli {
 
     /// Memory: off, recall (use saved lessons), learn (also tool context, file
     /// checks, credit from --verify), reflect (also a model review after checked
-    /// goals) or deep (most aggressive)
+    /// goals) or deep (most aggressive). Benchmark runs should pass off
     #[arg(long, env = "RUSTY_MEMORY", default_value = "learn")]
     memory: String,
 
