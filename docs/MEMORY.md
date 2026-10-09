@@ -20,9 +20,8 @@ lessons more readily and prune harder, since more capture means more noise.
 | Level | What it adds | Offered when score ≥ / per turn | Retired when |
 |---|---|---|---|
 | `off` | No memory. | – | – |
-| `legacy` | The older JSONL store, without the advisor. | – | – |
 | `recall` | Offers lessons you or the agent saved that match the request. Your preferences are added to every prompt. | 0.25 / 1 | an unvouched lesson has had no success in 28 days |
-| `learn` | The last four tool calls (arguments and error lines) join the request. Lessons record the files they describe and are re-checked before use. A goal's `--verify` check credits or charges the lessons it was offered. | 0.15 / 2 | mean < 0.3 after 2+ outcomes, or 28 days |
+| `learn` (default) | The last four tool calls (arguments and error lines) join the request. Lessons record the files they describe and are re-checked before use. A goal's `--verify` check credits or charges the lessons it was offered. | 0.15 / 2 | mean < 0.3 after 2+ outcomes, or 28 days |
 | `reflect` | After a checked goal, one budgeted request says which offered lessons the work used and, only after a pass, keeps up to two short new lessons. Compaction's lessons are kept too. | 0.15 / 2 | mean < 0.35, or 21 days |
 | `deep` | Up to three new lessons per pass and more offered per turn. | 0.10 / 3 | mean < 0.4, or 14 days |
 

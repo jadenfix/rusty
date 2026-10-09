@@ -13,7 +13,6 @@ mod infra;
 mod llm;
 mod markdown;
 mod mcp;
-mod memory;
 mod permissions;
 mod signal;
 mod skills;
@@ -35,7 +34,6 @@ use agent::{Agent, GoalStatus};
 use config::{AgentsMode, Settings};
 use execution::ExecutionMode;
 use llm::Client;
-use memory::Memory;
 use permissions::{Mode, Policy, Verdict};
 
 /// A coding agent for your terminal.
@@ -60,10 +58,10 @@ struct Cli {
     #[arg(long, env = "RUSTY_MODE")]
     mode: Option<String>,
 
-    /// Memory: off, legacy (the older store), recall (use saved lessons), learn
-    /// (also tool context, file checks, credit from --verify), reflect (also a
-    /// model review after checked goals) or deep (most aggressive)
-    #[arg(long, env = "RUSTY_MEMORY", default_value = "legacy")]
+    /// Memory: off, recall (use saved lessons), learn (also tool context, file
+    /// checks, credit from --verify), reflect (also a model review after checked
+    /// goals) or deep (most aggressive)
+    #[arg(long, env = "RUSTY_MEMORY", default_value = "learn")]
     memory: String,
 
     /// Permission mode: read-only, ask, auto or yolo
@@ -224,9 +222,8 @@ fn run() -> Result<i32> {
     let pdir = project_dir(&PathBuf::from(backend.identity(&cwd)));
     let global = config::config_dir().unwrap_or_default();
     let policy = Policy::load(pdir.join("permissions.json"), mode);
-    let memory = Memory::load(pdir.join("memory.jsonl"), global.join("memory.jsonl"));
 
-    let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy, memory);
+    let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy);
     if backend.name() == "local" {
         agent.infra.target = infra::Target::detect(&cwd);
     }
@@ -674,17 +671,14 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 println!("  usage: /remember [preference|fact|decision|gotcha:] <text>");
             } else {
                 let (kind, text) = match rest.split_once(':') {
-                    Some((k, t)) if memory::KINDS.contains(&k.trim()) => (k.trim(), t.trim()),
+                    Some((k, t)) if rusty::advisor::KINDS.contains(&k.trim()) => (k.trim(), t.trim()),
                     _ => ("fact", rest),
                 };
                 println!("  {}", agent.remember(kind, text, kind == "preference"));
-                agent.memory.save();
             }
         }
         "/forget" => {
-            let result = agent.forget_memory(rest);
-            agent.memory.save();
-            println!("  {result}");
+            println!("  {}", agent.forget_memory(rest));
         }
         "/skills" => {
             for s in skills::all(cwd) {
@@ -967,52 +961,28 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
 }
 
 fn memory_cmd(agent: &mut Agent, rest: &str) {
-    if agent.memory_level == rusty::advisor::Level::Off {
+    let Some(h) = &mut agent.advisor else {
         println!("  memory is off");
         return;
-    }
+    };
     let (sub, arg) = rest.split_once(char::is_whitespace).map(|(s, a)| (s, a.trim())).unwrap_or((rest, ""));
-    if let Some(h) = &mut agent.advisor {
-        let (op, data) = match sub {
-            "" | "list" => ("list", serde_json::Value::Null),
-            "search" => ("recall", serde_json::json!({"query":arg})),
-            "forget" => ("forget", serde_json::json!({"id":arg})),
-            "status" => ("status", serde_json::Value::Null),
-            "helpful" | "harmful" => ("feedback", serde_json::json!({"helpful":sub=="helpful"})),
-            _ => {
-                println!("  /memory [list | search <query> | forget <id> | status | helpful | harmful]");
-                return;
-            }
-        };
-        println!("  {}", h.control(op, data).text);
-        return;
+    let (op, data) = match sub {
+        "" | "list" => ("list", serde_json::Value::Null),
+        "search" => ("recall", serde_json::json!({"query":arg})),
+        "forget" => ("forget", serde_json::json!({"id":arg})),
+        "status" => ("status", serde_json::Value::Null),
+        "helpful" | "harmful" => ("feedback", serde_json::json!({"helpful":sub=="helpful"})),
+        _ => {
+            println!("  /memory [list | search <query> | forget <id> | status | helpful | harmful]");
+            return;
+        }
+    };
+    let text = h.control(op, data).text;
+    if text.is_empty() {
+        println!("{}", ui::dim("  no memories yet. rusty saves them as it learns, or use /remember"));
+    } else {
+        println!("  {text}");
     }
-    match sub {
-        "" | "list" => {
-            if agent.memory.entries.is_empty() {
-                println!("{}", ui::dim("  no memories yet. rusty saves them as it learns, or use /remember"));
-            }
-            for e in &agent.memory.entries {
-                let scope = if e.global { "global " } else { "project" };
-                println!("  {} {} {:<10} {}", ui::dim(&e.id), ui::dim(scope), e.kind, e.text);
-            }
-        }
-        "search" => {
-            for (score, e) in agent.memory.search(arg, 10) {
-                println!("  {} {:.2} {:<10} {}", ui::dim(&e.id), score, e.kind, e.text);
-            }
-        }
-        "forget" => {
-            let ok = agent.memory.forget(arg);
-            println!("  {}", if ok { "forgotten" } else { "no such memory" });
-        }
-        "clear" => {
-            agent.memory.clear_project();
-            println!("  project memories cleared (global ones kept)");
-        }
-        _ => println!("  /memory [list | search <query> | forget <id> | clear]"),
-    }
-    agent.memory.save();
 }
 
 /// Parses `[30s|5m|1h] [x10] <prompt>`.
@@ -1060,7 +1030,7 @@ fn print_help(cwd: &Path) {
         (
             "memory & context",
             &[
-                ("/memory", "list · search · forget · clear"),
+                ("/memory", "list · search · forget · status · helpful · harmful"),
                 ("/remember <text>", "save one (prefix preference:, gotcha:, decision:)"),
                 ("/context", "where the window is going"),
                 ("/compact [focus]", "summarise now; say what matters most to keep it in detail"),
@@ -1113,12 +1083,12 @@ fn tilde(p: &Path) -> String {
 
 fn project_dir(cwd: &Path) -> PathBuf {
     let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "root".into());
-    let id = format!("{name}-{:08x}", memory::fnv(&cwd.display().to_string()) as u32);
+    let id = format!("{name}-{:08x}", rusty::fnv(&cwd.display().to_string()) as u32);
     config::config_dir().unwrap_or_else(|| PathBuf::from(".rusty")).join("projects").join(id)
 }
 
 fn new_session_path(dir: &Path) -> PathBuf {
-    dir.join(format!("{}.json", memory::now()))
+    dir.join(format!("{}.json", rusty::unix_now()))
 }
 
 fn latest_session(dir: &Path) -> Option<PathBuf> {

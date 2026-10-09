@@ -17,14 +17,13 @@ use crate::display::{self, Display, View};
 use crate::execution::ExecutionMode;
 use crate::infra;
 use crate::llm::{Client, Event, Reply, ToolCall};
-use crate::memory::{Memory, KINDS};
 use crate::permissions::{Mode, Policy, Verdict};
 use crate::signal;
 use crate::tips;
 use crate::tools;
 use crate::ui;
 use crate::verification::{self, CheckRecord, CheckSpec};
-use rusty::advisor::{Hooks, Level};
+use rusty::advisor::{Hooks, Level, KINDS};
 
 const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
@@ -133,7 +132,6 @@ pub struct Agent {
     pub trajectory_path: Option<PathBuf>,
     trajectory_saved: Option<Instant>,
     pub policy: Policy,
-    pub memory: Memory,
     pub memory_level: Level,
     pub advisor: Option<Hooks>,
     pub plan: Vec<PlanItem>,
@@ -176,30 +174,20 @@ impl Agent {
     /// Saves a memory vouched for by `source` (user, agent, compaction or
     /// reflect), anchored to `files` when the advisor checks anchors.
     fn remember_as(&mut self, kind: &str, text: &str, global: bool, source: &str, files: &[String]) -> String {
-        if self.memory_level == Level::Off {
-            return "memory is off".into();
+        match &mut self.advisor {
+            Some(h) => h.remember(kind, &infra::redact(text).0, source, files, global && kind == "preference").text,
+            None => "memory is off".into(),
         }
-        if let Some(h) = &mut self.advisor {
-            return h.remember(kind, &infra::redact(text).0, source, files, global && kind == "preference").text;
-        }
-        self.memory.add(kind, text, global)
     }
 
     pub fn forget_memory(&mut self, id: &str) -> String {
-        if self.memory_level == Level::Off {
-            return "memory is off".into();
-        }
-        if let Some(h) = &mut self.advisor {
-            return h.control("forget", json!({"id":id})).text;
-        }
-        if self.memory.forget(id) {
-            format!("forgot {id}")
-        } else {
-            format!("no memory with id {id}")
+        match &mut self.advisor {
+            Some(h) => h.control("forget", json!({"id":id})).text,
+            None => "memory is off".into(),
         }
     }
 
-    pub fn new(client: Arc<Client>, model: String, cwd: PathBuf, policy: Policy, memory: Memory) -> Self {
+    pub fn new(client: Arc<Client>, model: String, cwd: PathBuf, policy: Policy) -> Self {
         let project_notes = load_project_notes(&cwd);
         Self {
             backend: crate::backend::Backend::Local,
@@ -219,8 +207,7 @@ impl Agent {
             trajectory_path: None,
             trajectory_saved: None,
             policy,
-            memory,
-            memory_level: Level::Legacy,
+            memory_level: Level::Off,
             advisor: None,
             plan: Vec::new(),
             goal: None,
@@ -365,7 +352,7 @@ impl Agent {
 
     // ---------------------------------------------------------------- prompt
 
-    fn system_prompt(&self, query: &str) -> (String, Vec<String>) {
+    fn system_prompt(&self) -> String {
         if self.is_worker {
             let s = format!(
                 "You are a research worker for a coding agent, working in {}. Investigate the task you are given \
@@ -381,7 +368,7 @@ impl Agent {
                     ""
                 }
             );
-            return (s, Vec::new());
+            return s;
         }
         let mut s = format!(
             "You are Rusty, a coding agent working in the user's terminal on the project at {}. You're a calm, \
@@ -444,15 +431,6 @@ impl Agent {
             s.push_str(&self.project_notes);
             s.push('\n');
         }
-        let (mem, ids) = if self.memory_level == Level::Legacy {
-            self.memory.context_block(query, context::MEMORY_CHARS)
-        } else {
-            (String::new(), Vec::new())
-        };
-        if !mem.is_empty() {
-            s.push_str("\nMemories relevant to this request (from earlier sessions; verify before relying on them):\n");
-            s.push_str(&mem);
-        }
         if let Some(prefs) = self.advisor.as_ref().map(Hooks::preferences).filter(|p| !p.is_empty()) {
             s.push_str("\nThe user's saved preferences:\n");
             s.push_str(prefs);
@@ -481,7 +459,7 @@ impl Agent {
                  unless something failed.\n",
             );
         }
-        (s, ids)
+        s
     }
 
     fn tool_defs(&self) -> Value {
@@ -588,13 +566,14 @@ impl Agent {
     /// Runs one user turn to completion. Returns false if interrupted.
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
         self.history.push(json!({"role": "user", "content": user}));
-        if let Some(h) = &mut self.advisor {
-            h.begin(&infra::redact(user).0);
-        }
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
             None => user.to_string(),
         };
+        // Later goal turns say only "keep going", so recall from the objective too.
+        if let Some(h) = &mut self.advisor {
+            h.begin(&infra::redact(&query).0);
+        }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
         let mut d = Display::new(self.is_worker);
         let before = self.totals.clone();
@@ -638,12 +617,9 @@ impl Agent {
                 }
             }
             self.manage_context(&mut d);
-            let (mut system, mem_ids) = self.system_prompt(&query);
+            let mut system = self.system_prompt();
             if let Some(h) = &mut self.advisor {
                 system.push_str(&h.advice());
-            }
-            if step == 0 {
-                self.memory.touch(&mem_ids);
             }
             let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(json!({"role": "system", "content": system}));
@@ -1294,24 +1270,10 @@ impl Agent {
     }
 
     fn recall(&mut self, query: &str) -> String {
-        if self.memory_level == Level::Off {
-            return "memory is off".into();
+        match &mut self.advisor {
+            Some(h) => h.control("recall", json!({"query": infra::redact(query).0})).text,
+            None => "memory is off".into(),
         }
-        if let Some(h) = &mut self.advisor {
-            return h.control("recall", json!({"query": infra::redact(query).0})).text;
-        }
-        let hits: Vec<(String, String)> = self
-            .memory
-            .search(query, 10)
-            .into_iter()
-            .map(|(_, e)| (e.id.clone(), format!("[{}:{}] {}", e.kind, e.id, e.text)))
-            .collect();
-        if hits.is_empty() {
-            return "no matching memories".into();
-        }
-        let ids: Vec<String> = hits.iter().map(|h| h.0.clone()).collect();
-        self.memory.touch(&ids);
-        hits.into_iter().map(|h| h.1).collect::<Vec<_>>().join("\n")
     }
 
     // ------------------------------------------------- subagents and swarms
@@ -1348,13 +1310,7 @@ impl Agent {
                 };
                 let temperature = if n > 1 { 0.2 + cfg.spread * i as f32 / (n - 1) as f32 } else { 0.2 };
                 let counter = Arc::new(AtomicUsize::new(0));
-                let mut w = Agent::new(
-                    client.clone(),
-                    model.clone(),
-                    cwd.clone(),
-                    Policy::new(Mode::ReadOnly),
-                    Memory::empty(),
-                );
+                let mut w = Agent::new(client.clone(), model.clone(), cwd.clone(), Policy::new(Mode::ReadOnly));
                 w.is_worker = true;
                 w.request_role = role;
                 w.backend = backend.clone();
@@ -1781,13 +1737,12 @@ impl Agent {
         if summary.is_empty() {
             bail!("the model returned an empty summary");
         }
-        // The advisor keeps unverified compaction lessons only from reflect up.
-        if self.advisor.as_ref().is_none_or(|h| h.level.reflects()) {
+        // Unverified compaction lessons are kept only from reflect up.
+        if self.advisor.as_ref().is_some_and(|h| h.level.reflects()) {
             for (kind, text) in &memories {
                 self.remember_as(kind, text, false, "compaction", &[]);
             }
         }
-        self.memory.save();
         let tail = self.history.split_off(split);
         let mut block = format!("[Summary of the conversation so far]\n{summary}\n\n");
         if !working_set.is_empty() {
@@ -1858,7 +1813,7 @@ impl Agent {
     }
 
     pub fn context_report(&self) -> String {
-        let (system, _) = self.system_prompt("");
+        let system = self.system_prompt();
         let sys = system.len() / 4;
         let hist = context::estimate(&self.history);
         let win = context::window();
@@ -1882,7 +1837,6 @@ impl Agent {
     }
 
     pub fn save_session(&mut self) {
-        self.memory.save();
         let Some(path) = &self.session_path else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1919,7 +1873,7 @@ impl Agent {
         }
         let Some(path) = &self.session_path else { return };
         let line = json!({
-            "t": crate::memory::now(),
+            "t": rusty::unix_now(),
             "model": self.model,
             "execution_mode": self.execution_mode.name(),
             "mode_reason": if self.mode_fixed { "chosen by the user" } else { self.mode_reason.as_str() },

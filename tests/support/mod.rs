@@ -42,6 +42,12 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // rusty starts a memory daemon on demand; don't leave it running.
+        for home in [self.0.join("home"), self.0.clone()] {
+            if home.join("memory/advisor.sock").exists() {
+                let _ = Command::new(MEMORYD).arg("--home").arg(&home).arg("stop").stdout(Stdio::null()).status();
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

@@ -94,7 +94,18 @@ impl Sandbox {
 
     /// Runs the REPL with `lines` piped to stdin.
     fn repl(&self, lines: &[&str]) -> String {
-        let mut child = self.cmd().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        self.repl_with(self.cmd(), lines)
+    }
+
+    /// `repl` with memory off.
+    fn repl_off(&self, lines: &[&str]) -> String {
+        let mut c = self.cmd();
+        c.args(["--memory", "off"]);
+        self.repl_with(c, lines)
+    }
+
+    fn repl_with(&self, mut c: Command, lines: &[&str]) -> String {
+        let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         for l in lines {
             writeln!(stdin, "{l}").unwrap();
@@ -108,6 +119,15 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        // rusty starts a memory daemon on demand; don't leave it running.
+        if self.home.join("memory/advisor.sock").exists() {
+            let _ = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
+                .arg("--home")
+                .arg(&self.home)
+                .arg("stop")
+                .stdout(Stdio::null())
+                .status();
+        }
         if let Some(root) = self.home.parent() {
             let _ = std::fs::remove_dir_all(root);
         }
@@ -148,13 +168,11 @@ fn saved_memory_and_history_do_not_contain_credentials() {
             let p = entry.unwrap().path();
             if p.is_dir() {
                 inspect(&p);
-            } else {
-                let text = std::fs::read_to_string(&p).unwrap();
+            } else if p.is_file() {
+                // Bytes, so the memory store's SQLite file is searched too.
+                let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
                 assert!(!text.contains("cli-secret-canary-12345"), "credential persisted in {}", p.display());
-                if p.file_name().unwrap() == "history"
-                    || p.file_name().unwrap() == "memory.jsonl"
-                    || p.extension().is_some_and(|s| s == "json")
-                {
+                if p.file_name().unwrap() == "history" || p.extension().is_some_and(|s| s == "json") {
                     assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
                 }
             }
@@ -271,13 +289,24 @@ fn memory_round_trip() {
     let s = Sandbox::new("memory");
     s.repl(&["/remember gotcha: the schema file is generated, never edit it", "/remember preference: tabs not spaces"]);
     let out = s.repl(&["/memory", "/memory search schema"]);
-    assert!(out.contains("gotcha") && out.contains("schema file is generated"));
-    assert!(out.contains("global") && out.contains("tabs not spaces"));
-    let id =
-        out.lines().find(|l| l.contains("schema file")).and_then(|l| l.split_whitespace().next()).unwrap().to_string();
+    // The user's own saves start trusted: confidence 0.65, no outcomes yet.
+    assert!(out.contains("schema file is generated, never edit it (confidence 0.65, +0 -0, user)"), "{out}");
+    // A preference from /remember applies to every project.
+    assert!(out.contains("tabs not spaces") && out.contains("user, global)"), "{out}");
+    let id = out
+        .lines()
+        .find(|l| l.contains("schema file"))
+        .and_then(|l| l.split(['[', ']']).nth(1))
+        .and_then(|tag| tag.split(':').nth(1))
+        .unwrap()
+        .to_string();
     let out = s.repl(&[&format!("/forget {id}"), "/memory"]);
-    assert!(out.contains(&format!("forgot {id}")));
-    assert!(!out.lines().any(|l| l.contains("schema file is generated") && l.contains("project")));
+    assert!(out.contains(&format!("forgot {id}")), "{out}");
+    assert!(!out.contains("schema file is generated"), "{out}");
+    // A forgotten lesson stays forgotten.
+    let out = s.repl(&["/remember gotcha: the schema file is generated, never edit it"]);
+    assert!(out.contains("forgotten"), "{out}");
+    assert!(s.repl_off(&["/memory"]).contains("memory is off"));
 }
 
 #[test]

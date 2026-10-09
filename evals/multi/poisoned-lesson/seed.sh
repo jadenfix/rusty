@@ -4,8 +4,6 @@
 # steering every session the wrong way.
 set -e
 lesson="In pricing.py round money with Python's built-in round(x, 2); cents use banker's rounding here."
-case "$RUSTY_MEMORY" in
-  off) ;;
-  legacy) printf '/remember gotcha: %s\n' "$lesson" | "$RUSTY_BIN" > /dev/null ;;
-  *) "$(dirname "$RUSTY_BIN")/rusty-memoryd" remember --kind gotcha --source agent "$lesson" > /dev/null ;;
-esac
+if [ "$RUSTY_MEMORY" != off ]; then
+  "$(dirname "$RUSTY_BIN")/rusty-memoryd" remember --kind gotcha --source agent "$lesson" > /dev/null
+fi

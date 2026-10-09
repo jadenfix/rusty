@@ -939,7 +939,7 @@ impl Harness {
 
     /// Logs one command: a line in the audit file and an entry in memory.
     pub fn record(&mut self, mode: &str, mut rec: Record) {
-        rec.t = crate::memory::now();
+        rec.t = rusty::unix_now();
         let line = json!({
             "t": rec.t, "mode": mode, "target": self.target.summary(), "command": rec.command,
             "tool": rec.action.tool, "verb": rec.action.verb, "mutating": rec.action.mutating, "dry_run": rec.action.dry_run,
@@ -970,7 +970,7 @@ impl Harness {
         }
         let Some(dir) = &self.dir else { return Err("no project directory to keep snapshots in".into()) };
         let slug: String = format!("{}-{}", action.tool, action.verb).replace(' ', "-");
-        let path = dir.join("snapshots").join(format!("{}-{slug}", crate::memory::now()));
+        let path = dir.join("snapshots").join(format!("{}-{slug}", rusty::unix_now()));
         let mut kept = 0;
         let mut errors = Vec::new();
         let mut files = Vec::new();
