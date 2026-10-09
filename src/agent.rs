@@ -722,7 +722,13 @@ impl Agent {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
                     // JSON whitespace/key order must not bypass repeat detection.
                     let signature = format!("{}:{args}", call.name);
-                    let policy_name = if call.name == "bash_start" { "bash" } else { &call.name };
+                    // A mistyped MCP name is judged as the tool it resolves to.
+                    let resolved = crate::mcp::Mcp::is_tool(&call.name).then(|| self.mcp.resolve(&call.name)).flatten();
+                    let policy_name = match &resolved {
+                        Some(tool) => tool.as_str(),
+                        None if call.name == "bash_start" => "bash",
+                        None => &call.name,
+                    };
                     let class = crate::permissions::classify(policy_name, &args, &self.cwd);
                     if let crate::permissions::Class::Risky(why) | crate::permissions::Class::Destructive(why) = &class
                     {
@@ -986,10 +992,13 @@ impl Agent {
                 }
                 Ok("noted".into())
             }
-            name if crate::mcp::Mcp::is_tool(name) => match self.authorize(name, &args, d) {
-                Ok(Authorization::Allowed(_)) => self.mcp.call(name, &args),
-                Ok(Authorization::Refused(why)) => Ok(why),
-                Err(e) => Err(e),
+            name if crate::mcp::Mcp::is_tool(name) => match self.mcp.resolve(name) {
+                None => Err(anyhow::anyhow!("unknown MCP tool `{name}`; use one of the mcp__ tools you were given")),
+                Some(tool) => match self.authorize(&tool, &args, d) {
+                    Ok(Authorization::Allowed(_)) => self.mcp.call(&tool, &args),
+                    Ok(Authorization::Refused(why)) => Ok(why),
+                    Err(e) => Err(e),
+                },
             },
             name => self.run_guarded(name, &args, d),
         };

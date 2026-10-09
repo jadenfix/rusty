@@ -2861,3 +2861,36 @@ fn the_first_request_shows_the_workspace() {
     let system = server.join().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_string();
     assert!(system.contains("Workspace snapshot") && system.contains("src/ Cargo.toml"), "{system}");
 }
+
+#[test]
+fn mistyped_mcp_names_reach_the_tool_they_mean_under_its_own_permissions() {
+    let s = mcp_sandbox("mcp-typo");
+    let answer = || serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+    let read = tool_reply("mcp__flags#get_flag", serde_json::json!({"key": "checkout.engine"}));
+    let delete = tool_reply("MCP__flags__DELETE-flag", serde_json::json!({}));
+    let (url, server) = scripted_endpoint(vec![read, delete, answer()]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "check"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert!(requests[1]["messages"].to_string().contains("flag checkout.engine = v2"), "the typo reached get_flag");
+    assert!(requests[2]["messages"].to_string().contains("nobody is watching"), "a mistyped delete is still a delete");
+    assert!(!s.calls().contains("delete_flag\""), "{}", s.calls());
+}
+
+#[test]
+fn a_mistyped_mcp_read_does_not_escalate_auto_mode() {
+    let s = mcp_sandbox("mcp-typo-auto");
+    let read = tool_reply("mcp__flags#get_flag", serde_json::json!({"key": "checkout.engine"}));
+    let answer = serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+    let (url, server) = scripted_endpoint(vec![read, answer]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).args(["--yolo", "check"]).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("switched up"));
+    assert_eq!(server.join().unwrap().len(), 2, "a read needs no careful review");
+}
