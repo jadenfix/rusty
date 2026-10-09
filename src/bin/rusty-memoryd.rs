@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use rusty::advisor::{Hooks, Mode};
+use rusty::advisor::{Hooks, Level};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,9 +19,17 @@ struct Cli {
 enum Control {
     Status,
     Stop,
+    /// This project's lessons with their confidence, best first.
+    List,
     Remember {
         #[arg(long, default_value = "fact")]
         kind: String,
+        /// Who vouches for it: user, agent, compaction or reflect
+        #[arg(long, default_value = "user")]
+        source: String,
+        /// Keep a preference for every project
+        #[arg(long)]
+        global: bool,
         text: String,
     },
     Export {
@@ -51,7 +59,7 @@ fn main() -> Result<()> {
                 scope: "admin".into(),
                 session: "admin".into(),
                 seq: 0,
-                mode: Mode::On,
+                level: Level::Learn,
                 data: json!(null),
             },
         )?;
@@ -61,11 +69,14 @@ fn main() -> Result<()> {
         println!("{}", r.text);
         return Ok(());
     }
-    let mut h = Hooks::connect(&home, &std::env::current_dir()?, Mode::On)?;
+    let mut h = Hooks::connect(&home, &std::env::current_dir()?, Level::Learn)?;
     let (op, data) = match &command {
         Control::Stop => unreachable!(),
         Control::Status => ("status", json!(null)),
-        Control::Remember { kind, text } => ("remember", json!({"kind":kind,"text":text})),
+        Control::List => ("list", json!(null)),
+        Control::Remember { kind, source, global, text } => {
+            ("remember", json!({"kind":kind,"text":text,"source":source,"global":global}))
+        }
         Control::Export { .. } => ("export", json!(null)),
         Control::Import { file } => {
             let mut text = String::new();

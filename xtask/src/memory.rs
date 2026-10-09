@@ -42,7 +42,9 @@ const TOOLS: &[&str] = &[
 const PROVIDER_ERRORS: &[&str] = &["429", "502", "503", "504", "unauthorized", "rate limit"];
 
 const SMOKE_USAGE: &str = "usage: cargo xtask memory-smoke [--live] [--binary PATH] [--model ID] \
-[--timeout SECONDS] [--modes off|on|deep ...] [--report PATH]";
+[--timeout SECONDS] [--modes off|recall|learn|reflect|deep ...] [--report PATH]";
+/// The memory levels the smoke drives, from none to the most aggressive.
+const LEVELS: [&str; 5] = ["off", "recall", "learn", "reflect", "deep"];
 const BENCH_USAGE: &str = "usage: cargo xtask memory-bench [--binary PATH] [--report PATH]";
 
 pub struct Smoke {
@@ -61,7 +63,7 @@ impl Smoke {
             live: false,
             model: "nvidia/nemotron-3-super-120b-a12b".into(),
             timeout: Duration::from_secs(180),
-            modes: ["off", "on", "deep"].map(String::from).to_vec(),
+            modes: LEVELS.map(String::from).to_vec(),
             report,
         }
     }
@@ -86,7 +88,7 @@ pub fn smoke_command(args: &[String]) -> Result<ExitCode> {
                 "--modes" => {
                     opts.modes.clear();
                     while let Some(m) = it.next_if(|a| !a.starts_with('-')) {
-                        ensure!(["off", "on", "deep"].contains(&m.as_str()), "bad mode {m}; choose off, on or deep");
+                        ensure!(LEVELS.contains(&m.as_str()), "bad level {m}; choose from {}", LEVELS.join(", "));
                         opts.modes.push(m.clone());
                     }
                     ensure!(!opts.modes.is_empty(), "--modes needs at least one mode");
@@ -195,7 +197,7 @@ fn run_case(opts: &Smoke, binary: &Path, mode: &str, task: &str, endpoint: &str,
     } else {
         "For creating note.txt, write exactly 42 and verify with Bash."
     };
-    let r = rpc(home, "remember", json!({"kind": "preference", "text": lesson}), 0)?;
+    let r = rpc(home, "remember", json!({"kind": "gotcha", "text": lesson}), 0)?;
     ensure!(!truthy(&r["error"]), "remember failed: {}", r["text"]);
     let prompt = if task == "edit" {
         "Fix calculator.py so add(a,b) adds a and b. Preserve SENTINEL. Read calculator.py directly with \
@@ -312,7 +314,7 @@ This task needs no directory discovery or extra planning."
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|m| m["role"] == "system" && m["content"].as_str().unwrap_or("").contains("Memory advisor"))
+                .any(|m| m["role"] == "system" && m["content"].as_str().unwrap_or("").contains("From memory"))
         });
         check("prompt_injection_matches_mode", seen == (mode != "off"));
     }
@@ -411,10 +413,11 @@ fn bench(binary: &Path, home: &Path, report: &Path) -> Result<bool> {
         ensure!(Instant::now() <= deadline, "startup deadline");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let evidence = "observed result ".repeat(100);
     for i in 0..512 {
-        let text = format!("Workspace package {i} requires inspect manifest then run Python checks.");
-        let r = rpc(home, "remember", json!({"kind": "fact", "text": text, "evidence": evidence}), 0)?;
+        // Distinct enough that near-duplicate merging keeps all 512.
+        let text =
+            format!("Workspace package {i}: inspect manifest then run Python checks for module m{i} and service s{i}.");
+        let r = rpc(home, "remember", json!({"kind": "fact", "text": text}), 0)?;
         ensure!(!truthy(&r["error"]), "{}", r["text"]);
     }
     ensure!(rpc(home, "status", Value::Null, 0)?["data"]["lessons"] == 512, "the store does not hold 512 lessons");
@@ -488,7 +491,7 @@ fn rpc(home: &Path, op: &str, data: Value, seq: u64) -> Result<Value> {
         hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     let request = json!({
-        "op": op, "scope": format!("project:{hash:016x}"), "session": "seed", "seq": seq, "mode": "on", "data": data,
+        "op": op, "scope": format!("project:{hash:016x}"), "session": "seed", "seq": seq, "level": "learn", "data": data,
     });
     let socket = home.join("memory/advisor.sock");
     let mut s = UnixStream::connect(&socket).with_context(|| format!("connecting to {}", socket.display()))?;
@@ -564,18 +567,6 @@ fn serve(stream: TcpStream, requests: &Requests) -> Result<()> {
     reader.read_exact(&mut body)?;
     let body: Value = serde_json::from_slice(&body)?;
     let mut out = stream;
-    if body["stream"] != true {
-        let content = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| m["content"].as_str());
-        let board: Value = serde_json::from_str(content.unwrap_or("null"))?;
-        let evidence = board["observations"].as_array().and_then(|o| o.last()).map(|o| o["id"].clone());
-        let result = json!({
-            "next_step": "Verify the calculator add function with the stated inputs.",
-            "evidence_ids": [evidence.ok_or_else(|| anyhow!("no observations"))?],
-        });
-        let data = json!({"choices": [{"message": {"content": result.to_string()}}]}).to_string();
-        write!(out, "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{data}", data.len())?;
-        return Ok(());
-    }
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     requests.lock().unwrap().push(body);
     let tools = messages.iter().filter(|m| m["role"] == "tool").count();

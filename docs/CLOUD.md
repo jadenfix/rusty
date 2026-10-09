@@ -22,7 +22,7 @@ another host.
 | `rusty-cloud hybrid ...` | local | local | one Daytona workspace |
 | `rusty-cloud run ...` | Daytona | Daytona | Daytona |
 
-`--memory off|on|deep` on the CLI, or `--memory-mode` on the launcher,
+`--memory off|recall|learn|reflect|deep` on the CLI, or `--memory-mode` on the launcher,
 chooses the memory behavior at the agent's location. `deep` may make extra
 model calls; `on` uses local hooks without background inference. The three
 reasoning modes and permission modes work in each arrangement.
@@ -57,7 +57,7 @@ cargo build --bins
 target/debug/rusty-cloud hybrid \
     --sandbox <existing-id> --workspace /home/daytona/work \
     --local-binary target/debug/rusty \
-    --mode standard --agents swarm --swarm-max 3 --memory-mode on
+    --mode standard --agents swarm --swarm-max 3 --memory-mode learn
 # Omit --prompt/--goal for the interactive CLI.
 # Headless run with a local receipt:
 target/debug/rusty-cloud hybrid \
@@ -240,15 +240,16 @@ None of this has been run against live Daytona yet.
 One lead uses `--agents swarm` to schedule bounded parallel read-only workers;
 only the lead edits and runs mutating commands. This runs within one sandbox,
 so workers share a checkout and local memory socket without extra network hops.
-Use `--memory-mode on` for the local advisor or `deep` for asynchronous model
-advice, and `--memory-input <scoped-export.json.gz>` for explicit L2 transfer.
-L1 stays in RAM; scoped L2 is exported separately, never as a raw database/WAL.
+Use `--memory-mode` with a memory level (`recall`, `learn`, `reflect` or
+`deep`) for the local advisor, and `--memory-input <scoped-export.json.gz>`
+for explicit lesson transfer. Session state stays in RAM; lessons are exported
+separately, never as a raw database/WAL.
 `--model` selects a model on the configured `RUSTY_BASE_URL` endpoint.
 
 ```bash
 rusty-cloud run --snapshot rusty-<printed-hash> \
     --repo https://github.com/you/project --ref <commit> \
-    --agents swarm --memory-mode on --mode standard \
+    --agents swarm --memory-mode learn --mode standard \
     --prompt "Use three read-only workers to inspect the components, then implement and verify the fix."
 
 # Live qualification: real sandbox, real model endpoint and credentials.

@@ -453,6 +453,17 @@ fn verified_run(
     mode: &str,
     permissions: &str,
 ) -> (Output, serde_json::Value, Vec<serde_json::Value>) {
+    verified_run_with_memory(s, command, replies, mode, permissions, "off")
+}
+
+fn verified_run_with_memory(
+    s: &Sandbox,
+    command: &str,
+    replies: Vec<serde_json::Value>,
+    mode: &str,
+    permissions: &str,
+    memory: &str,
+) -> (Output, serde_json::Value, Vec<serde_json::Value>) {
     let (url, server) = scripted_endpoint(replies);
     let out = s
         .cmd()
@@ -467,7 +478,7 @@ fn verified_run(
             "--agents",
             "off",
             "--memory",
-            "off",
+            memory,
             "--permissions",
             permissions,
             "--goal",
@@ -524,6 +535,61 @@ fn fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
     assert_eq!(trace["verification"][0]["exit_code"], 0);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"done\""));
     assert!(requests[0]["messages"].to_string().contains("Fixed acceptance command"));
+}
+
+/// The memory daemon beside the rusty under test, run in the sandbox project.
+fn memoryd(s: &Sandbox, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
+        .current_dir(&s.project)
+        .env("RUSTY_HOME", &s.home)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn memory_learns_only_from_a_goals_fixed_check() {
+    for (case, check) in [("pass", FIXED_CHECK), ("fail", "false")] {
+        let s = Sandbox::new(&format!("memory-credit-{case}"));
+        seed_calc(&s);
+        std::fs::write(s.project.join("notes.md"), "calc notes\n").unwrap();
+        let saved = memoryd(&s, &["remember", "--kind", "gotcha", "calc.py add must return a + b"]);
+        let id = saved.rsplit(' ').next().unwrap().to_string();
+        let reflection = serde_json::json!({"used": [id], "lessons": [
+            {"kind": "gotcha", "text": "calc.py add sign errors break the fixed calc check", "files": ["calc.py"]}
+        ]})
+        .to_string();
+        let mut replies = vec![fix_calc(), done_reply()];
+        if case == "fail" {
+            // The failed check reopens the goal for one more reply in this turn.
+            replies.push(text_reply("I could not make the check pass."));
+        }
+        replies.push(text_reply(&reflection));
+        let (out, trace, requests) = verified_run_with_memory(&s, check, replies, "standard", "yolo", "reflect");
+        let list = memoryd(&s, &["list"]);
+        memoryd(&s, &["stop"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("\"memory_mode\":\"reflect\""), "{stderr}");
+        let first = requests[0]["messages"].to_string();
+        assert!(first.contains("calc.py add must return a + b"), "the lesson was not offered: {first}");
+        let reflect = requests.last().unwrap()["messages"].to_string();
+        assert!(reflect.contains(&id), "{reflect}");
+        if case == "pass" {
+            assert_eq!(trace["verification"][0]["outcome"], "Passed");
+            assert!(reflect.contains("acceptance check passed"), "{reflect}");
+            assert!(
+                list.contains("calc.py add must return a + b (confidence") && list.contains("+1 -0, user)"),
+                "{list}"
+            );
+            assert!(list.contains("calc.py add sign errors") && list.contains("reflect, 1 files"), "{list}");
+        } else {
+            assert!(reflect.contains("acceptance check failed"), "{reflect}");
+            assert!(list.contains("+0 -1, user)"), "{list}");
+            assert!(!list.contains("sign errors"), "a failed goal wrote a lesson: {list}");
+        }
+    }
 }
 
 #[test]
@@ -2507,11 +2573,12 @@ fn root_budget_overrun_rejects_completion_and_stops_new_dispatch() {
 }
 
 #[test]
-fn root_budget_refuses_unaccounted_deep_memory() {
-    let s = Sandbox::new("budget-deep");
-    let out = s.cmd().args(["--max-requests", "20", "--memory", "deep", "inspect"]).output().unwrap();
+fn unknown_memory_level_names_the_levels() {
+    let s = Sandbox::new("memory-level");
+    let out = s.cmd().args(["--memory", "v2", "inspect"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot share this model budget"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown memory level `v2`") && err.contains("recall, learn, reflect, deep"), "{err}");
 }
 
 #[test]

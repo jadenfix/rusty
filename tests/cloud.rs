@@ -274,7 +274,7 @@ fn advisor_cloud_import_export_and_private_db_exclusion() {
 
 #[test]
 fn missing_trajectory_preserves_the_sandbox() {
-    for memory in [None, Some("on")] {
+    for memory in [None, Some("learn")] {
         let mut f = Fixture::new("no-trajectory");
         f.state.memory_mode = memory.map(Into::into);
         f.start(&["x"]);
@@ -289,7 +289,7 @@ fn missing_trajectory_preserves_the_sandbox() {
 
 #[test]
 fn unknown_exit_preserves_the_sandbox() {
-    for memory in [None, Some("on")] {
+    for memory in [None, Some("learn")] {
         let mut f = Fixture::new("unknown-exit");
         f.state.memory_mode = memory.map(Into::into);
         f.remote.env.lock().unwrap().insert("FAKE_RUSTY_SLEEP".into(), "1".into());
@@ -304,7 +304,7 @@ fn unknown_exit_preserves_the_sandbox() {
 #[test]
 fn missing_memory_export_preserves_cloud_sandbox() {
     let mut f = Fixture::new("no-memory-export");
-    f.state.memory_mode = Some("on".into());
+    f.state.memory_mode = Some("learn".into());
     f.start(&["x"]);
     f.follow();
     std::fs::remove_file(f.remote.bin.join("rusty-memoryd")).unwrap();
@@ -880,7 +880,7 @@ fn hosted_swarm_journey_offline() {
         .env("RUSTY_BASE_URL", format!("{}/v1", provider.url))
         .env("RUSTY_NO_DOTENV", "1")
         .args(["run", "--snapshot", "rusty-0123456789ab", "--mode", "standard", "--agents", "swarm"])
-        .args(["--memory-mode", "on", "--prompt", SWARM_PROMPT, "--repo"])
+        .args(["--memory-mode", "learn", "--prompt", SWARM_PROMPT, "--repo"])
         .arg(&repo)
         .output()
         .unwrap();
@@ -923,7 +923,7 @@ fn live_swarm_journey() {
     let out = Command::new(CLOUD)
         .current_dir(&dir)
         .args(["run", "--snapshot", &snapshot, "--ref", &git_ref, "--repo", "https://github.com/jadenfix/rusty.git"])
-        .args(["--mode", "standard", "--agents", "swarm", "--memory-mode", "on", "--prompt", prompt])
+        .args(["--mode", "standard", "--agents", "swarm", "--memory-mode", "learn", "--prompt", prompt])
         .status()
         .unwrap();
     let checks = verify(&the_only_run(&dir));

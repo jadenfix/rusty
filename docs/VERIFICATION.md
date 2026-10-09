@@ -256,12 +256,10 @@ or a multi-session eval) starts a new budget. It does not provide a durable
 spending envelope across restarts; use a separate experiment admission bound.
 Durable journal/reconciliation is the next increment.
 
-Deep memory's model runs in another daemon and cannot share this ledger yet.
-A bounded run refuses `--memory deep` rather than allowing unaccounted model
-work; `on`, `off` and legacy memory remain available. Unbounded legacy execution
-retains deep mode, but its daemon usage is outside this ledger. Other already
-running processes are outside this root's scope. Deep mode needs a budget-
-delegation protocol before it can be used with the enforced root budget.
+Memory's only model request, reflection after a checked goal (`--memory
+reflect` and `deep`), goes through the agent's client and this ledger with the
+role `memory`; the memory daemon makes no model calls. Other already running
+processes are outside this root's scope.
 
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
 over functional passing. A nonzero process exit cannot be `pass` either. The

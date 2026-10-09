@@ -1,0 +1,7 @@
+## goal
+## verify python3 -c "from app import price; assert price('gadget') == 7"
+Set the gadget price to 7. Then save a memory, for future sessions, of exactly which file defines the prices (name the file).
+## run bash "$EVAL_DIR/move_prices.sh"
+## goal
+## verify python3 -c "from app import price; assert price('widget') == 12"
+Raise the widget price to 12, wherever prices are defined now.

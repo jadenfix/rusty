@@ -1,21 +1,22 @@
-//! Optional local advisor. Hooks have a deadline; learning never executes tools.
-//! L1 is per session, L2 is scoped, and only explicit feedback trains the selector.
+//! The memory advisor behind `rusty-memoryd`. The agent's hooks have a
+//! deadline; the daemon never runs tools or calls a model.
+//!
+//! A lesson is offered when relevance × confidence × freshness clears the
+//! level's threshold. Confidence moves only on a goal's verified check or a
+//! person's `/memory helpful|harmful`, never on being shown. Preferences are
+//! not ranked: they apply everywhere, so `begin` returns them for the prompt.
 use anyhow::{bail, Context, Result};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FRAME: usize = 32_768;
@@ -23,23 +24,123 @@ const TRANSFER: usize = 4 * 1024 * 1024;
 const LESSONS: usize = 512;
 const SESSIONS: usize = 32;
 const HOOK_MS: u64 = 50;
+/// Recent tool observations kept per session for recall.
+const OBSERVATIONS: usize = 4;
+/// Lessons a client remembers offering, for crediting a goal.
+const DELIVERED: usize = 16;
+const KINDS: [&str; 5] = ["preference", "fact", "decision", "gotcha", "todo"];
+const SOURCES: [&str; 4] = ["user", "agent", "compaction", "reflect"];
+/// The scope for preferences that apply to every project.
+const GLOBAL: &str = "global";
+/// BM25 becomes a 0-1 relevance as s / (s + 2): one shared everyday term
+/// gives 0.33, three give 0.6, one rare term more.
+const RELEVANCE_HALF: f64 = 2.0;
+/// Two lessons of one kind whose terms overlap this much are one lesson.
+const DUPLICATE: f64 = 0.8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How much memory does. Each level includes the ones before it; higher
+/// levels capture more, offer lessons more readily and prune harder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Mode {
+pub enum Level {
+    /// No memory at all.
     Off,
+    /// The older JSONL store, without the advisor.
+    #[default]
     Legacy,
-    On,
+    /// Offers saved lessons that match the request.
+    Recall,
+    /// Also reads recent tool output, checks lessons against their files and
+    /// learns from a goal's fixed check.
+    Learn,
+    /// Also asks the model, after a checked goal, which lessons it used, and
+    /// keeps short new lessons from passes and from compaction.
+    Reflect,
+    /// The most aggressive: more lessons offered, more kept, faster pruning.
     Deep,
 }
-impl Mode {
+
+impl Level {
+    pub const NAMES: &'static str = "off, legacy, recall, learn, reflect, deep";
+
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "off" => Some(Self::Off),
-            "legacy" => Some(Self::Legacy),
-            "on" => Some(Self::On),
-            "deep" => Some(Self::Deep),
-            _ => None,
+        Some(match s.trim() {
+            "off" => Self::Off,
+            "legacy" => Self::Legacy,
+            "recall" => Self::Recall,
+            "learn" => Self::Learn,
+            "reflect" => Self::Reflect,
+            "deep" => Self::Deep,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Legacy => "legacy",
+            Self::Recall => "recall",
+            Self::Learn => "learn",
+            Self::Reflect => "reflect",
+            Self::Deep => "deep",
+        }
+    }
+    /// Runs the advisor at all.
+    pub fn advises(self) -> bool {
+        self >= Self::Recall
+    }
+    /// Recent tool output joins the request when choosing a lesson.
+    pub fn observes(self) -> bool {
+        self >= Self::Learn
+    }
+    /// Lessons record the files they describe and are re-checked before use.
+    pub fn anchors(self) -> bool {
+        self >= Self::Learn
+    }
+    /// A goal's fixed check credits or charges the lessons it was offered.
+    pub fn credits(self) -> bool {
+        self >= Self::Learn
+    }
+    /// One budgeted model request after a checked goal; compaction lessons kept.
+    pub fn reflects(self) -> bool {
+        self >= Self::Reflect
+    }
+    /// New lessons reflection may keep from one passing goal.
+    pub fn new_lessons(self) -> usize {
+        match self {
+            Self::Deep => 3,
+            Self::Reflect => 2,
+            _ => 0,
+        }
+    }
+    /// The lowest relevance × confidence × freshness worth offering.
+    fn threshold(self) -> f64 {
+        match self {
+            Self::Recall => 0.25,
+            Self::Deep => 0.10,
+            _ => 0.15,
+        }
+    }
+    fn per_turn(self) -> usize {
+        match self {
+            Self::Recall => 1,
+            Self::Deep => 3,
+            _ => 2,
+        }
+    }
+    /// A lesson with two or more outcomes goes when its posterior mean falls below this.
+    fn retire_below(self) -> f64 {
+        match self {
+            Self::Reflect => 0.35,
+            Self::Deep => 0.4,
+            _ => 0.3,
+        }
+    }
+    /// Days a lesson nobody vouched for may go without a success.
+    fn expiry_days(self) -> u64 {
+        match self {
+            Self::Reflect => 21,
+            Self::Deep => 14,
+            _ => 28,
         }
     }
 }
@@ -56,6 +157,23 @@ fn now() -> u64 {
 }
 fn hash(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+fn lesson_id(scope: &str, kind: &str, text: &str) -> String {
+    format!("{:016x}", hash(&format!("{scope}:{kind}:{text}")))
+}
+
+/// The worktree's top level (where anchored paths start), or `cwd` outside git.
+fn worktree(cwd: &Path) -> PathBuf {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|p| PathBuf::from(p.trim()))
+        .unwrap_or_else(|| cwd.to_owned())
 }
 
 /// Same repository across worktrees; explicit identity also works across cloud clones.
@@ -83,7 +201,7 @@ pub struct Request {
     pub scope: String,
     pub session: String,
     pub seq: u64,
-    pub mode: Mode,
+    pub level: Level,
     #[serde(default)]
     pub data: Value,
 }
@@ -104,8 +222,7 @@ pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
     // Hooks still return after HOOK_MS. Explicit management may flush SQLite
     // or transfer a snapshot, so its transport must honor the control budget.
-    let transport_ms =
-        if matches!(req.op.as_str(), "begin" | "event" | "finish" | "advice" | "prepared") { 200 } else { 1000 };
+    let transport_ms = if matches!(req.op.as_str(), "begin" | "event" | "finish" | "advice") { 200 } else { 1000 };
     stream.set_read_timeout(Some(Duration::from_millis(transport_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(transport_ms)))?;
     let mut body = serde_json::to_vec(req)?;
@@ -128,16 +245,24 @@ pub struct Metrics {
     pub max_hook_us: u64,
 }
 type Work = (Request, mpsc::Sender<Result<Response>>);
+/// The agent's side of the advisor.
 pub struct Hooks {
     tx: mpsc::SyncSender<Work>,
-    pub mode: Mode,
+    pub level: Level,
     scope: String,
     session: String,
     seq: u64,
+    /// Where the agent runs, and the worktree root anchors are relative to.
+    cwd: PathBuf,
+    root: PathBuf,
+    /// Lessons offered since `take_delivered`, as (id, lesson text).
+    delivered: Vec<(String, String)>,
+    /// The preferences block from the last `begin` that answered in time.
+    preferences: String,
     pub metrics: Metrics,
 }
 impl Hooks {
-    pub fn connect(home: &Path, cwd: &Path, mode: Mode) -> Result<Self> {
+    pub fn connect(home: &Path, cwd: &Path, level: Level) -> Result<Self> {
         let socket = home.join("memory/advisor.sock");
         if socket.as_os_str().len() > 100 {
             bail!("RUSTY_HOME is too long for a local memory socket");
@@ -154,10 +279,7 @@ impl Hooks {
                 .spawn()
                 .context("install rusty-memoryd alongside rusty")?;
             let start = Instant::now();
-            loop {
-                if UnixStream::connect(&socket).is_ok() {
-                    break;
-                }
+            while UnixStream::connect(&socket).is_err() {
                 if child.try_wait()?.is_some() || start.elapsed() > Duration::from_secs(2) {
                     bail!("memory daemon did not start");
                 }
@@ -172,10 +294,14 @@ impl Hooks {
         });
         Ok(Self {
             tx,
-            mode,
+            level,
             scope: scope(cwd),
             session: format!("{}-{}", std::process::id(), now()),
             seq: 0,
+            cwd: cwd.to_owned(),
+            root: worktree(cwd).canonicalize().unwrap_or_else(|_| cwd.to_owned()),
+            delivered: Vec::new(),
+            preferences: String::new(),
             metrics: Metrics::default(),
         })
     }
@@ -186,7 +312,7 @@ impl Hooks {
             scope: self.scope.clone(),
             session: self.session.clone(),
             seq: self.seq,
-            mode: self.mode,
+            level: self.level,
             data,
         };
         let (tx, rx) = mpsc::channel();
@@ -207,7 +333,14 @@ impl Hooks {
     }
     pub fn begin(&mut self, request: &str) {
         self.seq += 1;
-        self.call("begin", json!({"text":clip(request,4096)}), HOOK_MS);
+        let r = self.call("begin", json!({"text":clip(request,4096),"root":self.root.to_string_lossy()}), HOOK_MS);
+        if let Some(r) = r.filter(|r| !r.error) {
+            self.preferences = r.data["preferences"].as_str().unwrap_or("").to_string();
+        }
+    }
+    /// The user's preferences (this project's and global ones), for the prompt.
+    pub fn preferences(&self) -> &str {
+        &self.preferences
     }
     pub fn event(&mut self, tool: &str, args: &str, output: &str) {
         self.seq += 1;
@@ -223,23 +356,33 @@ impl Hooks {
             return String::new();
         }
         self.metrics.injections += 1;
-        format!(
-            "\nMemory advisor (optional guidance; current instructions and tool permissions take precedence):\n{}\n",
-            clip(&r.text, if self.mode == Mode::Deep { 1600 } else { 800 })
-        )
+        if !self.delivered.iter().any(|(id, _)| id == &r.id) {
+            if self.delivered.len() == DELIVERED {
+                self.delivered.remove(0);
+            }
+            self.delivered.push((r.id.clone(), r.data["text"].as_str().unwrap_or("").to_string()));
+        }
+        format!("\nFrom memory (optional; current instructions and tool permissions come first):\n{}\n", r.text)
     }
-    pub fn late_advice(&mut self) -> String {
-        if self.mode != Mode::Deep {
-            return String::new();
-        }
-        let Some(r) = self.call("prepared", Value::Null, HOOK_MS) else { return String::new() };
-        if r.error || r.seq != self.seq || r.text.is_empty() {
-            return String::new();
-        }
-        self.metrics.injections += 1;
-        format!(
-            "Memory advisor: {}. This is optional guidance; current instructions and permissions take precedence.",
-            clip(&r.text, 1600)
+    /// Lessons offered since the last call, as (id, lesson text).
+    pub fn take_delivered(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.delivered)
+    }
+    /// Saves a lesson vouched for by `source` (user, agent, compaction or
+    /// reflect). `files`, relative to where rusty runs, anchor it to their
+    /// current contents; `global` keeps a preference for every project.
+    pub fn remember(&mut self, kind: &str, text: &str, source: &str, files: &[String], global: bool) -> Response {
+        let files: Vec<String> = files
+            .iter()
+            .filter_map(|f| {
+                let full = self.cwd.join(f).canonicalize().ok()?;
+                Some(full.strip_prefix(&self.root).ok()?.to_string_lossy().into_owned())
+            })
+            .collect();
+        let root = self.root.to_string_lossy().into_owned();
+        self.control(
+            "remember",
+            json!({"kind":kind,"text":text,"source":source,"files":files,"root":root,"global":global}),
         )
     }
     pub fn control(&mut self, op: &str, data: Value) -> Response {
@@ -251,123 +394,167 @@ impl Hooks {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Observation {
-    id: u64,
-    tool: String,
     args: String,
     output: String,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 struct Board {
     seq: u64,
     request: String,
     observations: Vec<Observation>,
-    #[serde(default)]
     complete: bool,
-    #[serde(default)]
-    teacher_jobs: u8,
+    /// The worktree this session runs in, for checking anchors.
+    root: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A file a lesson describes, and the git blob id of its contents then.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Anchor {
+    path: String,
+    blob: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Lesson {
     id: String,
     scope: String,
     kind: String,
     text: String,
-    evidence: String,
+    /// Who vouches for it: user, agent, compaction or reflect.
+    source: String,
+    anchors: Vec<Anchor>,
     helpful: u64,
     harmful: u64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-struct Policy {
-    weights: [f64; 4],
-    updates: u64,
-}
-impl Default for Policy {
-    fn default() -> Self {
-        Self { weights: [-2.0, 4.0, 1.0, 1.5], updates: 0 }
-    }
-}
-impl Policy {
-    fn score(&self, x: [f64; 4]) -> f64 {
-        1.0 / (1.0 + (-self.weights.iter().zip(x).map(|(w, x)| w * x).sum::<f64>()).exp())
-    }
-    fn update(&mut self, x: [f64; 4], helpful: bool) {
-        let err = if helpful { 1.0 } else { 0.0 } - self.score(x);
-        for (w, x) in self.weights.iter_mut().zip(x) {
-            *w = (*w + 0.1 * err * x).clamp(-8.0, 8.0);
-        }
-        self.updates += 1;
-    }
-}
-fn words(s: &str) -> HashSet<String> {
-    s.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| s.len() > 2)
-        .filter(|s| !["the", "and", "for", "this", "that", "please", "with", "from"].contains(s))
-        .map(str::to_owned)
-        .collect()
-}
-fn features(query: &str, lesson: &Lesson) -> [f64; 4] {
-    let q = words(query);
-    let t = words(&lesson.text);
-    features_terms(&q, lesson, &t)
-}
-fn features_terms(q: &HashSet<String>, lesson: &Lesson, t: &HashSet<String>) -> [f64; 4] {
-    let overlap = q.intersection(t).count() as f64 / q.len().min(t.len()).max(1) as f64;
-    [
-        1.0,
-        overlap,
-        (lesson.helpful as f64 + 1.0) / (lesson.helpful + lesson.harmful + 2) as f64,
-        if lesson.kind == "preference" { 1.0 } else { 0.0 },
-    ]
-}
-fn pack(s: &str) -> Result<Vec<u8>> {
-    // Tiny notes would grow under gzip. A zero tag denotes bounded raw UTF-8;
-    // existing gzip blobs keep their original header and remain readable.
-    let raw = || {
-        let mut b = Vec::with_capacity(s.len() + 1);
-        b.push(0);
-        b.extend_from_slice(s.as_bytes());
-        b
-    };
-    if s.len() < 32 {
-        return Ok(raw());
-    }
-    let mut w = GzEncoder::new(Vec::new(), Compression::fast());
-    w.write_all(s.as_bytes())?;
-    let packed = w.finish()?;
-    Ok(if packed.len() < s.len() + 1 { packed } else { raw() })
-}
-fn unpack(b: &[u8]) -> Result<String> {
-    if b.first() == Some(&0) {
-        if b.len() > FRAME + 1 {
-            bail!("raw memory exceeds limit");
-        }
-        return Ok(std::str::from_utf8(&b[1..])?.to_owned());
-    }
-    let mut s = String::new();
-    GzDecoder::new(b).take(FRAME as u64 + 1).read_to_string(&mut s)?;
-    if s.len() > FRAME {
-        bail!("decompressed memory exceeds limit");
-    }
-    Ok(s)
+    /// When it was saved or last helped; lessons nobody vouched for expire.
+    credited_at: u64,
 }
 
-// SQLite's dynamic type permits a backwards-compatible upgrade from plain
-// TEXT to gzip BLOBs without a second table or an in-memory storage engine.
-fn stored_text(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<String> {
-    match row.get::<_, rusqlite::types::Value>(column)? {
-        rusqlite::types::Value::Text(s) => Ok(s),
-        rusqlite::types::Value::Blob(b) => unpack(&b)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Blob, e.into())),
-        _ => Err(rusqlite::Error::InvalidQuery),
+impl Lesson {
+    /// Beta prior pseudo-counts: the user vouching counts as three successes.
+    fn prior(&self) -> (f64, f64) {
+        if self.source == "user" {
+            (3.0, 1.0)
+        } else {
+            (1.0, 1.0)
+        }
     }
+    /// The Beta posterior's mean less half its standard deviation: a cautious
+    /// estimate that ranks nine successes in ten above one in one, and moves
+    /// only with outcomes.
+    fn confidence(&self) -> f64 {
+        let (a0, b0) = self.prior();
+        let (a, b) = (a0 + self.helpful as f64, b0 + self.harmful as f64);
+        let sd = (a * b / ((a + b) * (a + b) * (a + b + 1.0))).sqrt();
+        (a / (a + b) - 0.5 * sd).max(0.0)
+    }
+}
+
+/// Lessons a level retires: outcomes say they mostly hurt (the posterior
+/// mean, with the same prior as `Lesson::prior`), or nobody vouched for them
+/// and they earned nothing in the level's expiry. ?2 is the mean, ?3 the cutoff.
+const RETIRED: &str = "(helpful + harmful >= 2
+      AND (CASE source WHEN 'user' THEN 3.0 ELSE 1.0 END + helpful)
+          / (CASE source WHEN 'user' THEN 4.0 ELSE 2.0 END + helpful + harmful) < ?2)
+   OR (source != 'user' AND helpful = 0 AND credited_at < ?3)";
+
+/// A relative path that stays inside the worktree: no `..`, no root.
+fn safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 256
+        && Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Git blob ids of anchored files, cached by path, size and mtime so a hook
+/// only `stat`s a file whose contents it has already hashed.
+#[derive(Default)]
+struct Blobs(HashMap<PathBuf, (u64, SystemTime, String)>);
+impl Blobs {
+    /// Git's blob id (SHA-1 of `blob <len>\0` and the bytes) of a regular
+    /// file under `root`, refusing symlinks and files over 1 MiB.
+    fn get(&mut self, root: &Path, path: &str) -> Option<String> {
+        if !safe_path(path) {
+            return None;
+        }
+        let full = root.join(path);
+        if !full.canonicalize().ok()?.starts_with(root.canonicalize().ok()?) {
+            return None;
+        }
+        let mut f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&full).ok()?;
+        let meta = f.metadata().ok()?;
+        let mtime = meta.modified().ok()?;
+        if !meta.is_file() || meta.len() > 1 << 20 {
+            return None;
+        }
+        if let Some((len, at, blob)) = self.0.get(&full) {
+            if *len == meta.len() && *at == mtime {
+                return Some(blob.clone());
+            }
+        }
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        f.read_to_end(&mut bytes).ok()?;
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+        ctx.update(format!("blob {}\0", bytes.len()).as_bytes());
+        ctx.update(&bytes);
+        let blob: String = ctx.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        if self.0.len() >= 4 * LESSONS {
+            self.0.clear();
+        }
+        self.0.insert(full, (meta.len(), mtime, blob.clone()));
+        Some(blob)
+    }
+
+    /// 1 when every anchor matches (or there are none), 0.5 when a file
+    /// changed, 0 when one is gone; with the changed paths.
+    fn freshness(&mut self, root: &str, anchors: &[Anchor]) -> (f64, Vec<String>) {
+        if anchors.is_empty() || root.is_empty() {
+            return (1.0, Vec::new());
+        }
+        let mut changed = Vec::new();
+        for a in anchors {
+            match self.get(Path::new(root), &a.path) {
+                None => return (0.0, vec![a.path.clone()]),
+                Some(b) if b != a.blob => changed.push(a.path.clone()),
+                Some(_) => {}
+            }
+        }
+        (if changed.is_empty() { 1.0 } else { 0.5 }, changed)
+    }
+}
+
+/// What a session is about: the request, plus (when the level observes) the
+/// last few tool calls' arguments and error lines. Only error lines (or a
+/// first line) are kept, since whole outputs would drown the request.
+fn query(board: &Board, observe: bool) -> HashSet<String> {
+    let mut text = board.request.clone();
+    if observe {
+        for o in &board.observations {
+            let errors: Vec<&str> = o
+                .output
+                .lines()
+                .filter(|l| {
+                    let l = l.to_lowercase();
+                    l.contains("error") || l.contains("fail") || l.contains("not found")
+                })
+                .take(3)
+                .collect();
+            let lines = if errors.is_empty() { o.output.lines().take(1).collect() } else { errors };
+            text.push_str(&format!(" {} {}", o.args, lines.join(" ")));
+        }
+    }
+    crate::recall::query(&text)
+}
+
+/// Jaccard similarity of two lessons' term sets.
+fn overlap(a: &str, b: &str) -> f64 {
+    let (a, b) = (crate::recall::query(a), crate::recall::query(b));
+    a.intersection(&b).count() as f64 / a.union(&b).count().max(1) as f64
 }
 
 struct Store {
     db: Connection,
 }
+const COLUMNS: &str = "id,scope,kind,text,source,anchors,helpful,harmful,credited_at";
+const SCHEMA: i64 = 3;
 impl Store {
     fn open(home: &Path) -> Result<Self> {
         let dir = home.join("memory");
@@ -389,252 +576,289 @@ impl Store {
                 .open(dir.join("memory.sqlite"))?,
         );
         let db = Connection::open(dir.join("memory.sqlite"))?;
-        db.execute_batch("PRAGMA secure_delete=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-512; PRAGMA mmap_size=0;
-          PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA journal_size_limit=65536; PRAGMA wal_autocheckpoint=16; PRAGMA max_page_count=4096;
-          CREATE TABLE IF NOT EXISTS lessons(id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL,evidence BLOB NOT NULL,helpful INTEGER DEFAULT 0,harmful INTEGER DEFAULT 0);
-          CREATE TABLE IF NOT EXISTS policies(scope TEXT PRIMARY KEY,payload TEXT);
-          CREATE TABLE IF NOT EXISTS deleted(id TEXT PRIMARY KEY,scope TEXT NOT NULL);")?;
-        // Migrate the first version's duplicated L1 journals. L1 now stays in
-        // RAM, so tool arguments/output never enter the advisor database.
-        let old: bool =
-            db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('events','boards'))", [], |r| {
-                r.get(0)
-            })?;
-        if old {
-            db.execute_batch(
-                "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS boards; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
-            )?;
+        db.execute_batch(
+            "PRAGMA secure_delete=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-512; PRAGMA mmap_size=0;
+             PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA journal_size_limit=65536;
+             PRAGMA wal_autocheckpoint=16; PRAGMA max_page_count=4096;",
+        )?;
+        // Stores from before this schema are dropped, not migrated.
+        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != SCHEMA {
+            db.execute_batch(&format!(
+                "BEGIN;
+                 DROP TABLE IF EXISTS lessons; DROP TABLE IF EXISTS deleted; DROP TABLE IF EXISTS policies;
+                 DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS boards;
+                 CREATE TABLE lessons(id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL,
+                   text TEXT NOT NULL, source TEXT NOT NULL, anchors TEXT NOT NULL,
+                   helpful INTEGER NOT NULL DEFAULT 0, harmful INTEGER NOT NULL DEFAULT 0,
+                   credited_at INTEGER NOT NULL);
+                 CREATE INDEX lessons_scope ON lessons(scope);
+                 CREATE TABLE deleted(id TEXT PRIMARY KEY, scope TEXT NOT NULL);
+                 PRAGMA user_version={SCHEMA};
+                 COMMIT;"
+            ))?;
         }
-        let mut store = Self { db };
-        // Upgrade lessons saved through older direct CLI paths, tombstoning
-        // unsafe old identities when redaction changes canonical text.
-        let rows = {
-            let mut q =
-                store.db.prepare("SELECT id,scope,kind,text,evidence,helpful,harmful FROM lessons LIMIT 513")?;
-            let rows = q.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    stored_text(r, 3)?,
-                    r.get::<_, Vec<u8>>(4)?,
-                    r.get::<_, u64>(5)?,
-                    r.get::<_, u64>(6)?,
-                    r.get_ref(3)?.data_type() == rusqlite::types::Type::Text,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        if rows.len() > LESSONS {
-            bail!("existing store exceeds lesson limit");
-        }
-        let mut changed = false;
-        for (id, scope, kind, text, evidence, helpful, harmful, plain) in rows {
-            let evidence = unpack(&evidence)?;
-            let clean_text = crate::privacy::redact(&text).0;
-            let clean_evidence = crate::privacy::redact(&evidence).0;
-            if !plain && text == clean_text && evidence == clean_evidence {
-                continue;
-            }
-            let new_id = format!("{:016x}", hash(&format!("{scope}:{kind}:{clean_text}")));
-            let tx = store.db.transaction()?;
-            tx.execute("DELETE FROM lessons WHERE id=?1", [&id])?;
-            if new_id != id {
-                tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, scope])?;
-            }
-            tx.execute(
-                "INSERT OR IGNORE INTO lessons VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![new_id, scope, kind, pack(&clean_text)?, pack(&clean_evidence)?, helpful, harmful],
-            )?;
-            tx.commit()?;
-            changed = true;
-        }
-        if changed {
-            store.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-        }
-        Ok(store)
+        Ok(Self { db })
     }
     fn lessons(&self, scope: &str) -> Result<Vec<Lesson>> {
-        let mut q =
-            self.db.prepare("SELECT id,scope,kind,text,evidence,helpful,harmful FROM lessons WHERE scope=?1")?;
+        let mut q = self.db.prepare_cached(&format!("SELECT {COLUMNS} FROM lessons WHERE scope=?1"))?;
         let rows = q.query_map([scope], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                stored_text(r, 3)?,
-                r.get::<_, Vec<u8>>(4)?,
-                r.get::<_, u64>(5)?,
-                r.get::<_, u64>(6)?,
-            ))
+            Ok(Lesson {
+                id: r.get(0)?,
+                scope: r.get(1)?,
+                kind: r.get(2)?,
+                text: r.get(3)?,
+                source: r.get(4)?,
+                anchors: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                helpful: r.get(6)?,
+                harmful: r.get(7)?,
+                credited_at: r.get(8)?,
+            })
         })?;
-        rows.map(|r| {
-            let (id, scope, kind, text, e, helpful, harmful) = r?;
-            Ok(Lesson { id, scope, kind, text, evidence: unpack(&e)?, helpful, harmful })
-        })
-        .collect()
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    fn save_lesson(&mut self, l: &Lesson) -> Result<()> {
-        let tx = self.db.transaction()?;
-        if tx.query_row("SELECT EXISTS(SELECT 1 FROM deleted WHERE id=?1)", [&l.id], |r| r.get::<_, bool>(0))? {
-            bail!("this lesson was forgotten; save revised text instead");
-        }
-        let n: i64 = tx.query_row("SELECT count(*) FROM lessons", [], |r| r.get(0))?;
-        if n >= LESSONS as i64
-            && !tx.query_row("SELECT EXISTS(SELECT 1 FROM lessons WHERE id=?1)", [&l.id], |r| r.get::<_, bool>(0))?
-        {
-            bail!("memory capacity reached; forget unused lessons first");
-        }
-        tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,pack(&l.text)?,pack(&l.evidence)?,l.helpful,l.harmful])?;
-        tx.commit()?;
+    fn tombstoned(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM deleted WHERE id=?1)", [id], |r| r.get(0))?)
+    }
+    fn insert(&self, l: &Lesson) -> Result<()> {
+        self.db.execute(
+            &format!("INSERT OR IGNORE INTO lessons({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)"),
+            params![
+                l.id,
+                l.scope,
+                l.kind,
+                l.text,
+                l.source,
+                serde_json::to_string(&l.anchors)?,
+                l.helpful,
+                l.harmful,
+                l.credited_at
+            ],
+        )?;
         Ok(())
     }
-    fn policy(&self, scope: &str) -> Policy {
-        self.db
-            .query_row("SELECT payload FROM policies WHERE scope=?1", [scope], |r| r.get::<_, String>(0))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Deletes and tombstones `scope`'s retired lessons; how many went.
+    fn retire(&mut self, scope: &str, level: Level) -> Result<usize> {
+        let cutoff = now().saturating_sub(level.expiry_days() * 86_400);
+        let below = level.retire_below();
+        let tx = self.db.transaction()?;
+        tx.execute(
+            &format!("INSERT OR IGNORE INTO deleted SELECT id, scope FROM lessons WHERE scope=?1 AND ({RETIRED})"),
+            params![scope, below, cutoff],
+        )?;
+        let n =
+            tx.execute(&format!("DELETE FROM lessons WHERE scope=?1 AND ({RETIRED})"), params![scope, below, cutoff])?;
+        tx.commit()?;
+        Ok(n)
     }
-}
-
-#[derive(Clone)]
-struct Prepared {
-    seq: u64,
-    text: String,
-}
-struct Job {
-    key: String,
-    board: Board,
-}
-#[derive(Default, Serialize)]
-struct TeacherMetrics {
-    requests: u64,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    call_us: u64,
-    hints: u64,
-}
-
-fn teacher(board: &Board, metrics: &Arc<Mutex<TeacherMetrics>>, client: &reqwest::blocking::Client) -> Option<String> {
-    let key = std::env::var("RUSTY_API_KEY").or_else(|_| std::env::var("NVIDIA_API_KEY")).ok()?;
-    let base = std::env::var("RUSTY_BASE_URL").unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".into());
-    let model = std::env::var("RUSTY_MEMORY_MODEL")
-        .or_else(|_| std::env::var("RUSTY_MODEL"))
-        .unwrap_or_else(|_| "nvidia/nemotron-3-super-120b-a12b".into());
-    let prompt="You advise a coding agent using only the supplied request and observed evidence. Choose one specific useful NEXT step or remain silent. Do not invent preferences, repositories, credentials or permissions. Return JSON only: {\"next_step\":\"...\",\"evidence_ids\":[1]}. Each ID must reference an observation that supports the step. If no grounded intervention is needed return {\"next_step\":\"\",\"evidence_ids\":[]}. Do not repeat a successful action or prescribe external mutations.";
-    let mut body = json!({"model":model,"stream":false,"temperature":0.0,"max_tokens":2048,"messages":[{"role":"system","content":prompt},{"role":"user","content":serde_json::to_string(board).ok()?}]});
-    if base.trim_end_matches('/') == "https://integrate.api.nvidia.com/v1"
-        && model == "nvidia/nemotron-3-super-120b-a12b"
-    {
-        body["reasoning_effort"] = json!("low");
-        body["reasoning_budget"] = json!(512);
+    /// Makes room for one lesson: drops the least trusted lesson nobody
+    /// vouched for. Eviction is about space, so it leaves no tombstone.
+    fn make_room(&self) -> Result<()> {
+        let n: i64 = self.db.query_row("SELECT count(*) FROM lessons", [], |r| r.get(0))?;
+        if n < LESSONS as i64 {
+            return Ok(());
+        }
+        let evicted = self.db.execute(
+            "DELETE FROM lessons WHERE id = (SELECT id FROM lessons WHERE source != 'user'
+               ORDER BY (1.0 + helpful) / (2.0 + helpful + harmful), credited_at LIMIT 1)",
+            [],
+        )?;
+        if evicted == 0 {
+            bail!("memory is full of lessons you saved; forget some first");
+        }
+        Ok(())
     }
-    metrics.lock().unwrap().requests += 1;
-    let response = client
-        .post(format!("{}/chat/completions", base.trim_end_matches('/')))
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?;
-    let mut text = String::new();
-    response.take(65_537).read_to_string(&mut text).ok()?;
-    if text.len() > 65_536 {
-        return None;
-    }
-    let v: Value = serde_json::from_str(&text).ok()?;
-    {
-        let mut m = metrics.lock().unwrap();
-        m.prompt_tokens += v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-        m.completion_tokens += v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    }
-    let s = v["choices"][0]["message"]["content"].as_str()?;
-    let v: Value = serde_json::from_str(
-        s.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim(),
-    )
-    .ok()?;
-    let text = v["next_step"].as_str()?;
-    let ids = v["evidence_ids"].as_array()?;
-    if text.is_empty()
-        || ids.is_empty()
-        || ids.iter().any(|id| !board.observations.iter().any(|o| Some(o.id) == id.as_u64()))
-    {
-        return None;
-    }
-    Some(format!(
-        "Suggested next step (background analysis; verify applicability): {} [events: {}]",
-        clip(&crate::privacy::redact(text).0, 1200),
-        ids.iter().filter_map(Value::as_u64).map(|n| n.to_string()).collect::<Vec<_>>().join(",")
-    ))
 }
 
 struct Engine {
     store: Store,
     boards: HashMap<String, Board>,
-    used: HashMap<String, (String, [f64; 4])>,
+    /// The last lesson offered to each session, for `/memory helpful|harmful`.
+    used: HashMap<String, String>,
+    /// Lessons offered to each session this turn.
     delivered: HashMap<String, HashSet<String>>,
-    cache: HashMap<String, Vec<(Lesson, HashSet<String>)>>,
-    prepared: Arc<Mutex<HashMap<String, Prepared>>>,
-    jobs: mpsc::SyncSender<Job>,
-    teacher_metrics: Arc<Mutex<TeacherMetrics>>,
-    versions: Arc<Mutex<HashMap<String, u64>>>,
+    /// Each scope's ranked lessons (not preferences) and their index.
+    cache: HashMap<String, (Vec<Lesson>, crate::recall::Index)>,
+    blobs: Blobs,
 }
 impl Engine {
     fn new(home: &Path) -> Result<Self> {
-        let prepared: Arc<Mutex<HashMap<String, Prepared>>> = Arc::default();
-        let ready = prepared.clone();
-        let versions: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
-        let current = versions.clone();
-        let teacher_metrics: Arc<Mutex<TeacherMetrics>> = Arc::default();
-        let measurements = teacher_metrics.clone();
-        let (tx, rx) = mpsc::sync_channel::<Job>(4);
-        std::thread::spawn(move || {
-            let mut client = None;
-            for j in rx {
-                if current.lock().unwrap().get(&j.key) != Some(&j.board.seq) {
-                    continue;
-                }
-                // The on/off paths never initialize TLS or a provider client.
-                if client.is_none() {
-                    client = reqwest::blocking::Client::builder()
-                        .connect_timeout(Duration::from_secs(5))
-                        .timeout(Duration::from_secs(20))
-                        .build()
-                        .ok();
-                }
-                let start = Instant::now();
-                let answer = client.as_ref().and_then(|client| teacher(&j.board, &measurements, client));
-                {
-                    let mut m = measurements.lock().unwrap();
-                    m.call_us += start.elapsed().as_micros() as u64;
-                    m.hints += u64::from(answer.is_some());
-                }
-                if let Some(text) = answer {
-                    if current.lock().unwrap().get(&j.key) != Some(&j.board.seq) {
-                        continue;
-                    }
-                    let mut ready = ready.lock().unwrap();
-                    if ready.len() >= SESSIONS {
-                        ready.clear();
-                    }
-                    ready.insert(j.key, Prepared { seq: j.board.seq, text });
-                }
-            }
-        });
-        let store = Store::open(home)?;
         Ok(Self {
-            store,
+            store: Store::open(home)?,
             boards: HashMap::new(),
             used: HashMap::new(),
             delivered: HashMap::new(),
             cache: HashMap::new(),
-            prepared,
-            jobs: tx,
-            teacher_metrics,
-            versions,
+            blobs: Blobs::default(),
         })
+    }
+    /// Prunes a scope and caches its lessons with their index. Anchored paths
+    /// are indexed twice: a lesson is most about its files.
+    fn load(&mut self, scope: &str, level: Level) -> Result<()> {
+        if self.cache.contains_key(scope) {
+            return Ok(());
+        }
+        self.store.retire(scope, level)?;
+        if self.cache.len() >= SESSIONS {
+            self.cache.clear();
+        }
+        let lessons: Vec<Lesson> = self.store.lessons(scope)?.into_iter().filter(|l| l.kind != "preference").collect();
+        let docs: Vec<Vec<String>> = lessons
+            .iter()
+            .map(|l| {
+                let paths: String = l.anchors.iter().map(|a| format!(" {0} {0}", a.path)).collect();
+                crate::recall::terms(&format!("{}{paths}", l.text))
+            })
+            .collect();
+        let index = crate::recall::Index::new(&docs);
+        self.cache.insert(scope.to_owned(), (lessons, index));
+        Ok(())
+    }
+    /// The project's and global preferences, as prompt lines.
+    fn preferences(&self, scope: &str) -> Result<String> {
+        let mut q = self.store.db.prepare_cached(
+            "SELECT text FROM lessons WHERE kind='preference' AND scope IN (?1, ?2) ORDER BY credited_at",
+        )?;
+        let texts = q.query_map([scope, GLOBAL], |r| r.get::<_, String>(0))?;
+        let mut out = String::new();
+        for t in texts {
+            let line = format!("- {}\n", t?);
+            if out.len() + line.len() > 1200 {
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+    /// Adds `weight` outcomes to each lesson, then prunes the scope. Only a
+    /// success restarts the expiry clock.
+    fn credit(&mut self, scope: &str, ids: &[String], helpful: bool, weight: u64, level: Level) -> Result<usize> {
+        let (column, clock) = if helpful { ("helpful", ", credited_at=?2") } else { ("harmful", "") };
+        let tx = self.store.db.transaction()?;
+        for id in ids {
+            tx.execute(
+                &format!("UPDATE lessons SET {column}={column}+?1{clock} WHERE id=?3 AND scope=?4"),
+                params![weight, now(), id, scope],
+            )?;
+        }
+        tx.commit()?;
+        self.cache.remove(scope);
+        self.store.retire(scope, level)
+    }
+    fn remember(&mut self, r: &Request) -> Result<Response> {
+        let text = clip(r.data["text"].as_str().unwrap_or("").trim(), 1000);
+        let kind = r.data["kind"].as_str().unwrap_or("fact");
+        let source = r.data["source"].as_str().unwrap_or("user");
+        let global = r.data["global"].as_bool() == Some(true);
+        if text.is_empty() {
+            bail!("empty lesson");
+        }
+        if !KINDS.contains(&kind) {
+            bail!("unknown memory kind");
+        }
+        if !SOURCES.contains(&source) {
+            bail!("unknown memory source");
+        }
+        if global && kind != "preference" {
+            bail!("only preferences can be global");
+        }
+        let scope = if global { GLOBAL } else { r.scope.as_str() };
+        let root = r.data["root"].as_str().unwrap_or("");
+        let anchors: Vec<Anchor> = if r.level.anchors() && !root.is_empty() {
+            let paths = r.data["files"].as_array().into_iter().flatten().filter_map(Value::as_str).take(4);
+            paths.filter_map(|p| Some(Anchor { path: p.into(), blob: self.blobs.get(Path::new(root), p)? })).collect()
+        } else {
+            Vec::new()
+        };
+        let id = lesson_id(scope, kind, &text);
+        if self.store.tombstoned(&id)? {
+            bail!("this lesson was forgotten; save revised text instead");
+        }
+        // A near-duplicate is the same lesson: refresh it instead of adding a
+        // copy that would split its outcomes.
+        let twin = self
+            .store
+            .lessons(scope)?
+            .into_iter()
+            .find(|l| l.kind == kind && (l.id == id || overlap(&l.text, &text) >= DUPLICATE));
+        let reply_id = match twin {
+            Some(l) => {
+                self.store.db.execute(
+                    "UPDATE lessons SET anchors=CASE WHEN ?1='[]' THEN anchors ELSE ?1 END,
+                       source=CASE WHEN ?2='user' THEN 'user' ELSE source END WHERE id=?3",
+                    params![serde_json::to_string(&anchors)?, source, l.id],
+                )?;
+                l.id
+            }
+            None => {
+                self.store.make_room()?;
+                let l = Lesson {
+                    id: id.clone(),
+                    scope: scope.into(),
+                    kind: kind.into(),
+                    text,
+                    source: source.into(),
+                    anchors,
+                    helpful: 0,
+                    harmful: 0,
+                    credited_at: now(),
+                };
+                self.store.insert(&l)?;
+                id
+            }
+        };
+        self.cache.clear();
+        Ok(Response { text: format!("saved memory {reply_id}"), id: reply_id, ..Response::default() })
+    }
+    /// The best lesson for this session right now, if any clears the bar.
+    fn advise(&mut self, r: &Request, key: &str) -> Result<Response> {
+        let mut reply = Response { seq: r.seq, ..Response::default() };
+        let Some(b) = self.boards.get(key) else { return Ok(reply) };
+        if b.seq != r.seq || b.complete || self.delivered.get(key).is_some_and(|d| d.len() >= r.level.per_turn()) {
+            return Ok(reply);
+        }
+        let query = query(b, r.level.observes());
+        let root = b.root.clone();
+        self.load(&r.scope, r.level)?;
+        let (lessons, index) = &self.cache[&r.scope];
+        let done = self.delivered.get(key);
+        let threshold = r.level.threshold();
+        let mut ranked: Vec<(f64, usize)> = index
+            .scores(&query)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, s)| *s > 0.0 && !done.is_some_and(|d| d.contains(&lessons[*i].id)))
+            .map(|(i, s)| (s / (s + RELEVANCE_HALF) * lessons[i].confidence(), i))
+            .filter(|(score, _)| *score >= threshold)
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Files are checked only for the few best, inside the hook deadline.
+        let mut best: Option<(f64, usize, Vec<String>)> = None;
+        for (score, i) in ranked.into_iter().take(3) {
+            let (fresh, changed) =
+                if r.level.anchors() { self.blobs.freshness(&root, &lessons[i].anchors) } else { (1.0, vec![]) };
+            if score * fresh >= threshold && best.as_ref().is_none_or(|(old, _, _)| score * fresh > *old) {
+                best = Some((score * fresh, i, changed));
+            }
+        }
+        let Some((_, i, changed)) = best else { return Ok(reply) };
+        let l = &lessons[i];
+        let standing = match (l.helpful, l.source.as_str()) {
+            (0, "user") => "saved by the user".to_string(),
+            (0, _) => "unverified".to_string(),
+            (n, _) => format!("worked {n}×"),
+        };
+        let stale = if changed.is_empty() {
+            String::new()
+        } else {
+            format!(" Changed since: {}; re-check before relying on it.", changed.join(", "))
+        };
+        reply.text = format!("- {} ({standing}){stale} [memory:{}]", l.text, l.id);
+        reply.id = l.id.clone();
+        reply.data = json!({"text": l.text});
+        self.delivered.entry(key.to_owned()).or_default().insert(l.id.clone());
+        self.used.insert(key.to_owned(), l.id.clone());
+        Ok(reply)
     }
     fn handle(&mut self, mut r: Request) -> Result<Response> {
         if r.op != "import" && serde_json::to_vec(&r)?.len() > FRAME {
@@ -645,7 +869,7 @@ impl Engine {
         }
         let key = format!("{}:{}", r.scope, r.session);
         let mut reply = Response { seq: r.seq, ..Response::default() };
-        if r.mode == Mode::Off {
+        if !r.level.advises() && r.op != "shutdown" {
             reply.text = "memory is off".into();
             return Ok(reply);
         }
@@ -661,8 +885,6 @@ impl Engine {
                         self.boards.remove(&k);
                         self.used.remove(&k);
                         self.delivered.remove(&k);
-                        self.versions.lock().unwrap().remove(&k);
-                        self.prepared.lock().unwrap().remove(&k);
                     }
                 }
                 let board = self.boards.entry(key.clone()).or_default();
@@ -670,197 +892,118 @@ impl Engine {
                     bail!("stale memory event");
                 }
                 board.seq = r.seq;
-                if r.op == "begin" {
-                    board.request = clip(r.data["text"].as_str().unwrap_or(""), 4096);
-                    board.observations.clear();
-                    board.complete = false;
-                    board.teacher_jobs = 0;
-                    self.used.remove(&key);
-                    self.delivered.remove(&key);
-                    self.prepared.lock().unwrap().remove(&key);
-                }
-                if r.op == "event" {
-                    board.observations.push(Observation {
-                        id: r.seq,
-                        tool: clip(r.data["tool"].as_str().unwrap_or(""), 64),
-                        args: clip(r.data["args"].as_str().unwrap_or(""), 1024),
-                        output: clip(r.data["output"].as_str().unwrap_or(""), 2048),
-                    });
-                    if board.observations.len() > 8 {
-                        board.observations.remove(0);
+                match r.op.as_str() {
+                    "begin" => {
+                        board.request = clip(r.data["text"].as_str().unwrap_or(""), 4096);
+                        board.root = clip(r.data["root"].as_str().unwrap_or(""), 4096);
+                        board.observations.clear();
+                        board.complete = false;
+                        self.used.remove(&key);
+                        self.delivered.remove(&key);
+                        reply.data = json!({"preferences": self.preferences(&r.scope)?});
                     }
-                }
-                if r.op == "finish" {
-                    board.complete = r.data["complete"].as_bool().unwrap_or(false);
-                }
-                if r.op == "finish" {
-                    self.versions.lock().unwrap().remove(&key);
-                    self.prepared.lock().unwrap().remove(&key);
-                    // Keep only sequence/completion so stale calls still fail.
-                    board.request.clear();
-                    board.observations.clear();
-                } else {
-                    self.versions.lock().unwrap().insert(key.clone(), r.seq);
-                }
-                if r.mode == Mode::Deep
-                    && r.op == "event"
-                    && !board.complete
-                    && board.teacher_jobs < 4
-                    && (r.seq.is_multiple_of(4)
-                        || r.data["output"].as_str().is_some_and(|s| {
-                            s.starts_with("error:") || (s.starts_with("exit code:") && !s.starts_with("exit code: 0\n"))
-                        }))
-                    && self.jobs.try_send(Job { key, board: board.clone() }).is_ok()
-                {
-                    board.teacher_jobs += 1;
+                    "event" if r.level.observes() => {
+                        board.observations.push(Observation {
+                            args: clip(r.data["args"].as_str().unwrap_or(""), 1024),
+                            output: clip(r.data["output"].as_str().unwrap_or(""), 2048),
+                        });
+                        if board.observations.len() > OBSERVATIONS {
+                            board.observations.remove(0);
+                        }
+                    }
+                    "finish" => {
+                        board.complete = r.data["complete"].as_bool().unwrap_or(false);
+                        // Keep only the sequence and completion so stale calls still fail.
+                        board.request.clear();
+                        board.observations.clear();
+                    }
+                    _ => {}
                 }
             }
-            "advice" | "prepared" => {
-                let Some(b) = self.boards.get(&key) else { return Ok(reply) };
-                if b.seq != r.seq || b.complete {
-                    return Ok(reply);
-                };
-                if self.delivered.get(&key).is_some_and(|d| d.len() >= if r.mode == Mode::Deep { 4 } else { 2 }) {
-                    return Ok(reply);
-                }
-                if let Some(p) = self.prepared.lock().unwrap().remove(&key).filter(|p| p.seq == r.seq) {
-                    reply.text = p.text;
-                    self.delivered.entry(key).or_default().insert(format!("deep:{}", r.seq));
-                    return Ok(reply);
-                }
-                if r.op == "prepared" {
-                    return Ok(reply);
-                }
-                let query = format!(
-                    "{} {}",
-                    b.request,
-                    b.observations.last().map(|o| format!("{} {} {}", o.tool, o.args, o.output)).unwrap_or_default()
-                );
-                let policy = self.store.policy(&r.scope);
-                let query_terms = words(&query);
-                let mut best: Option<(f64, Lesson, [f64; 4])> = None;
-                if !self.cache.contains_key(&r.scope) {
-                    if self.cache.len() >= SESSIONS {
-                        self.cache.clear();
-                    }
-                    let lessons = self
-                        .store
-                        .lessons(&r.scope)?
-                        .into_iter()
-                        .map(|mut l| {
-                            let terms = words(&l.text);
-                            l.evidence = clip(&l.evidence, 160);
-                            (l, terms)
-                        })
-                        .collect();
-                    self.cache.insert(r.scope.clone(), lessons);
-                }
-                for (l, terms) in &self.cache[&r.scope] {
-                    if self.delivered.get(&key).is_some_and(|d| d.contains(&l.id)) {
-                        continue;
-                    }
-                    let f = features_terms(&query_terms, l, terms);
-                    if f[1] < 0.25 && l.kind != "preference" {
-                        continue;
-                    }
-                    let p = policy.score(f);
-                    if p >= 0.6 && best.as_ref().is_none_or(|(old, _, _)| p > *old) {
-                        best = Some((p, l.clone(), f));
-                    }
-                }
-                if let Some((_, l, f)) = best {
-                    reply.text = format!(
-                        "Apply this prior lesson if its prerequisites still hold: {} [memory:{}; {}]",
-                        l.text,
-                        l.id,
-                        clip(&l.evidence, 160)
-                    );
-                    reply.id = l.id.clone();
-                    self.delivered.entry(key.clone()).or_default().insert(l.id.clone());
-                    self.used.insert(key, (l.id, f));
-                }
-            }
-            "remember" => {
-                let text = clip(r.data["text"].as_str().unwrap_or("").trim(), 2048);
-                if text.is_empty() {
-                    bail!("empty lesson");
-                }
-                if r.data["global"].as_bool() == Some(true) {
-                    bail!("advisor memory is project scoped; global memory is available in legacy mode");
-                }
-                let kind = r.data["kind"].as_str().unwrap_or("fact");
-                if !["preference", "fact", "decision", "gotcha", "todo"].contains(&kind) {
-                    bail!("unknown memory kind");
-                }
-                let id = format!("{:016x}", hash(&format!("{}:{kind}:{text}", r.scope)));
-                let evidence =
-                    clip(r.data["evidence"].as_str().unwrap_or("explicitly saved; not independently verified"), 2048);
-                self.store.save_lesson(&Lesson {
-                    id: id.clone(),
-                    scope: r.scope.clone(),
-                    kind: kind.into(),
-                    text,
-                    evidence,
-                    helpful: 0,
-                    harmful: 0,
-                })?;
-                self.cache.remove(&r.scope);
-                reply.text = format!("saved project memory {id}");
-                reply.id = id;
-            }
+            "advice" => return self.advise(&r, &key),
+            "remember" => return self.remember(&r),
             "recall" | "list" => {
-                let query = r.data["query"].as_str().unwrap_or("");
-                let mut ls = self.store.lessons(&r.scope)?;
-                if r.op == "recall" {
-                    ls.retain(|l| features(query, l)[1] > 0.0);
-                    ls.sort_by(|a, b| features(query, b)[1].total_cmp(&features(query, a)[1]));
-                }
-                reply.text = clip(
-                    &ls.iter()
-                        .take(10)
-                        .map(|l| format!("[{}:{}] {}", l.kind, l.id, l.text))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    4096,
-                );
+                let mut lessons = self.store.lessons(&r.scope)?;
+                lessons.extend(self.store.lessons(GLOBAL)?);
+                let mut order: Vec<(f64, &Lesson)> = if r.op == "recall" {
+                    let docs: Vec<Vec<String>> = lessons.iter().map(|l| crate::recall::terms(&l.text)).collect();
+                    let q = crate::recall::query(r.data["query"].as_str().unwrap_or(""));
+                    let scores = crate::recall::Index::new(&docs).scores(&q);
+                    lessons.iter().zip(scores).filter(|(_, s)| *s > 0.0).map(|(l, s)| (s, l)).collect()
+                } else {
+                    lessons.iter().map(|l| (l.confidence(), l)).collect()
+                };
+                order.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let lines: Vec<String> = order
+                    .iter()
+                    .take(if r.op == "recall" { 10 } else { 100 })
+                    .map(|(_, l)| {
+                        let files =
+                            if l.anchors.is_empty() { String::new() } else { format!(", {} files", l.anchors.len()) };
+                        let scope = if l.scope == GLOBAL { ", global" } else { "" };
+                        format!(
+                            "[{}:{}] {} (confidence {:.2}, +{} -{}, {}{files}{scope})",
+                            l.kind,
+                            l.id,
+                            l.text,
+                            l.confidence(),
+                            l.helpful,
+                            l.harmful,
+                            l.source
+                        )
+                    })
+                    .collect();
+                reply.text = clip(&lines.join("\n"), if r.op == "recall" { 4096 } else { 24_576 });
             }
             "forget" => {
                 let id = r.data["id"].as_str().unwrap_or("");
                 let tx = self.store.db.transaction()?;
-                let n = tx.execute("DELETE FROM lessons WHERE id=?1 AND scope=?2", params![id, r.scope])?;
-                if n > 0 {
-                    tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, r.scope])?;
-                    reply.text = format!("forgot {id}");
-                } else {
-                    reply.text = "no memory in this scope".into();
+                let scope: Option<String> = tx
+                    .query_row(
+                        "SELECT scope FROM lessons WHERE id=?1 AND scope IN (?2, ?3)",
+                        params![id, r.scope, GLOBAL],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(scope) = &scope {
+                    tx.execute("DELETE FROM lessons WHERE id=?1", [id])?;
+                    tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, scope])?;
                 }
                 tx.commit()?;
+                reply.text = if scope.is_some() { format!("forgot {id}") } else { "no memory in this scope".into() };
                 self.store.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-                self.prepared.lock().unwrap().clear();
-                self.used.retain(|_, (last, _)| last != id);
-                self.cache.remove(&r.scope);
+                self.used.retain(|_, last| last != id);
+                self.cache.clear();
             }
             "feedback" => {
-                let Some((id, x)) = self.used.remove(&key) else {
-                    bail!("no delivered L2 intervention to rate");
+                // A person's judgement counts as two outcomes.
+                let Some(id) = self.used.remove(&key) else {
+                    bail!("no lesson was offered in this session to rate");
                 };
                 let helpful = r.data["helpful"].as_bool().context("helpful must be boolean")?;
-                self.store.db.execute(
-                    if helpful {
-                        "UPDATE lessons SET helpful=helpful+1 WHERE id=?1 AND scope=?2"
-                    } else {
-                        "UPDATE lessons SET harmful=harmful+1 WHERE id=?1 AND scope=?2"
-                    },
-                    params![id, r.scope],
-                )?;
-                let mut p = self.store.policy(&r.scope);
-                p.update(x, helpful);
-                self.store.db.execute(
-                    "INSERT INTO policies VALUES(?1,?2) ON CONFLICT(scope) DO UPDATE SET payload=excluded.payload",
-                    params![r.scope, serde_json::to_string(&p)?],
-                )?;
-                reply.text = "feedback recorded; outcome attribution is explicit".into();
-                self.cache.remove(&r.scope);
+                let retired = self.credit(&r.scope, &[id], helpful, 2, r.level)?;
+                reply.text = format!("feedback recorded{}", if retired > 0 { "; the lesson was retired" } else { "" });
+            }
+            "credit" => {
+                if !r.level.credits() {
+                    bail!("outcome credit needs --memory learn or higher");
+                }
+                let ids: Vec<String> = r.data["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(DELIVERED)
+                    .map(str::to_owned)
+                    .collect();
+                let passed = match r.data["verified"].as_str() {
+                    Some("pass") => true,
+                    Some("fail") => false,
+                    _ => bail!("verified must be pass or fail"),
+                };
+                let retired = self.credit(&r.scope, &ids, passed, 1, r.level)?;
+                reply.text = format!("credited {} lesson(s); retired {retired}", ids.len());
+                reply.data = json!({"credited": ids.len(), "retired": retired});
             }
             "export" => {
                 let deleted = self
@@ -869,10 +1012,10 @@ impl Engine {
                     .prepare("SELECT id FROM deleted WHERE scope=?1")?
                     .query_map([&r.scope], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                reply.data = json!({"version":1,"scope":r.scope,"lessons":self.store.lessons(&r.scope)?,"deleted":deleted,"policy":self.store.policy(&r.scope)});
+                reply.data = json!({"version": SCHEMA, "scope": r.scope, "lessons": self.store.lessons(&r.scope)?, "deleted": deleted});
             }
             "import" => {
-                if r.data["version"] != 1 || r.data["scope"] != r.scope {
+                if r.data["version"] != SCHEMA || r.data["scope"] != r.scope {
                     bail!("memory export version or scope mismatch");
                 }
                 let lessons: Vec<Lesson> = serde_json::from_value(r.data["lessons"].clone())?;
@@ -883,12 +1026,15 @@ impl Engine {
                 for l in &lessons {
                     if l.scope != r.scope
                         || l.text.is_empty()
-                        || l.text.len() > 2048
-                        || l.evidence.len() > 2048
+                        || l.text.len() > 1000
                         || crate::privacy::redact(&l.text).0 != l.text
-                        || crate::privacy::redact(&l.evidence).0 != l.evidence
-                        || !["preference", "fact", "decision", "gotcha", "todo"].contains(&l.kind.as_str())
-                        || l.id != format!("{:016x}", hash(&format!("{}:{}:{}", l.scope, l.kind, l.text)))
+                        || !KINDS.contains(&l.kind.as_str())
+                        || !SOURCES.contains(&l.source.as_str())
+                        || l.id != lesson_id(&l.scope, &l.kind, &l.text)
+                        || l.anchors.len() > 4
+                        || l.anchors.iter().any(|a| {
+                            !safe_path(&a.path) || a.blob.len() != 40 || !a.blob.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
                     {
                         bail!("invalid imported lesson");
                     }
@@ -903,31 +1049,117 @@ impl Engine {
                     tx.execute("DELETE FROM lessons WHERE id=?1 AND scope=?2", params![id, r.scope])?;
                     tx.execute("INSERT OR IGNORE INTO deleted VALUES(?1,?2)", params![id, r.scope])?;
                 }
-                for l in lessons {
-                    tx.execute("INSERT INTO lessons(id,scope,kind,text,evidence,helpful,harmful) SELECT ?1,?2,?3,?4,?5,0,0 WHERE NOT EXISTS(SELECT 1 FROM deleted WHERE id=?1) ON CONFLICT(id) DO NOTHING",params![l.id,l.scope,l.kind,pack(&l.text)?,pack(&l.evidence)?])?;
-                }
-                let n: i64 = tx.query_row("SELECT count(*) FROM lessons", [], |r| r.get(0))?;
-                if n > LESSONS as i64 {
-                    bail!("memory capacity exceeded; import rolled back");
-                }
                 tx.commit()?;
-                self.cache.remove(&r.scope);
-                self.prepared.lock().unwrap().clear();
-                reply.text = "imported scoped lessons; local feedback policy preserved".into();
+                // Outcomes don't travel: an imported lesson earns trust here.
+                for l in lessons {
+                    if !self.store.tombstoned(&l.id)? {
+                        self.store.insert(&Lesson { helpful: 0, harmful: 0, credited_at: now(), ..l })?;
+                    }
+                }
+                let n: i64 = self.store.db.query_row("SELECT count(*) FROM lessons", [], |r| r.get(0))?;
+                if n > LESSONS as i64 {
+                    bail!("memory capacity exceeded by the import");
+                }
+                self.cache.clear();
+                reply.text = "imported scoped lessons; outcomes start fresh".into();
             }
-            "shutdown" => {
-                reply.text = "memory daemon stopped".into();
-            }
+            "shutdown" => reply.text = "memory daemon stopped".into(),
             "status" => {
-                let lessons: i64 =
-                    self.store.db.query_row("SELECT count(*) FROM lessons WHERE scope=?1", [&r.scope], |r| r.get(0))?;
-                reply.data = json!({"lessons":lessons,"sessions":self.boards.len(),"compressed_event_bytes":0,"l1_persistence":"ram-only","policy_updates":self.store.policy(&r.scope).updates,"background":*self.teacher_metrics.lock().unwrap(),"l1":self.boards.get(&key).map(|b| json!({"seq":b.seq,"observations":b.observations.len(),"complete":b.complete}))});
+                let (lessons, credited, outcomes): (i64, i64, i64) = self.store.db.query_row(
+                    "SELECT count(*), count(*) FILTER (WHERE helpful+harmful>0), coalesce(sum(helpful+harmful),0)
+                     FROM lessons WHERE scope=?1",
+                    [&r.scope],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                let l1 = self
+                    .boards
+                    .get(&key)
+                    .map(|b| json!({"seq":b.seq,"observations":b.observations.len(),"complete":b.complete}));
+                reply.data = json!({"level": r.level, "lessons": lessons, "credited_lessons": credited, "outcomes": outcomes,
+                    "sessions": self.boards.len(), "l1": l1});
                 reply.text = reply.data.to_string();
             }
             _ => bail!("unknown memory operation"),
         }
         Ok(reply)
     }
+}
+
+/// What reflecting on a checked goal yields.
+#[derive(Debug, PartialEq)]
+pub struct Reflection {
+    /// The offered lessons the agent actually relied on.
+    pub used: Vec<String>,
+    /// New lessons, only ever from a passing goal.
+    pub lessons: Vec<NewLesson>,
+}
+#[derive(Debug, PartialEq)]
+pub struct NewLesson {
+    pub kind: String,
+    pub text: String,
+    pub files: Vec<String>,
+}
+
+/// The reflection request: the goal, how its check ended, the lessons that
+/// were offered and the working set (files changed, commands and errors).
+pub fn reflect_prompt(
+    objective: &str,
+    passed: bool,
+    offered: &[(String, String)],
+    work: &str,
+    max_new: usize,
+) -> String {
+    let offered = if offered.is_empty() {
+        "(none)".to_string()
+    } else {
+        offered.iter().map(|(id, text)| format!("- {id}: {}", clip(text, 400))).collect::<Vec<_>>().join("\n")
+    };
+    let ask = if passed {
+        format!(
+            "Then add at most {max_new} new lessons that would help a future session in this repository: a fix \
+             pattern, a command that must be run a certain way, or a trap and how to avoid it. Each is one \
+             specific sentence under 200 characters naming the files or commands involved. Add none if nothing \
+             reusable was learned; never restate the task or its result."
+        )
+    } else {
+        "The check failed, so add no new lessons.".to_string()
+    };
+    format!(
+        "A coding goal just finished and its fixed acceptance check {}.\n\nGoal: {}\n\nLessons offered from \
+         memory:\n{offered}\n\nWhat happened:\n{}\n\nSay which offered lessons the work actually relied on (by \
+         id; leave out ones it ignored). {ask}\n\nReply with JSON only: {{\"used\": [\"id\"], \"lessons\": \
+         [{{\"kind\": \"fact|decision|gotcha\", \"text\": \"...\", \"files\": [\"path\"]}}]}}",
+        if passed { "passed" } else { "failed" },
+        clip(objective, 2000),
+        clip(work, 4000),
+    )
+}
+
+/// Reads the model's reflection strictly: only offered ids count as used,
+/// and new lessons need a pass, a known kind, one short sentence and at most
+/// four plain relative paths. Anything malformed yields None.
+pub fn parse_reflection(content: &str, offered: &[String], passed: bool, max_new: usize) -> Option<Reflection> {
+    let v: Value = serde_json::from_str(content.get(content.find('{')?..=content.rfind('}')?)?).ok()?;
+    let mut used = Vec::new();
+    for id in v["used"].as_array()?.iter().filter_map(Value::as_str) {
+        if offered.iter().any(|o| o == id) && !used.iter().any(|u| u == id) {
+            used.push(id.to_string());
+        }
+    }
+    let mut lessons = Vec::new();
+    for l in v["lessons"].as_array().into_iter().flatten().take(8) {
+        if !passed || lessons.len() == max_new {
+            break;
+        }
+        let kind = l["kind"].as_str().unwrap_or("");
+        let text = crate::privacy::redact(l["text"].as_str().unwrap_or("").trim()).0;
+        if !["fact", "decision", "gotcha"].contains(&kind) || text.is_empty() || text.chars().count() > 200 {
+            continue;
+        }
+        let files = l["files"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|f| safe_path(f));
+        lessons.push(NewLesson { kind: kind.into(), text, files: files.take(4).map(str::to_owned).collect() });
+    }
+    Some(Reflection { used, lessons })
 }
 
 pub fn serve(home: &Path) -> Result<()> {
@@ -993,140 +1225,282 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    fn engine() -> (Engine, PathBuf) {
-        let p = std::env::temp_dir().join(format!(
+
+    fn home() -> PathBuf {
+        std::env::temp_dir().join(format!(
             "rusty-memory-unit-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+    fn engine() -> (Engine, PathBuf) {
+        let p = home();
         (Engine::new(&p).unwrap(), p)
     }
     fn req(op: &str, scope: &str, seq: u64, data: Value) -> Request {
-        Request { op: op.into(), scope: scope.into(), session: "test".into(), seq, mode: Mode::On, data }
+        Request { op: op.into(), scope: scope.into(), session: "test".into(), seq, level: Level::Learn, data }
     }
+    fn save(e: &mut Engine, kind: &str, text: &str, source: &str) -> String {
+        e.handle(req("remember", "a", 0, json!({"kind":kind,"text":text,"source":source}))).unwrap().id
+    }
+    fn lesson(e: &Engine, id: &str) -> Option<Lesson> {
+        e.store.lessons("a").unwrap().into_iter().find(|l| l.id == id)
+    }
+    /// Starts a fresh session on `request` at `level` and returns its advice.
+    fn ask(e: &mut Engine, session: &str, level: Level, request: &str, root: &str) -> Response {
+        let mut r = req("begin", "a", 1, json!({"text":request,"root":root}));
+        r.session = session.into();
+        r.level = level;
+        e.handle(r.clone()).unwrap();
+        r.op = "advice".into();
+        e.handle(r).unwrap()
+    }
+    fn stored(source: &str, helpful: u64, harmful: u64) -> Lesson {
+        Lesson {
+            id: format!("{source}{helpful}{harmful}"),
+            scope: "a".into(),
+            kind: "fact".into(),
+            text: "t".into(),
+            source: source.into(),
+            anchors: Vec::new(),
+            helpful,
+            harmful,
+            credited_at: now(),
+        }
+    }
+
     #[test]
-    fn scope_staleness_learning_and_deletion() {
+    fn levels_build_on_each_other() {
+        let all = [Level::Off, Level::Legacy, Level::Recall, Level::Learn, Level::Reflect, Level::Deep];
+        for l in all {
+            assert_eq!(Level::parse(l.name()), Some(l));
+        }
+        assert_eq!(Level::parse("v2"), None);
+        assert!(!Level::Legacy.advises() && Level::Recall.advises());
+        assert!(!Level::Recall.observes() && !Level::Recall.credits());
+        assert!(
+            Level::Learn.observes() && Level::Learn.anchors() && Level::Learn.credits() && !Level::Learn.reflects()
+        );
+        assert!(Level::Reflect.reflects() && Level::Deep.reflects());
+        // Higher levels offer more readily, keep more and prune harder.
+        assert!(
+            Level::Recall.threshold() > Level::Learn.threshold() && Level::Learn.threshold() > Level::Deep.threshold()
+        );
+        assert!(Level::Recall.per_turn() < Level::Deep.per_turn());
+        assert!(Level::Learn.retire_below() < Level::Deep.retire_below());
+        assert!(Level::Learn.expiry_days() > Level::Deep.expiry_days());
+        assert_eq!((Level::Learn.new_lessons(), Level::Reflect.new_lessons(), Level::Deep.new_lessons()), (0, 2, 3));
+    }
+
+    #[test]
+    fn confidence_rewards_verified_use() {
+        let fresh = stored("agent", 0, 0).confidence();
+        assert!((fresh - 0.356).abs() < 0.01);
+        assert!(stored("agent", 1, 0).confidence() > fresh && stored("agent", 0, 1).confidence() < fresh);
+        // Many successes beat one: the estimate is cautious about small counts.
+        assert!(stored("agent", 9, 1).confidence() > stored("agent", 1, 0).confidence());
+        assert!(stored("user", 0, 0).confidence() > fresh);
+    }
+
+    #[test]
+    fn retirement_follows_the_level() {
         let (mut e, p) = engine();
-        let id = e
-            .handle(req(
-                "remember",
+        let old = now() - 20 * 86_400;
+        for (id, source, h, x, at) in [
+            ("fails", "agent", 0, 2, now()),
+            ("mixed", "agent", 1, 1, now()),
+            ("user-fails", "user", 0, 2, now()),
+            ("user-fails-a-lot", "user", 0, 8, now()),
+            ("unused-20-days", "agent", 0, 0, old),
+            ("user-unused", "user", 0, 0, 1),
+        ] {
+            let l = Lesson {
+                id: id.into(),
+                source: source.into(),
+                helpful: h,
+                harmful: x,
+                credited_at: at,
+                ..stored("", 0, 0)
+            };
+            e.store.insert(&l).unwrap();
+        }
+        let left = |e: &Engine| {
+            let mut ids: Vec<String> = e.store.lessons("a").unwrap().into_iter().map(|l| l.id).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(e.store.retire("a", Level::Learn).unwrap(), 2);
+        assert_eq!(left(&e), ["mixed", "unused-20-days", "user-fails", "user-unused"]);
+        // Deep expires after 14 days and retires below a mean of 0.4.
+        e.store.retire("a", Level::Deep).unwrap();
+        assert_eq!(left(&e), ["mixed", "user-fails", "user-unused"]);
+        assert!(e.store.tombstoned("fails").unwrap() && e.store.tombstoned("unused-20-days").unwrap());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn preferences_reach_every_turn_without_crowding_out_lessons() {
+        let (mut e, p) = engine();
+        save(&mut e, "preference", "answer in British English", "user");
+        e.handle(req("remember", "a", 0, json!({"kind":"preference","text":"prefer tabs","global":true}))).unwrap();
+        assert!(e.handle(req("remember", "a", 0, json!({"kind":"fact","text":"x","global":true}))).is_err());
+        let id = save(&mut e, "gotcha", "run make check, not pytest, so fixtures regenerate", "user");
+        let begin = e.handle(req("begin", "a", 1, json!({"text":"run the tests"}))).unwrap();
+        assert_eq!(begin.data["preferences"], "- answer in British English\n- prefer tabs\n");
+        // A global preference reaches other projects too.
+        let other = e.handle(req("begin", "b", 1, json!({"text":"hi"}))).unwrap();
+        assert_eq!(other.data["preferences"], "- prefer tabs\n");
+        assert_eq!(e.handle(req("advice", "a", 1, Value::Null)).unwrap().id, id);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn observations_steer_recall_from_learn_up() {
+        let (mut e, p) = engine();
+        save(&mut e, "gotcha", "gen_fixtures.py must run before pytest or fixtures are stale", "agent");
+        let mut run = |level: Level, session: &str| {
+            let before = ask(&mut e, session, level, "add a median function and test it", "");
+            let mut r = req(
+                "event",
                 "a",
-                0,
-                json!({"kind":"preference","text":"Always inspect the workspace manifest before editing packages"}),
-            ))
-            .unwrap()
-            .id;
+                2,
+                json!({"tool":"bash","args":"pytest -q","output":"exit code: 1\nE   FileNotFoundError: fixtures/data.json"}),
+            );
+            r.session = session.into();
+            r.level = level;
+            e.handle(r.clone()).unwrap();
+            r.op = "advice".into();
+            (before.text, e.handle(r).unwrap())
+        };
+        let (before, after) = run(Level::Learn, "one");
+        assert!(before.is_empty(), "nothing in the request points at the lesson");
+        assert!(after.text.contains("gen_fixtures.py") && after.text.contains("(unverified)"), "{}", after.text);
+        // The client gets the bare lesson, for crediting and reflection.
+        assert_eq!(after.data["text"], "gen_fixtures.py must run before pytest or fixtures are stale");
+        assert!(run(Level::Recall, "two").1.text.is_empty());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn being_shown_never_changes_a_lesson() {
+        let (mut e, p) = engine();
+        let id = save(&mut e, "fact", "deploy scripts live in ops/deploy", "user");
+        let before = lesson(&e, &id).unwrap();
+        for n in 0..20 {
+            assert_eq!(ask(&mut e, &format!("s{n}"), Level::Learn, "run the deploy scripts in ops", "").id, id);
+        }
+        assert_eq!(lesson(&e, &id).unwrap(), before);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn verified_outcomes_credit_and_retire_lessons() {
+        let (mut e, p) = engine();
+        let good = save(&mut e, "gotcha", "run make check, not pytest, so fixtures regenerate", "agent");
+        let bad = save(&mut e, "gotcha", "the build needs python2 everywhere", "agent");
+        let credit = |e: &mut Engine, id: &str, verdict: &str| {
+            e.handle(req("credit", "a", 0, json!({"ids":[id],"verified":verdict}))).unwrap().data
+        };
+        assert_eq!(credit(&mut e, &good, "pass")["retired"], 0);
+        assert_eq!(lesson(&e, &good).unwrap().helpful, 1);
+        credit(&mut e, &bad, "fail");
+        assert_eq!(credit(&mut e, &bad, "fail")["retired"], 1);
+        assert!(lesson(&e, &bad).is_none());
+        // Retired means tombstoned: saving it again is refused.
+        assert!(e
+            .handle(req("remember", "a", 0, json!({"kind":"gotcha","text":"the build needs python2 everywhere"})))
+            .is_err());
+        // A failure doesn't restart the expiry clock: this old lesson goes at
+        // its first failure instead of living another 28 days.
+        let stale = save(&mut e, "fact", "the frontend lives in web/legacy", "agent");
+        e.store.db.execute("UPDATE lessons SET credited_at=1 WHERE id=?1", [&stale]).unwrap();
+        assert_eq!(credit(&mut e, &stale, "fail")["retired"], 1);
+        assert!(e.handle(req("credit", "a", 0, json!({"ids":[&good],"verified":"maybe"}))).is_err());
+        let mut recall = req("credit", "a", 0, json!({"ids":[&good],"verified":"pass"}));
+        recall.level = Level::Recall;
+        assert!(e.handle(recall).is_err());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn near_duplicates_merge_and_a_full_store_evicts() {
+        let (mut e, p) = engine();
+        let a = save(&mut e, "gotcha", "run make check before pushing so fixtures regenerate", "agent");
+        let b = save(&mut e, "gotcha", "Run make check before pushing, so the fixtures regenerate", "user");
+        assert_eq!(a, b, "a paraphrase is the same lesson");
+        assert_eq!(lesson(&e, &a).unwrap().source, "user", "the user vouching upgrades it");
+        assert_ne!(save(&mut e, "fact", "run make check before pushing so fixtures regenerate", "agent"), a);
+        // Fill the store; the next save evicts the least trusted agent lesson.
+        for i in 0..LESSONS - 3 {
+            e.store
+                .insert(&Lesson { id: format!("filler{i}"), credited_at: now() - 1, ..stored("agent", 1, 0) })
+                .unwrap();
+        }
+        e.store.insert(&Lesson { id: "weak".into(), ..stored("agent", 0, 1) }).unwrap();
+        save(&mut e, "fact", "the api listens on port 8443", "agent");
+        assert!(lesson(&e, "weak").is_none() && !e.store.tombstoned("weak").unwrap());
+        // When everything left is the user's, nothing is evicted.
+        e.store.db.execute("UPDATE lessons SET source='user'", []).unwrap();
+        assert!(e.handle(req("remember", "a", 0, json!({"kind":"fact","text":"one more fact"}))).is_err());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn anchors_flag_changed_files_and_hide_lessons_about_missing_ones() {
+        let (mut e, p) = engine();
+        let root = p.join("work");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/tax.rs"), "hello\n").unwrap();
+        // The same id `git hash-object` prints.
+        assert_eq!(e.blobs.get(&root, "src/tax.rs").unwrap(), "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert!(e.blobs.get(&root, "../outside").is_none() && e.blobs.get(&root, "/etc/passwd").is_none());
+        std::os::unix::fs::symlink("/etc/hostname", root.join("link")).unwrap();
+        assert!(e.blobs.get(&root, "link").is_none());
+        let root_s = root.to_string_lossy().to_string();
+        let data =
+            json!({"kind":"fact","text":"tax rounding is half-even","files":["src/tax.rs","missing.rs"],"root":root_s});
+        let id = e.handle(req("remember", "a", 0, data)).unwrap().id;
+        assert_eq!(lesson(&e, &id).unwrap().anchors.len(), 1, "files that don't exist aren't anchored");
+        assert!(!ask(&mut e, "s1", Level::Learn, "fix tax rounding", &root_s).text.contains("Changed since"));
+        std::fs::write(root.join("src/tax.rs"), "changed\n").unwrap();
+        let text = ask(&mut e, "s2", Level::Learn, "fix tax rounding", &root_s).text;
+        assert!(text.contains("Changed since: src/tax.rs"), "{text}");
+        // Recall doesn't check files.
+        assert!(!ask(&mut e, "s3", Level::Recall, "fix tax rounding", &root_s).text.contains("Changed since"));
+        std::fs::remove_file(root.join("src/tax.rs")).unwrap();
+        assert!(ask(&mut e, "s4", Level::Learn, "fix tax rounding", &root_s).text.is_empty());
+        assert!(lesson(&e, &id).is_some(), "another branch may still have the file");
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn unchanged_files_are_not_rehashed() {
+        let p = home();
+        std::fs::create_dir_all(&p).unwrap();
+        let file = p.join("a.txt");
+        std::fs::write(&file, "first\n").unwrap();
+        let mut blobs = Blobs::default();
+        let first = blobs.get(&p, "a.txt").unwrap();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        // Same length and mtime: the cached id is reused without reading.
+        std::fs::write(&file, "other\n").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(blobs.get(&p, "a.txt").unwrap(), first);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime + Duration::from_secs(5)).unwrap();
+        assert_ne!(blobs.get(&p, "a.txt").unwrap(), first);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn sessions_are_ordered_scoped_and_bounded_in_ram() {
+        let (mut e, p) = engine();
+        save(&mut e, "fact", "inspect the workspace manifest before editing packages", "user");
         e.handle(req("begin", "a", 1, json!({"text":"edit workspace packages"}))).unwrap();
         assert!(!e.handle(req("advice", "a", 1, Value::Null)).unwrap().text.is_empty());
         assert!(e.handle(req("advice", "b", 1, Value::Null)).unwrap().text.is_empty());
         assert!(e.handle(req("begin", "a", 1, json!({"text":"stale"}))).is_err());
-        e.handle(req("feedback", "a", 1, json!({"helpful":false}))).unwrap();
-        assert_eq!(e.store.policy("a").updates, 1);
-        let exported = e.handle(req("export", "a", 1, Value::Null)).unwrap().data;
-        e.handle(req("forget", "a", 1, json!({"id":id}))).unwrap();
-        e.handle(req("import", "a", 1, exported)).unwrap();
-        assert!(e.store.lessons("a").unwrap().is_empty());
-        drop(e);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-    #[test]
-    fn evidence_compression_unicode_and_bounded_notepad() {
-        assert_eq!(clip("ééé", 3), "é");
-        let text = "long repeated evidence ".repeat(100);
-        let b = pack(&text).unwrap();
-        assert!(b.len() < text.len() / 5);
-        assert_eq!(unpack(&b).unwrap(), text);
-        assert_eq!(pack("small").unwrap().len(), 6);
-        assert_eq!(unpack(&pack("small").unwrap()).unwrap(), "small");
-        let (mut e, p) = engine();
-        e.handle(req("begin", "a", 1, json!({"text":"work"}))).unwrap();
-        for n in 2..30 {
-            e.handle(req("event", "a", n, json!({"tool":"bash","args":"x".repeat(5000),"output":"y".repeat(5000)})))
-                .unwrap();
-        }
-        assert_eq!(e.boards["a:test"].observations.len(), 8);
-        assert_eq!(e.boards["a:test"].observations[0].args.len(), 1024);
-        drop(e);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-    #[test]
-    fn fact_advice_and_background_advice_require_current_state() {
-        let (mut e, p) = engine();
-        e.handle(req(
-            "remember",
-            "a",
-            0,
-            json!({"kind":"fact","text":"monorepo URL is https://github.com/example/workspace"}),
-        ))
-        .unwrap();
-        e.handle(req("begin", "a", 1, json!({"text":"search monorepo"}))).unwrap();
-        assert!(!e.handle(req("advice", "a", 1, Value::Null)).unwrap().id.is_empty());
-        e.prepared.lock().unwrap().insert("a:test".into(), Prepared { seq: 1, text: "old proposal".into() });
-        e.handle(req("event", "a", 2, json!({"tool":"bash","output":"exit code: 0"}))).unwrap();
+        e.handle(req("finish", "a", 2, json!({"complete":true}))).unwrap();
         assert!(e.handle(req("advice", "a", 2, Value::Null)).unwrap().text.is_empty());
-        e.prepared.lock().unwrap().insert("a:test".into(), Prepared { seq: 2, text: "current proposal".into() });
-        assert_eq!(e.handle(req("advice", "a", 2, Value::Null)).unwrap().text, "current proposal");
-        e.handle(req("finish", "a", 3, json!({"complete":true}))).unwrap();
-        assert!(e.handle(req("advice", "a", 3, Value::Null)).unwrap().text.is_empty());
-        drop(e);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-
-    #[test]
-    fn feedback_moves_probability_in_correct_direction() {
-        let mut p = Policy::default();
-        let x = [1.0, 0.8, 0.5, 0.0];
-        let before = p.score(x);
-        p.update(x, true);
-        assert!(p.score(x) > before);
-        p.update(x, false);
-        assert!(p.score(x) < before + 0.02);
-    }
-
-    #[test]
-    fn upgrade_removes_legacy_traces_and_sanitizes_saved_lessons() {
-        let (e, p) = engine();
-        let text = "DB_PASSWORD=legacy-secret-canary-12345";
-        let id = format!("{:016x}", hash(&format!("a:fact:{text}")));
-        e.store
-            .db
-            .execute(
-                "INSERT INTO lessons VALUES(?1,'a','fact',?2,?3,0,0)",
-                params![id, text, pack("Bearer legacy-evidence-canary-12345").unwrap()],
-            )
-            .unwrap();
-        e.store.db.execute_batch("CREATE TABLE events(payload BLOB); CREATE TABLE boards(payload BLOB); INSERT INTO events VALUES('legacy-tool-output-canary');").unwrap();
-        drop(e);
-        let store = Store::open(&p).unwrap();
-        let lessons = store.lessons("a").unwrap();
-        assert_eq!(lessons.len(), 1);
-        assert_ne!(lessons[0].id, id);
-        assert!(!lessons[0].text.contains("legacy-secret"));
-        assert!(!lessons[0].evidence.contains("legacy-evidence"));
-        assert!(store
-            .db
-            .query_row("SELECT EXISTS(SELECT 1 FROM deleted WHERE id=?1)", [&id], |r| r.get::<_, bool>(0))
-            .unwrap());
-        let old: i64 = store
-            .db
-            .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('events','boards')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(old, 0);
-        drop(store);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-
-    #[test]
-    fn compressed_input_cannot_expand_past_the_bound() {
-        let bomb = pack(&"x".repeat(FRAME + 1)).unwrap();
-        assert!(unpack(&bomb).is_err());
-    }
-
-    #[test]
-    fn sustained_hooks_bound_ram_state_without_growing_disk() {
-        let (mut e, p) = engine();
-        e.handle(req("remember", "a", 0, json!({"kind":"preference","text":"Inspect the workspace manifest"})))
-            .unwrap();
         let bytes =
             || std::fs::read_dir(p.join("memory")).unwrap().map(|f| f.unwrap().metadata().unwrap().len()).sum::<u64>();
         let before = bytes();
@@ -1145,10 +1519,66 @@ mod tests {
         }
         assert_eq!(e.boards.len(), SESSIONS);
         assert!(e.used.len() <= SESSIONS && e.delivered.len() <= SESSIONS);
-        assert!(e.versions.lock().unwrap().len() <= SESSIONS);
-        assert!(e.boards.values().all(|b| b.observations.len() <= 8));
+        assert!(e.boards.values().all(|b| b.observations.len() <= OBSERVATIONS));
+        assert_eq!(e.boards.values().next().unwrap().observations[0].args.len(), 1024);
         assert_eq!(bytes(), before, "coding hooks wrote persistent data");
-        drop(e);
         std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn export_import_and_forget_round_trip() {
+        let (mut e, p) = engine();
+        let id = save(&mut e, "fact", "monorepo URL is https://github.com/example/workspace", "user");
+        e.handle(req("credit", "a", 0, json!({"ids":[&id],"verified":"pass"}))).unwrap();
+        let exported = e.handle(req("export", "a", 0, Value::Null)).unwrap().data;
+        e.handle(req("forget", "a", 0, json!({"id":id}))).unwrap();
+        e.handle(req("import", "a", 0, exported.clone())).unwrap();
+        assert!(lesson(&e, &id).is_none(), "a forgotten lesson came back");
+        let (mut fresh, q) = engine();
+        fresh.handle(req("import", "a", 0, exported)).unwrap();
+        let l = lesson(&fresh, &id).unwrap();
+        assert_eq!((l.helpful, l.source.as_str()), (0, "user"), "outcomes don't travel");
+        assert!(fresh.handle(req("import", "a", 0, json!({"version":1,"scope":"a","lessons":[]}))).is_err());
+        std::fs::remove_dir_all(p).unwrap();
+        std::fs::remove_dir_all(q).unwrap();
+    }
+
+    #[test]
+    fn older_stores_are_replaced() {
+        let p = home();
+        crate::privacy::private_dir(&p.join("memory")).unwrap();
+        {
+            let db = Connection::open(p.join("memory/memory.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE lessons(id TEXT, scope TEXT, kind TEXT, text TEXT, evidence BLOB, helpful INTEGER, harmful INTEGER);
+                              INSERT INTO lessons VALUES('x','a','fact','old',x'00',0,0); PRAGMA user_version=2;").unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&p).unwrap();
+            assert!(store.lessons("a").unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn reflection_is_parsed_strictly() {
+        let offered = vec!["aaa".to_string(), "bbb".to_string()];
+        let reply = r#"Sure: {"used":["aaa","zzz","aaa"],"lessons":[
+            {"kind":"gotcha","text":"run make check; pytest alone skips fixture generation","files":["Makefile","../etc"]},
+            {"kind":"preference","text":"the user likes tabs"},
+            {"kind":"fact","text":"x"},
+            {"kind":"fact","text":"a third lesson"}]}"#;
+        let r = parse_reflection(reply, &offered, true, 2).unwrap();
+        assert_eq!(r.used, ["aaa"]);
+        assert_eq!(r.lessons.len(), 2, "at most two, and invented preferences are dropped");
+        assert_eq!(r.lessons[0].files, ["Makefile"]);
+        assert_eq!(parse_reflection(reply, &offered, true, 3).unwrap().lessons.len(), 3);
+        assert!(parse_reflection(reply, &offered, false, 2).unwrap().lessons.is_empty());
+        assert!(parse_reflection("no json here", &offered, true, 2).is_none());
+        let long = format!(r#"{{"used":[],"lessons":[{{"kind":"fact","text":"{}"}}]}}"#, "x".repeat(201));
+        assert!(parse_reflection(&long, &offered, true, 2).unwrap().lessons.is_empty());
+        let prompt =
+            reflect_prompt("add median", true, &[("aaa".into(), "use make check".into())], "- changed: stats.py", 2);
+        assert!(prompt.contains("passed") && prompt.contains("aaa: use make check") && prompt.contains("at most 2"));
+        assert!(reflect_prompt("g", false, &[], "", 2).contains("add no new lessons"));
     }
 }

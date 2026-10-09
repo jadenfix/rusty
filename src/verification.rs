@@ -104,6 +104,16 @@ impl CheckRecord {
         matches!(self.outcome, CheckOutcome::Passed)
     }
 
+    /// Some(pass) when the check ran to a verdict; None when it timed out,
+    /// was interrupted or saw the workspace change underneath it.
+    pub fn verdict(&self) -> Option<bool> {
+        match self.outcome {
+            CheckOutcome::Passed => Some(true),
+            CheckOutcome::Failed => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "fixed verification: {:?} (exit {:?}, {:.2}s)\n{}",

@@ -120,7 +120,7 @@ struct RunArgs {
     /// Static Linux rusty binary the snapshot was built from
     #[arg(long)]
     binary: Option<PathBuf>,
-    #[arg(long, default_value = "legacy", value_parser = ["legacy", "off", "on", "deep"])]
+    #[arg(long, default_value = "legacy", value_parser = ["off", "legacy", "recall", "learn", "reflect", "deep"])]
     memory_mode: String,
     /// Scoped gzip export from rusty-memoryd
     #[arg(long)]
@@ -425,9 +425,9 @@ fn run(env: &Env, runs: &Runs, args: RunArgs) -> Result<i32> {
     if !vars.contains_key("NVIDIA_API_KEY") && !vars.contains_key("RUSTY_API_KEY") {
         bail!("set NVIDIA_API_KEY (or RUSTY_API_KEY) in the environment or .env");
     }
-    let remembers = matches!(args.memory_mode.as_str(), "on" | "deep");
+    let remembers = crate::advisor::Level::parse(&args.memory_mode).is_some_and(crate::advisor::Level::advises);
     if args.memory_input.is_some() && !remembers {
-        bail!("--memory-input requires --memory-mode on or deep");
+        bail!("--memory-input requires --memory-mode recall or higher");
     }
     if args.memory_input.as_ref().is_some_and(|p| !p.is_file()) {
         bail!("memory input file not found");
