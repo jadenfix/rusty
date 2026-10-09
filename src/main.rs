@@ -128,6 +128,10 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// Print the values this build accepts, as JSON, and exit
+    #[arg(long)]
+    capabilities: bool,
+
     /// Project directory (defaults to the current directory)
     #[arg(short = 'C', long)]
     dir: Option<PathBuf>,
@@ -159,6 +163,10 @@ fn run() -> Result<i32> {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
     let cwd = std::env::current_dir()?.canonicalize()?;
+    if cli.capabilities {
+        println!("{}", capabilities());
+        return Ok(0);
+    }
 
     let mut settings = Settings::load();
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
@@ -328,6 +336,34 @@ fn run() -> Result<i32> {
     }
     agent.write_trajectory()?;
     Ok(0)
+}
+
+/// Bumped when a harness-facing flag, exit code or `--stats` key changes
+/// meaning (docs/VERIFICATION.md, "Harness contract").
+const CONTRACT: u32 = 1;
+
+/// What this build accepts, so a harness can refuse an unsupported setting
+/// before any model call. Each list is filtered through the parser that
+/// reads the flag, so it can't claim a value the flag would reject.
+fn capabilities() -> serde_json::Value {
+    let accepted = |values: &[&'static str], ok: &dyn Fn(&str) -> bool| -> Vec<&'static str> {
+        values.iter().copied().filter(|v| ok(v)).collect()
+    };
+    let memory: Vec<&str> = rusty::advisor::Level::NAMES.split(", ").collect();
+    let mut modes = vec!["auto"];
+    modes.extend(accepted(&["careful", "standard", "vibe"], &|v| ExecutionMode::parse(v).is_some()));
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "contract": CONTRACT,
+        "memory": accepted(&memory, &|v| rusty::advisor::Level::parse(v).is_some()),
+        "mode": modes,
+        "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
+        "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
+        "tools": ["local", "daytona"],
+        "verify": {"supported": true, "timeout_secs": [1, 600]},
+        "mcp": {"transports": ["stdio"]},
+        "budget": ["max-requests", "max-budget-tokens", "budget-secs"],
+    })
 }
 
 /// One JSON line on stderr for scripts and evals.

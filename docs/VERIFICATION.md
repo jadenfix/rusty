@@ -24,6 +24,25 @@ afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
 
+## What careful mode changes
+
+An ablation of `--mode careful` measures the whole mode. Nothing here
+isolates "review", so a difference between careful and standard can't be
+credited to any single part of it. Pin `--mode`: in `auto`, a risky call or
+a production target switches a turn to careful mid-run.
+
+| Part | Careful | Standard |
+|---|---|---|
+| Instructions | assumptions, failure modes, a bounded plan with recovery before critical changes, recheck the diff | focused plan, verify the changed behaviour |
+| Output cap | 32,768 tokens on the default NVIDIA model (others stay at 16,384) | 16,384 |
+| Reasoning | NVIDIA default model: `reasoning_effort` high with a 24,576 budget; OpenAI reasoning models: high; Anthropic: `xhigh` where supported | provider default / medium / high |
+| Model | `RUSTY_CAREFUL_MODEL` if set | `RUSTY_STANDARD_MODEL` if set |
+| Completion review | one read-only checker worker reviews the first proposed completion, even with `--agents off`; it is another model call on the same budget (role `review`), on `agents.sub_model` if set | none |
+| Infrastructure | an apply is refused until its dry run ran in this session against the same files and target; a successful mutating command is followed by a health check | snapshots and logging only |
+
+The checker's findings go back to the model and do not decide acceptance.
+The fixed `--verify` check is the same in every mode.
+
 ## Evidence and scope
 
 The private `CheckRecord` fields are constructed from executor observations.

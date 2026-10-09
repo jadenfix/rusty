@@ -3051,3 +3051,16 @@ fn a_mistyped_mcp_read_does_not_escalate_auto_mode() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("switched up"));
     assert_eq!(server.join().unwrap().len(), 2, "a read needs no careful review");
 }
+
+#[test]
+fn capabilities_list_only_values_the_flags_accept() {
+    let s = Sandbox::new("capabilities");
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").arg("--capabilities").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["memory"], serde_json::json!(["off", "recall", "learn", "reflect", "deep"]));
+    assert_eq!(caps["mcp"]["transports"], serde_json::json!(["stdio"]));
+    // An old value the flag now rejects is not offered.
+    let out = s.cmd().args(["--memory", "legacy", "hi"]).output().unwrap();
+    assert!(!out.status.success() && !caps["memory"].to_string().contains("legacy"));
+}
