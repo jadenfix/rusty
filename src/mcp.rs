@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -23,6 +23,7 @@ const PREFIX: &str = "mcp__";
 const MAX_NAME: usize = 64;
 const MAX_PAGES: usize = 100;
 const MAX_TOOLS: usize = 1000;
+const HANDSHAKE: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct Config {
@@ -72,6 +73,12 @@ pub struct Report {
     required: bool,
     /// `ok`, `skipped` or `failed`.
     status: &'static str,
+    /// Why it isn't fully usable, so a harness can tell a capability rusty
+    /// declares unsupported (`unsupported_transport`) from a server that
+    /// didn't come up (`bad_config`, `start_failed`, `handshake_failed`) and
+    /// from tools that weren't found (`discovery_failed`, `missing_tools`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
     tools: usize,
     missing: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,15 +134,22 @@ impl Mcp {
             let cfg = parsed.as_ref().ok();
             let required = cfg.is_some_and(|c| c.required || !c.required_tools.is_empty())
                 || raw["required"].as_bool() == Some(true);
-            let mut report =
-                Report { server: name.clone(), required, status: "failed", tools: 0, missing: Vec::new(), error: None };
+            let mut report = Report {
+                server: name.clone(),
+                required,
+                status: "failed",
+                reason: None,
+                tools: 0,
+                missing: Vec::new(),
+                error: None,
+            };
             let started = match (&parsed, cfg.and_then(|c| c.command.as_ref())) {
-                (Err(e), _) => Err(anyhow!("bad entry: {e}")),
+                (Err(e), _) => Err(("bad_config", anyhow!("bad entry: {e}"))),
                 (Ok(c), None) if c.url.is_some() => {
                     report.status = "skipped";
-                    Err(anyhow!("only stdio servers are supported, not `url`"))
+                    Err(("unsupported_transport", anyhow!("only stdio servers are supported, not `url`")))
                 }
-                (Ok(_), None) => Err(anyhow!("no `command`")),
+                (Ok(_), None) => Err(("bad_config", anyhow!("no `command`"))),
                 (Ok(c), Some(command)) => Server::start(&name, command, c, cwd),
             };
             match started {
@@ -145,10 +159,14 @@ impl Mcp {
                         .map(|c| c.required_tools.iter().filter(|t| !have.contains(t.as_str())).cloned().collect())
                         .unwrap_or_default();
                     report.status = "ok";
+                    report.reason = (!report.missing.is_empty()).then_some("missing_tools");
                     report.tools = server.tools.len();
                     servers.push(server);
                 }
-                Err(e) => report.error = Some(format!("{e:#}")),
+                Err((reason, e)) => {
+                    report.reason = Some(reason);
+                    report.error = Some(format!("{e:#}"));
+                }
             }
             reports.push(report);
         }
@@ -221,7 +239,15 @@ impl Mcp {
 }
 
 impl Server {
-    fn start(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
+    /// Starts, initializes and lists one server; an error says which stage failed.
+    fn start(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self, (&'static str, Error)> {
+        let mut server = Self::spawn(name, command, cfg, cwd).map_err(|e| ("start_failed", e))?;
+        server.initialize().map_err(|e| ("handshake_failed", e))?;
+        server.discover().map_err(|e| ("discovery_failed", e))?;
+        Ok(server)
+    }
+
+    fn spawn(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
         let mut child = Command::new(command)
             .args(&cfg.args)
             .envs(&cfg.env)
@@ -243,28 +269,34 @@ impl Server {
                 }
             }
         });
-        let mut server = Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new() };
-        let handshake = Duration::from_secs(30);
-        server.request(
+        Ok(Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new() })
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.request(
             "initialize",
             json!({"protocolVersion": PROTOCOL, "capabilities": {},
                    "clientInfo": {"name": "rusty", "version": env!("CARGO_PKG_VERSION")}}),
-            handshake,
+            HANDSHAKE,
         )?;
-        server.notify("notifications/initialized")?;
+        self.notify("notifications/initialized")
+    }
+
+    fn discover(&mut self) -> Result<()> {
+        let name = self.name.clone();
         // `tools/list` is paginated: follow `nextCursor` until it stops,
         // within bounds a looping or endless server can't get past.
         let (mut cursor, mut seen) = (None::<String>, HashSet::new());
         for page in 1.. {
             let params = cursor.as_ref().map_or(json!({}), |c| json!({ "cursor": c }));
-            let listed = server.request("tools/list", params, handshake)?;
+            let listed = self.request("tools/list", params, HANDSHAKE)?;
             for t in listed["tools"].as_array().into_iter().flatten() {
                 let Some(tool) = t["name"].as_str().filter(|n| !n.is_empty()) else { continue };
                 let mut schema = t["inputSchema"].clone();
                 if !schema.is_object() {
                     schema = json!({"type": "object", "properties": {}});
                 }
-                server.tools.push(Tool {
+                self.tools.push(Tool {
                     exposed: String::new(),
                     name: tool.to_string(),
                     description: format!("[{name} MCP] {}", t["description"].as_str().unwrap_or("")),
@@ -277,11 +309,11 @@ impl Server {
             if !seen.insert(c.clone()) {
                 bail!("tools/list repeated cursor `{c}`");
             }
-            if page >= MAX_PAGES || server.tools.len() >= MAX_TOOLS {
-                bail!("tools/list still had more after {page} pages and {} tools", server.tools.len());
+            if page >= MAX_PAGES || self.tools.len() >= MAX_TOOLS {
+                bail!("tools/list still had more after {page} pages and {} tools", self.tools.len());
             }
         }
-        Ok(server)
+        Ok(())
     }
 
     fn send(&mut self, message: &Value) -> Result<()> {

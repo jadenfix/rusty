@@ -2918,13 +2918,27 @@ fn required_mcp_servers_and_tools_fail_closed() {
     assert_eq!((flags["status"].as_str(), flags["tools"].as_u64()), (Some("ok"), Some(3)), "{report}");
     assert_eq!(report["ok"], true, "optional servers that fail don't block: {report}");
 
+    let reason = |name: &str| {
+        report["servers"].as_array().unwrap().iter().find(|r| r["server"] == name).unwrap()["reason"].clone()
+    };
+    assert_eq!((reason("broken"), reason("remote")), ("start_failed".into(), "unsupported_transport".into()));
+    assert!(flags.get("reason").is_none(), "{report}");
+
     for (config, why) in [
         (
             r#"{"mcpServers": {"flags": {"command": "flags-mcp", "requiredTools": ["get_flag", "set_flag"]}}}"#,
-            "set_flag",
+            "\"reason\":\"missing_tools\"",
         ),
-        (r#"{"mcpServers": {"gone": {"command": "no-such-mcp-server", "required": true}}}"#, "no-such-mcp-server"),
-        (r#"{"mcpServers": {"remote": {"url": "https://mcp.example.com/sse", "required": true}}}"#, "only stdio"),
+        (
+            r#"{"mcpServers": {"gone": {"command": "no-such-mcp-server", "required": true}}}"#,
+            "\"reason\":\"start_failed\"",
+        ),
+        (r#"{"mcpServers": {"mute": {"command": "true", "required": true}}}"#, "\"reason\":\"handshake_failed\""),
+        (
+            r#"{"mcpServers": {"remote": {"url": "https://mcp.example.com/sse", "required": true}}}"#,
+            "\"reason\":\"unsupported_transport\"",
+        ),
+        (r#"{"mcpServers": {"odd": {"command": 7, "required": true}}}"#, "\"reason\":\"bad_config\""),
     ] {
         std::fs::write(s.project.join(".mcp.json"), config).unwrap();
         let out = check();
