@@ -17,6 +17,7 @@ mod memory;
 mod permissions;
 mod signal;
 mod skills;
+mod snapshot;
 mod swarm;
 mod tips;
 mod tools;
@@ -229,6 +230,7 @@ fn run() -> Result<i32> {
     }
     agent.set_backend(backend)?;
     if agent.backend.name() == "local" {
+        agent.snapshot = snapshot::take(&cwd);
         agent.mcp = mcp::Mcp::load(&cwd)?;
         if !agent.mcp.is_empty() {
             println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));
