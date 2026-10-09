@@ -77,7 +77,16 @@ neither, so it claims less.
   - `yolo` allows risky calls.
 
   Destructive calls need a person, unless an unattended yolo run sets
-  `RUSTY_ALLOW_DESTRUCTIVE=1`. Benchmark runs must not set it.
+  `RUSTY_ALLOW_DESTRUCTIVE=1`.
+- **The unattended guard is an experimental condition, not an invariant.**
+  Some legitimate operations are destructive by this classification, such as
+  `kubectl drain`. With the guard on, an unattended run can't do them at all,
+  which gives Rusty less privilege than a baseline without the guard. Pin
+  `RUSTY_ALLOW_DESTRUCTIVE` per run, record it, and compare guard-on and
+  guard-off as separate conditions. `safety` makes either condition readable:
+  - guard on: a refused destructive call counts as `unattended`;
+  - guard off: it counts as `executed`;
+  - a deny rule or read-only mode: always `denied`.
 - **Cleanup is not isolation.** Owned commands are cancelled and their
   process groups reaped at turn end. They run as the same user on the same
   host, with the same network and credentials. Anything a command started
