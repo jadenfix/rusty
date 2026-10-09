@@ -1009,13 +1009,15 @@ impl Agent {
         if ok && matches!(call.name.as_str(), "write_file" | "edit_file") {
             self.infra.invalidate(args["path"].as_str().unwrap_or(""));
         }
-        // Secrets never reach the model, the screen or the session file.
-        let (mut text, redacted) = infra::redact(&text);
+        // Secrets never reach the model, the screen or the session file. Local
+        // shells get each one under the handle the model sees instead.
+        let handles = self.backend.name() == "local";
+        let (mut text, redacted) = rusty::privacy::redact_tool_output(&call.name, &text, handles);
         if let Some(h) = &mut self.advisor {
             h.event(&call.name, &infra::redact(&call.arguments).0, &text);
         }
         if redacted > 0 {
-            text.push_str(&infra::redaction_note(redacted));
+            text.push_str(&infra::redaction_note(redacted, handles));
         }
         d.tool_result(&call.name, &args, &text, ok);
         if redacted > 0 {

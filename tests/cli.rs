@@ -380,7 +380,13 @@ fn secrets_in_tool_output_never_reach_the_model_or_the_session_file() {
     )
     .unwrap();
     let answer = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
-    let (url, server) = scripted_endpoint(vec![tool_reply("bash", serde_json::json!({"command": "cat .env"})), answer]);
+    // The model uses the password by its handle, then tries to print it.
+    let use_it = "grep -qx \"DB_PASSWORD=$RUSTY_SECRET_1\" .env && echo works; echo \"got $RUSTY_SECRET_1\"";
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("bash", serde_json::json!({"command": "cat .env"})),
+        tool_reply("bash", serde_json::json!({ "command": use_it })),
+        answer,
+    ]);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
@@ -392,10 +398,11 @@ fn secrets_in_tool_output_never_reach_the_model_or_the_session_file() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let requests = server.join().unwrap();
-    let seen = requests[1]["messages"].to_string();
+    let seen = requests[2]["messages"].to_string();
     assert!(!seen.contains("hunter22-real") && !seen.contains("AKIAIOSFODNN7EXAMPLE"), "{seen}");
-    assert!(seen.contains("DB_HOST=db.internal") && seen.contains("DB_PASSWORD=[redacted]"), "{seen}");
+    assert!(seen.contains("DB_HOST=db.internal") && seen.contains("DB_PASSWORD=${RUSTY_SECRET_1}"), "{seen}");
     assert!(seen.contains("redacted 2 secret values"), "{seen}");
+    assert!(seen.contains("works") && seen.contains("got ${RUSTY_SECRET_1}"), "{seen}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("2 secrets redacted"));
     let mut sessions = Vec::new();
     find_files(&s.home, "json", &mut sessions);
@@ -2695,6 +2702,38 @@ fn mcp_sandbox(name: &str) -> Sandbox {
     )
     .unwrap();
     s
+}
+
+/// A secret store over MCP: its answer's `value` field is the secret.
+const FAKE_VAULT_MCP: &str = r#"k="vault-live-$(printf 9f3a)2c1e7b"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":"2025-06-18","capabilities":{}}}' ;;
+    *'"tools/list"'*) echo '{"jsonrpc":"2.0","id":'$id',"result":{"tools":[{"name":"secret_access","description":"Read a secret","inputSchema":{"type":"object"}}]}}' ;;
+    *'"tools/call"'*) echo '{"jsonrpc":"2.0","id":'$id',"result":{"content":[{"type":"text","text":"{\"version\": 1, \"value\": \"'$k'\"}"}]}}' ;;
+  esac
+done"#;
+
+#[test]
+fn a_secret_from_an_mcp_secret_store_is_usable_but_never_seen() {
+    let s = Sandbox::new("mcp-vault");
+    s.fake("vault-mcp", FAKE_VAULT_MCP);
+    std::fs::write(s.project.join(".mcp.json"), r#"{"mcpServers": {"vault": {"command": "vault-mcp"}}}"#).unwrap();
+    let key = format!("vault-live-{}2c1e7b", "9f3a");
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "standard", "use the payments key"],
+        vec![
+            tool_reply("mcp__vault__secret_access", serde_json::json!({"name": "payments-key"})),
+            bash_reply("printf %s \"$RUSTY_SECRET_1\" > used.txt && echo stored"),
+            text_reply("done"),
+        ],
+    );
+    let seen = requests[2]["messages"].to_string();
+    assert!(!seen.contains(&key), "{seen}");
+    assert!(seen.contains(r#"\"value\": \"${RUSTY_SECRET_1}\""#) && seen.contains("stored"), "{seen}");
+    assert_eq!(std::fs::read_to_string(s.project.join("used.txt")).unwrap(), key);
 }
 
 #[test]

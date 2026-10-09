@@ -66,6 +66,104 @@ const REDACTED: &str = "[redacted]";
 /// with well-known prefixes, bearer and basic auth headers, URL passwords,
 /// PEM private keys and the data of Kubernetes Secrets.
 pub fn redact(text: &str) -> (String, usize) {
+    redact_by(text, &mut |_| REDACTED.to_string())
+}
+
+/// Like [`redact`], but each secret is shown as a handle such as
+/// `${RUSTY_SECRET_1}` instead of `[redacted]`, and [`secret_env`] hands the
+/// value to later shell commands under that name. A model can then use a
+/// secret it fetched without ever reading it. Values already handed out are
+/// replaced wherever they show up again, even without a secret-looking key.
+pub fn redact_with_handles(text: &str) -> (String, usize) {
+    let known: Vec<String> = vault().clone();
+    let mut text = text.to_string();
+    let mut count = 0;
+    for (i, value) in known.iter().enumerate() {
+        if value.chars().count() >= MIN_RECALL && text.contains(value.as_str()) {
+            count += text.matches(value.as_str()).count();
+            text = text.replace(value.as_str(), &handle_name(i));
+        }
+    }
+    let (out, n) = redact_by(&text, &mut handle);
+    (out, n + count)
+}
+
+/// Redacts one tool's output for the model. A secret store hands back its
+/// secret in a plain field such as `value`, with nothing secret-looking
+/// around it, so when the tool's name says it deals in secrets those fields
+/// count as secrets too. `handles` picks [`redact_with_handles`] over
+/// [`redact`].
+pub fn redact_tool_output(tool: &str, text: &str, handles: bool) -> (String, usize) {
+    let mut hidden = 0;
+    let mut text = std::borrow::Cow::Borrowed(text);
+    let name = tool.to_ascii_lowercase();
+    if name.contains("secret") || name.contains("credential") {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
+            hidden = hide_secret_fields(&mut json, handles);
+            if hidden > 0 {
+                text = serde_json::to_string_pretty(&json).unwrap_or_default().into();
+            }
+        }
+    }
+    let (out, n) = if handles { redact_with_handles(&text) } else { redact(&text) };
+    (out, n + hidden)
+}
+
+fn hide_secret_fields(value: &mut serde_json::Value, handles: bool) -> usize {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter_mut()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s)
+                    if !s.is_empty() && matches!(k.as_str(), "value" | "secret" | "plaintext" | "data") =>
+                {
+                    *s = if handles { handle(s) } else { REDACTED.to_string() };
+                    1
+                }
+                _ => hide_secret_fields(v, handles),
+            })
+            .sum(),
+        serde_json::Value::Array(items) => items.iter_mut().map(|v| hide_secret_fields(v, handles)).sum(),
+        _ => 0,
+    }
+}
+
+/// The handed-out secrets as environment variables for a shell command.
+pub fn secret_env() -> Vec<(String, String)> {
+    vault().iter().enumerate().map(|(i, v)| (format!("{HANDLE}{}", i + 1), v.clone())).collect()
+}
+
+/// Secrets taken out of tool output this session, in handle order. Memory
+/// only: never written anywhere, gone when the process ends.
+fn vault() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static VAULT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    VAULT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+const HANDLE: &str = "RUSTY_SECRET_";
+const MAX_HANDLES: usize = 100;
+/// Shorter values are only replaced where a pattern finds them, so a short
+/// password can't blank out every matching word in later output.
+const MIN_RECALL: usize = 6;
+
+fn handle_name(i: usize) -> String {
+    format!("${{{HANDLE}{}}}", i + 1)
+}
+
+fn handle(value: &str) -> String {
+    let mut v = vault();
+    let i = match v.iter().position(|s| s == value) {
+        Some(i) => i,
+        None if v.len() < MAX_HANDLES => {
+            v.push(value.to_string());
+            v.len() - 1
+        }
+        None => return REDACTED.to_string(),
+    };
+    handle_name(i)
+}
+
+fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
     let mut lines: Vec<String> = Vec::new();
     let mut count = 0;
     let mut in_pem = false;
@@ -95,14 +193,21 @@ pub fn redact(text: &str) -> (String, usize) {
                 in_secret_data = false;
             }
             if in_secret_data {
-                if let Some((k, _)) = split_kv(trimmed) {
+                if let Some((k, v)) = split_kv(trimmed) {
                     count += 1;
-                    lines.push(format!("{}{k} {REDACTED}", &line[..indent]));
+                    let (v, tail) = match v.strip_suffix(',') {
+                        Some(v) => (v, ","),
+                        None => (v, ""),
+                    };
+                    let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
+                    let v = if quoted { &v[1..v.len() - 1] } else { v };
+                    let q = if quoted { "\"" } else { "" };
+                    lines.push(format!("{}{k} {q}{}{q}{tail}", &line[..indent], mark(v)));
                     continue;
                 }
             }
         }
-        let (redacted, n) = redact_line(line);
+        let (redacted, n) = redact_line(line, mark);
         count += n;
         lines.push(redacted);
     }
@@ -203,8 +308,8 @@ enum Expect {
     Flag,
 }
 
-fn redact_line(line: &str) -> (String, usize) {
-    let (line, mut count) = redact_urls(line);
+fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
+    let (line, mut count) = redact_urls(line, mark);
     let mut out = String::with_capacity(line.len());
     let mut rest = line.as_str();
     let mut expect: Option<Expect> = None;
@@ -226,9 +331,11 @@ fn redact_line(line: &str) -> (String, usize) {
             None => false,
         };
         if (wanted && secret_value(token)) || secret_shape(token) {
-            out.push_str(REDACTED);
+            let padded = rest.trim_start_matches('='); // base64 padding
+            let value = &line[line.len() - rest.len() - token.len()..line.len() - padded.len()];
+            out.push_str(&mark(value));
             count += 1;
-            rest = rest.trim_start_matches('='); // base64 padding
+            rest = padded;
             continue;
         }
         out.push_str(token);
@@ -279,7 +386,7 @@ fn secret_shape(token: &str) -> bool {
 }
 
 /// `scheme://user:pass@host` anywhere in the line → `scheme://user:[redacted]@host`.
-fn redact_urls(line: &str) -> (String, usize) {
+fn redact_urls(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
     let mut out = String::with_capacity(line.len());
     let mut count = 0;
     let mut rest = line;
@@ -290,7 +397,7 @@ fn redact_urls(line: &str) -> (String, usize) {
             .map_or(rest.len(), |e| i + e);
         let url = &rest[scheme_start..url_end];
         out.push_str(&rest[..scheme_start]);
-        match redact_url(url) {
+        match redact_url(url, mark) {
             Some(redone) => {
                 out.push_str(&redone);
                 count += 1;
@@ -303,28 +410,91 @@ fn redact_urls(line: &str) -> (String, usize) {
     (out, count)
 }
 
-fn redact_url(url: &str) -> Option<String> {
+fn redact_url(url: &str, mark: &mut dyn FnMut(&str) -> String) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let (userinfo, host) = rest.split_once('@')?;
     let (user, pass) = userinfo.split_once(':')?;
-    (!pass.is_empty() && !host.is_empty() && !userinfo.contains('/'))
-        .then(|| format!("{scheme}://{user}:{REDACTED}@{host}"))
+    (!pass.is_empty() && !host.is_empty() && !userinfo.contains('/') && !pass.starts_with("${"))
+        .then(|| format!("{scheme}://{user}:{}@{host}", mark(pass)))
 }
 
-/// The line appended to a tool result that had secrets in it.
-pub fn redaction_note(n: usize) -> String {
+/// The line appended to a tool result that had secrets in it. With handles,
+/// it says how to use one; without, how to work around not seeing it.
+pub fn redaction_note(n: usize, handles: bool) -> String {
+    let what =
+        format!("rusty redacted {n} secret value{} from this output before you saw it", if n == 1 { "" } else { "s" });
+    if handles {
+        return format!(
+            "\n[{what}. Each one is shown as a name like ${{{HANDLE}1}}, and your bash commands have that variable \
+             set to the real value, so use the name inside a command: psql \"postgresql://user:${{{HANDLE}1}}@host/db\", \
+             curl -H \"Authorization: Bearer ${{{HANDLE}2}}\". The same secret keeps the same name. Don't re-run the \
+             command to see a value, and don't print one: output is redacted again.]"
+        );
+    }
     format!(
-        "\n[rusty redacted {n} secret value{} from this output before you saw it. Never try to print or copy a \
-         secret, and don't re-run the command hoping to see it: the value works, you just can't read it. To use \
-         one, pass it inside a single command without printing it (DSN=$(...) && psql \"$DSN\" -c ...). To change \
-         one in a file, rewrite its whole line (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]",
-        if n == 1 { "" } else { "s" }
+        "\n[{what}. Never try to print or copy a secret, and don't re-run the command hoping to see it: the value \
+         works, you just can't read it. To use one, pass it inside a single command without printing it \
+         (DSN=$(...) && psql \"$DSN\" -c ...). To change one in a file, rewrite its whole line \
+         (sed -i 's/^KEY=.*/KEY=.../') rather than matching the value.]"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handles_name_each_secret_and_hand_it_to_shells() {
+        // Built at run time so the source holds no credential-shaped literal.
+        let (user, pass) = ("app", ["handle", "test", "pass"].join("-"));
+        let (out, n) = redact_with_handles(&format!(
+            "DB_PASSWORD={pass}\nurl: postgres://{user}:{pass}@db:5432/x\ntoken: aGFuZGxlLXRvay=="
+        ));
+        assert_eq!(n, 3, "{out}");
+        let name = |v: &str| {
+            let (k, _) = secret_env().into_iter().find(|(_, val)| val == v).expect(v);
+            format!("${{{k}}}")
+        };
+        let name_of_pass = name(&pass);
+        assert!(name_of_pass.starts_with("${RUSTY_SECRET_"), "{pass}");
+        // One secret keeps one name, wherever it shows up; base64 padding stays with its value.
+        assert!(out.contains(&format!("DB_PASSWORD={name_of_pass}\n")), "{out}");
+        assert!(out.contains(&format!("postgres://{user}:{name_of_pass}@db:5432/x")), "{out}");
+        assert!(out.contains(&format!("token: {}", name("aGFuZGxlLXRvay=="))), "{out}");
+        // Echoed later with nothing secret-looking around it, it is still hidden.
+        let (again, n) = redact_with_handles(&format!("value is {pass}."));
+        assert_eq!((again, n), (format!("value is {name_of_pass}."), 1));
+        // A handle is not itself a secret, and plain redaction is unchanged.
+        assert_eq!(redact(&out).1, 0, "{out}");
+        assert_eq!(redact(&format!("DB_PASSWORD={pass}")).0, "DB_PASSWORD=[redacted]");
+        let secret = "kind: Secret\ndata:\n  \"pw\": \"aGFuZGxlLXNlY3JldA==\",\n";
+        let (out, _) = redact_with_handles(secret);
+        assert!(out.contains(&format!("  \"pw\": \"{}\",\n", name("aGFuZGxlLXNlY3JldA=="))), "{out}");
+    }
+
+    #[test]
+    fn a_secret_tool_s_value_field_is_a_secret() {
+        let key = ["tp", "live", "shop", "8c41f0e2b7d9"].join("_");
+        let answer = format!("{{\"version\": 1, \"stage\": \"current\", \"value\": \"{key}\"}}");
+        let (out, n) = redact_tool_output("mcp__simcloud__secret_access", &answer, true);
+        assert_eq!(n, 1, "{out}");
+        assert!(!out.contains(&key) && out.contains("\"stage\": \"current\""), "{out}");
+        assert!(secret_env().iter().any(|(_, v)| *v == key));
+        // Shown again later by any tool, it stays hidden.
+        assert!(!redact_with_handles(&format!("key={key}")).0.contains(&key));
+        // Without handles it is plainly redacted; other tools' value fields are data.
+        assert_eq!(redact_tool_output("mcp__x__get_secret", &answer, false).1, 1);
+        assert_eq!(redact_tool_output("mcp__x__get_config", "{\"value\": \"blue\"}", true).1, 0);
+    }
+
+    #[test]
+    fn short_secrets_are_not_hunted_in_later_output() {
+        let short = ["ab", "12"].concat();
+        let (out, _) = redact_with_handles(&format!("password: {short}"));
+        assert!(out.starts_with("password: ${RUSTY_SECRET_"), "{out}");
+        let later = format!("t{short} and {short}");
+        assert_eq!(redact_with_handles(&later).0, later);
+    }
 
     #[test]
     fn the_working_directory_is_not_a_password() {

@@ -383,6 +383,12 @@ fn bash(args: &Value) -> Result<String> {
     if !stderr.is_empty() {
         let _ = write!(out, "\nstderr:\n{stderr}");
     }
+    if stderr.contains("mcp__") && stderr.contains("not found") {
+        out.push_str(
+            "\nnote: mcp__ tools are tool calls, not shell commands, so bash can't run them. Call the tool \
+             directly, then use what it returned in your command.",
+        );
+    }
     if only_changes_directory(command) {
         out.push_str(
             "\nnote: nothing else ran. Each bash call starts a fresh shell in the working directory, \
@@ -430,6 +436,8 @@ fn run_owned(
     }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Secrets the model saw only as ${RUSTY_SECRET_n} handles.
+    cmd.envs(rusty::privacy::secret_env());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -736,6 +744,13 @@ mod tests {
             assert_eq!(status, expected);
             assert!(started.elapsed() < Duration::from_secs(3));
         }
+    }
+
+    #[test]
+    fn an_mcp_tool_run_from_bash_gets_pointed_back_to_the_tool() {
+        let out = bash(&json!({"command": "mcp__simcloud__db_credentials --env prod"})).unwrap();
+        assert!(out.contains("exit code: 127") && out.contains("tool calls, not shell commands"), "{out}");
+        assert!(!bash(&json!({"command": "nosuchcommand"})).unwrap().contains("mcp__"));
     }
 
     #[test]
