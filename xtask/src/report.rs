@@ -1,5 +1,5 @@
-//! Summarises eval runs: one row per model, then one row per task across
-//! models. Reads one or more target/evals/*.jsonl files (rows from several
+//! Summarises eval runs: one row per model (or model and memory setting, when
+//! rows pin one), then one row per task across them. Reads one or more target/evals/*.jsonl files (rows from several
 //! runs are pooled), prints the tables, writes them next to the first file as
 //! .md, and appends them to $GITHUB_STEP_SUMMARY when set. Fails unless every
 //! scored run passed.
@@ -73,6 +73,14 @@ fn text(r: &Value, key: &str) -> String {
     }
 }
 
+/// What a row is compared by: its model, plus its memory setting if pinned.
+fn key(r: &Value) -> String {
+    match text(r, "memory") {
+        m if m.is_empty() => text(r, "model"),
+        m => format!("{} · {m}", text(r, "model")),
+    }
+}
+
 fn verdict(r: &Value) -> &str {
     r["verdict"].as_str().unwrap_or("")
 }
@@ -99,7 +107,7 @@ fn prefix(s: &str, n: usize) -> String {
 pub fn report(rows: &[Value]) -> String {
     let mut models: Vec<String> = Vec::new();
     for r in rows {
-        let m = text(r, "model");
+        let m = key(r);
         if !models.contains(&m) {
             models.push(m);
         }
@@ -113,7 +121,7 @@ pub fn report(rows: &[Value]) -> String {
         "|---|---|---|---|---|---|---|".to_string(),
     ];
     for m in &models {
-        let mine: Vec<&Value> = rows.iter().filter(|r| &text(r, "model") == m).collect();
+        let mine: Vec<&Value> = rows.iter().filter(|r| &key(r) == m).collect();
         let scored = mine.iter().filter(|r| verdict(r) != "infra").count();
         let passed = mine.iter().filter(|r| verdict(r) == "pass").count();
         let tok: f64 = mine.iter().map(|r| num(r, "prompt") + num(r, "completion")).sum();
@@ -136,8 +144,7 @@ pub fn report(rows: &[Value]) -> String {
         let cells: Vec<String> = models
             .iter()
             .map(|m| {
-                let mut runs: Vec<&Value> =
-                    rows.iter().filter(|r| &text(r, "model") == m && &text(r, "task") == t).collect();
+                let mut runs: Vec<&Value> = rows.iter().filter(|r| &key(r) == m && &text(r, "task") == t).collect();
                 if runs.is_empty() {
                     return String::new();
                 }
@@ -169,12 +176,12 @@ pub fn report(rows: &[Value]) -> String {
 
     let mut misses: Vec<&Value> = rows.iter().filter(|r| matches!(verdict(r), "fail" | "timeout")).collect();
     if !misses.is_empty() {
-        misses.sort_by_key(|r| (text(r, "model"), text(r, "task"), rep(r)));
+        misses.sort_by_key(|r| (key(r), text(r, "task"), rep(r)));
         lines.push(String::new());
         lines.push("Misses:".into());
         for r in misses {
             let why = reason(r).unwrap_or_else(|| verdict(r).to_string());
-            lines.push(format!("- `{}` {} #{}: {}", text(r, "model"), text(r, "task"), rep(r), prefix(&why, 160)));
+            lines.push(format!("- `{}` {} #{}: {}", key(r), text(r, "task"), rep(r), prefix(&why, 160)));
         }
     }
     lines.join("\n")
@@ -237,6 +244,19 @@ Misses:
         assert!(!all_passed(&rows(&format!("{infra}\n"))));
         // A row without `rep` counts as the first run.
         assert!(report(&rows(pass)).contains("| t | 1/1 ✓ |"));
+    }
+
+    #[test]
+    fn memory_settings_are_compared_side_by_side() {
+        let on = r#"{"task": "t", "model": "m", "memory": "v2", "verdict": "pass", "secs": 1, "prompt": 0, "completion": 0}"#;
+        let off = r#"{"task": "t", "model": "m", "memory": "off", "verdict": "fail", "secs": 1, "prompt": 0, "completion": 0}"#;
+        let old = r#"{"task": "t", "model": "m", "verdict": "pass", "secs": 1, "prompt": 0, "completion": 0}"#;
+        let text = report(&rows(&format!("{on}\n{off}\n{old}\n")));
+        assert!(text.contains("| `m · v2` | 1/1 |"), "{text}");
+        assert!(text.contains("| `m · off` | 0/1 |"), "{text}");
+        assert!(text.contains("| `m` | 1/1 |"), "{text}");
+        assert!(text.contains("| task | `m · v2` | `m · off` | `m` |"), "{text}");
+        assert!(text.contains("- `m · off` t #1: fail"), "{text}");
     }
 
     #[test]

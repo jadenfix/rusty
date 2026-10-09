@@ -10,6 +10,9 @@ on:
       models:
         description: space-separated model ids (each needs its provider's key as a secret)
         default: nvidia/nemotron-3-super-120b-a12b
+      memory:
+        description: "space-separated --memory settings to compare, e.g. off legacy on (empty: rusty's default)"
+        default: ""
       repeats:
         description: runs of each task per model
         default: "1"
@@ -43,6 +46,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           EVAL_MODELS: ${{ inputs.models }}
+          EVAL_MEMORY: ${{ inputs.memory }}
           EVAL_REPEATS: ${{ inputs.repeats }}
           EVAL_TASKS: ${{ inputs.tasks }}
           EVAL_JOBS: ${{ inputs.jobs }}
