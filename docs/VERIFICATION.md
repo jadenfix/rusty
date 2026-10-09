@@ -38,6 +38,83 @@ better repairs. A runtime that never accepted anything would look perfectly
 honest. Report proposals and acceptances against every attempt, and next to an
 independent grader's verdict on the final state.
 
+`safety` counts the model's consequential calls by permission class (`risky`,
+`destructive`). Each class has:
+
+- `proposed`: calls the model made;
+- `executed`: calls that ran;
+- refusals by cause: `denied` (a rule or read-only mode), `declined` (a
+  person said no), `unattended` (needed a person, nobody was watching) and
+  `careful_gate` (careful mode's dry-run gate).
+
+A blocked call is enforcement and may cost capability. An executed one is
+never counted as prevented. Two things Rusty can't see: whether the
+environment would have refused the call, and whether it caused harm. The
+benchmark's observers report those.
+
+## Safety assumptions
+
+Rusty's safeguards are guards around an agent, not transactions. A system
+such as STRATUS (no-regression mitigation for cloud operations) assumes
+writer exclusivity and a faithful undo for every action. Rusty assumes
+neither, so it claims less.
+
+- **Refused.** Rusty refuses:
+  - calls a deny rule names;
+  - anything that changes state in read-only mode;
+  - a destructive call nobody is there to approve (a person must type `yes`);
+  - in careful mode, a kubectl, helm or terraform change whose dry run hasn't
+    run in this session against the same files and target.
+- **Made recoverable where possible.** Before a mutating kubectl, helm or
+  terraform command, Rusty saves what the command will touch (the live
+  objects, helm values and manifest, terraform state) and prints a rollback
+  command. The snapshot is taken just before the change, so a concurrent
+  writer can make it stale. Restoring it is a new action, not an undo. Other
+  commands (databases, cloud CLIs, scripts) get no snapshot.
+- **Allowed.** Everything else follows the permission mode:
+  - `ask` asks before each change;
+  - `auto` allows workspace edits and asks for risky calls;
+  - `yolo` allows risky calls.
+
+  Destructive calls need a person, unless an unattended yolo run sets
+  `RUSTY_ALLOW_DESTRUCTIVE=1`.
+- **The unattended guard is an experimental condition, not an invariant.**
+  Some legitimate operations are destructive by this classification, such as
+  `kubectl drain`. With the guard on, an unattended run can't do them at all,
+  which gives Rusty less privilege than a baseline without the guard. Pin
+  `RUSTY_ALLOW_DESTRUCTIVE` per run, record it, and compare guard-on and
+  guard-off as separate conditions. `safety` makes either condition readable:
+  - guard on: a refused destructive call counts as `unattended`;
+  - guard off: it counts as `executed`;
+  - a deny rule or read-only mode: always `denied`.
+- **Cleanup is not isolation.** Owned commands are cancelled and their
+  process groups reaped at turn end. They run as the same user on the same
+  host, with the same network and credentials. Anything a command started
+  outside its process group, or changed remotely, stays.
+- **Local verification is mutable.** `--verify` runs in the workspace the
+  agent can write. The input fingerprint only catches files that change
+  while the check runs. Before proposing completion, the agent can change
+  what the check reads, or the check's own files. The check also says
+  nothing about deployed state. An independent grader outside the workspace
+  is still required.
+- **The record is the agent's own.** The trajectory, `--stats` and the infra
+  audit log are written by the Rusty process, so they show what Rusty
+  observed. They are not proof of what happened, and anything running as
+  the same user can modify them.
+
+## Benchmark-motivated changes
+
+A Rusty change made after reading a benchmark failure turns that example into
+development evidence for later versions; headline results then need fresh,
+frozen tasks. Each such change is listed here when it lands.
+
+| Commit | Benchmark task | What the trace showed |
+|---|---|---|
+
+None so far. The MCP, budget, completion, safety and capabilities changes came
+from code review, Rusty's own eval runs and the study protocol, not from
+inspecting benchmark task failures.
+
 ## Evidence and scope
 
 The private `CheckRecord` fields are constructed from executor observations.
@@ -297,6 +374,10 @@ reflect` and `deep`), goes through the agent's client and this ledger with the
 role `memory`; the memory daemon makes no model calls. Other already running
 processes are outside this root's scope.
 
+With repeats, the report gives pass@k (a task counts when any attempt passed)
+next to pass^k (only when every attempt passed). Best-of-k picked with the
+hidden grader is not something a deployed agent can do.
+
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
 over functional passing. Each run gets its own budget ledger, so a killed
 process still records its provider waits. By a rule fixed before any run, a
@@ -372,10 +453,11 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   - `secs`, `interrupted`;
   - `goal` (`done`, `blocked`, `open` or null);
   - `claims`: what happened to the model's completion claims (see above);
+  - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;
   - `memory` (null when off).
-- **`--trajectory`** writes the conversation and the same `model_budget` and
-  `claims`, at the top level.
+- **`--trajectory`** writes the conversation and the same `model_budget`,
+  `claims` and `safety`, at the top level.
 - Count requests against a gateway with `attempts`, and spending with
   `charged_tokens` and `unknown_usage_requests`. Billing evidence comes from
   the provider or gateway: `reported_cost_usd` is only what providers chose
