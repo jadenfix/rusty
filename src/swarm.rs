@@ -1,6 +1,8 @@
 //! What a swarm's workers share while they run: a board of one-line findings.
 //! Each worker sees what its peers posted since its last step, so the swarm
 //! builds on its own discoveries instead of repeating them.
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Most tasks one swarm call runs; the rest are reported as not run.
@@ -51,6 +53,50 @@ impl Board {
     }
 }
 
+/// Most blind spots named to the lead; the rest are counted.
+const MAX_UNOPENED: usize = 30;
+
+/// Files a worker's tool call opened: `read_file` and `outline` paths, and
+/// any word of a bash command that names an existing file under `cwd`.
+pub fn opened_by(cwd: &Path, tool: &str, args: &serde_json::Value) -> Vec<PathBuf> {
+    let words: Vec<&str> = match tool {
+        "read_file" | "outline" => args["path"].as_str().into_iter().collect(),
+        "bash" => args["command"]
+            .as_str()
+            .unwrap_or("")
+            .split(|c: char| c.is_whitespace() || "'\";|&<>()".contains(c))
+            .collect(),
+        _ => Vec::new(),
+    };
+    words
+        .into_iter()
+        .filter(|w| !w.is_empty() && !w.starts_with('-'))
+        .filter_map(|w| cwd.join(w).canonicalize().ok())
+        .filter(|p| p.is_file() && p.starts_with(cwd))
+        .collect()
+}
+
+/// Files beside the ones the workers opened that none of them did: where a
+/// swarm's blind spots most likely are. Returns the first few, relative to
+/// `cwd`, and how many there are in all.
+pub fn unopened_neighbours(cwd: &Path, opened: &BTreeSet<PathBuf>) -> (Vec<String>, usize) {
+    let dirs: BTreeSet<&Path> = opened.iter().filter_map(|p| p.parent()).collect();
+    let mut missed: Vec<String> = dirs
+        .into_iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && !opened.contains(p))
+        .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.') || n.ends_with(".lock")))
+        .filter_map(|p| p.strip_prefix(cwd).ok().map(|r| r.display().to_string()))
+        .collect();
+    missed.sort();
+    let total = missed.len();
+    missed.truncate(MAX_UNOPENED);
+    (missed, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +113,26 @@ mod tests {
         assert_eq!(b.unseen(1, &mut seen_b), vec!["[auth] token check skipped at api.rs:42"]);
         assert_eq!(b.summary().lines().count(), 2);
         assert_eq!(b.post(2, "x", "  "), "nothing to share");
+    }
+
+    #[test]
+    fn blind_spots_are_the_unopened_files_beside_the_opened_ones() {
+        let dir = std::env::temp_dir().join(format!("rusty-swarm-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("shop")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        for f in ["shop/cart.py", "shop/tax.py", "shop/pricing.py", "shop/.cache", "docs/guide.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let cwd = dir.canonicalize().unwrap();
+        let mut opened = BTreeSet::new();
+        opened.extend(opened_by(&cwd, "read_file", &serde_json::json!({"path": "shop/cart.py"})));
+        opened.extend(opened_by(&cwd, "bash", &serde_json::json!({"command": "sed -n 1,40p shop/pricing.py | head"})));
+        opened.extend(opened_by(&cwd, "bash", &serde_json::json!({"command": "cat /etc/hostname nosuch.py"})));
+        assert_eq!(opened.len(), 2, "{opened:?}");
+        // docs/ was never visited, so it is not a blind spot of this swarm.
+        assert_eq!(unopened_neighbours(&cwd, &opened), (vec!["shop/tax.py".to_string()], 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
