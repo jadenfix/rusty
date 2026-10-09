@@ -30,6 +30,58 @@ const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue
 const WORKER_STEPS: usize = 30;
 const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
 
+/// What happened to the consequential calls the model made, by permission
+/// class: proposed, then either executed or blocked and by what. Kept apart
+/// so a runtime that blocks a call gets the credit (and the capability cost)
+/// and an action that ran is never counted as prevented. Whether the
+/// environment would have refused it, or whether it caused harm, is for the
+/// benchmark's own observers to say.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Safety {
+    pub risky: Calls,
+    pub destructive: Calls,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Calls {
+    pub proposed: u64,
+    pub executed: u64,
+    /// A deny rule or read-only mode refused it.
+    pub denied: u64,
+    /// A person said no.
+    pub declined: u64,
+    /// It needed a person and nobody was watching.
+    pub unattended: u64,
+    /// Careful mode's dry-run gate refused it.
+    pub careful_gate: u64,
+}
+
+impl Safety {
+    /// Records one consequential call from its class and what dispatch said.
+    fn record(&mut self, class: &crate::permissions::Class, out: &str) {
+        use crate::permissions::Class;
+        let calls = match class {
+            Class::Risky(_) => &mut self.risky,
+            Class::Destructive(_) => &mut self.destructive,
+            _ => return,
+        };
+        calls.proposed += 1;
+        let declined = out.starts_with("the user declined");
+        let slot = if out.starts_with("denied") {
+            &mut calls.denied
+        } else if declined && (out.contains("nobody is watching") || out.contains("non-interactive session")) {
+            &mut calls.unattended
+        } else if declined {
+            &mut calls.declined
+        } else if out.starts_with("blocked by careful mode") {
+            &mut calls.careful_gate
+        } else {
+            &mut calls.executed
+        };
+        *slot += 1;
+    }
+}
+
 /// What happened to the model's claims that a goal is done, kept apart from
 /// whether the work is right: a runtime that refuses every claim looks honest
 /// without being useful, so proposals and acceptances are counted against
@@ -165,6 +217,7 @@ pub struct Agent {
     /// Observations are exported, but never reloaded as acceptance authority.
     pub verification_records: Vec<CheckRecord>,
     pub completion: Completion,
+    pub safety: Safety,
     pub activities: crate::activity::Activities,
     loop_ctl: Option<LoopCtl>,
     pub agents: AgentsConfig,
@@ -240,6 +293,7 @@ impl Agent {
             goal_check: None,
             verification_records: Vec::new(),
             completion: Completion::default(),
+            safety: Safety::default(),
             activities: crate::activity::Activities::default(),
             loop_ctl: None,
             agents: AgentsConfig::default(),
@@ -742,6 +796,7 @@ impl Agent {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
                     let mut out = self.dispatch(call, &mut d);
+                    self.safety.record(&class, &out);
                     // Only a call that actually ran changes anything.
                     let refused =
                         ["denied", "the user declined", "blocked by careful mode"].iter().any(|p| out.starts_with(p));
@@ -1831,6 +1886,7 @@ impl Agent {
             "goal": self.goal,
             "verification": self.verification_records,
             "completion": self.completion,
+            "safety": self.safety,
             "activities": self.activities.records(),
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},

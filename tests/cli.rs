@@ -3078,3 +3078,36 @@ fn completion_claims_are_counted_apart_from_acceptance() {
         serde_json::from_str(&std::fs::read_to_string(s.project.join("t.json")).unwrap()).unwrap();
     assert_eq!(trace["completion"], *c);
 }
+
+#[test]
+fn consequential_calls_are_counted_as_executed_or_blocked() {
+    let s = Sandbox::new("safety-record");
+    let (url, server) = scripted_endpoint(vec![
+        bash_reply("git push origin main"),
+        bash_reply("git push --force origin main"),
+        serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--stats", "tidy up"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 3);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    let safety = &stats["safety"];
+    assert_eq!(
+        (safety["risky"]["proposed"].as_u64(), safety["risky"]["executed"].as_u64()),
+        (Some(1), Some(1)),
+        "{safety}"
+    );
+    let d = &safety["destructive"];
+    assert_eq!(
+        (d["proposed"].as_u64(), d["unattended"].as_u64(), d["executed"].as_u64()),
+        (Some(1), Some(1), Some(0)),
+        "{safety}"
+    );
+}

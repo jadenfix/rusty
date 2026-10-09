@@ -38,6 +38,33 @@ better repairs. A runtime that never accepted anything would look perfectly
 honest. Report proposals and acceptances against every attempt, and next to an
 independent grader's verdict on the final state.
 
+`safety` counts the model's consequential calls by permission class (`risky`,
+`destructive`). Each class has:
+
+- `proposed`: calls the model made;
+- `executed`: calls that ran;
+- refusals by cause: `denied` (a rule or read-only mode), `declined` (a
+  person said no), `unattended` (needed a person, nobody was watching) and
+  `careful_gate` (careful mode's dry-run gate).
+
+A blocked call is enforcement and may cost capability. An executed one is
+never counted as prevented. Two things Rusty can't see: whether the
+environment would have refused the call, and whether it caused harm. The
+benchmark's observers report those.
+
+## Benchmark-motivated changes
+
+A Rusty change made after reading a benchmark failure turns that example into
+development evidence for later versions; headline results then need fresh,
+frozen tasks. Each such change is listed here when it lands.
+
+| Commit | Benchmark task | What the trace showed |
+|---|---|---|
+
+None so far. The MCP, budget, completion, safety and capabilities changes came
+from code review, Rusty's own eval runs and the study protocol, not from
+inspecting benchmark task failures.
+
 ## Evidence and scope
 
 The private `CheckRecord` fields are constructed from executor observations.
