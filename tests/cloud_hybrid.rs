@@ -465,7 +465,7 @@ esac
 #[test]
 fn three_modes_run_parallel_swarms_with_all_remote_tools_and_local_memory() {
     let mut h = Hybrid::new("modes");
-    for (mode, memory) in [("standard", "off"), ("vibe", "off"), ("careful", "on")] {
+    for (mode, memory) in [("standard", "off"), ("vibe", "off"), ("careful", "learn")] {
         std::fs::write(h.remote.join("source.py"), "def add(a,b):\n    return a - b\n").unwrap();
         let _ = std::fs::remove_file(h.remote.join("note.txt"));
         let _ = std::fs::remove_file(h.remote.join("result.txt"));
@@ -473,7 +473,7 @@ fn three_modes_run_parallel_swarms_with_all_remote_tools_and_local_memory() {
         h.machine().peak.store(0, Ordering::SeqCst);
         let (server, shared) = model();
         let trajectory = h.tmp.path().join(format!("{mode}.json"));
-        if memory == "on" {
+        if memory == "learn" {
             let mut c = Command::new(MEMORYD);
             c.arg("--home").arg(&h.home).env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &h.home);
             h.daemon = Some(c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
@@ -512,7 +512,7 @@ fn three_modes_run_parallel_swarms_with_all_remote_tools_and_local_memory() {
         assert!(!serde_json::to_string(&calls).unwrap().contains("offline-model-key"));
         assert_eq!(shared.0.lock().unwrap().checker_requests, usize::from(mode == "careful"), "{mode}");
         assert_eq!(trace["memory_mode"], memory);
-        if memory == "on" {
+        if memory == "learn" {
             assert!(trace["memory"]["hooks"].as_u64().unwrap() > 0);
             assert_eq!(trace["memory"]["timeouts"], 0);
         }

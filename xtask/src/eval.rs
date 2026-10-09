@@ -23,8 +23,8 @@
 //! each rusty process in seconds; EVAL_TRANSCRIPTS=0 drops the miss details
 //! from the log. The summary compares models.
 //!
-//! EVAL_MEMORY="off legacy on" runs every model under each memory setting
-//! (any value `rusty --memory` takes). Each row records its
+//! EVAL_MEMORY="off recall learn reflect" runs every model under each memory
+//! level (any value `rusty --memory` takes). Each row records its
 //! setting and the summary groups by model and memory. Unset, rusty's own
 //! default applies and rows carry no memory field.
 //!

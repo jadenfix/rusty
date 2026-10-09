@@ -33,7 +33,7 @@ pub struct HybridArgs {
     pub swarm_max: u8,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, default_value = "on", value_parser = ["legacy", "off", "on", "deep"])]
+    #[arg(long, default_value = "learn", value_parser = ["off", "legacy", "recall", "learn", "reflect", "deep"])]
     pub memory_mode: String,
     #[arg(long, default_value = "auto", value_parser = ["read-only", "ask", "auto", "yolo"])]
     pub permissions: String,

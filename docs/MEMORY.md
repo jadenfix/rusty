@@ -1,193 +1,173 @@
-# Optional proactive memory
+# Memory
 
-Build/install both executables (`cargo install --path .`). The normal CLI remains
-one binary; the advisor is an optional second binary, `rusty-memoryd`, installed
-beside it. No Python, vector database, downloaded embeddings or model weights
-are required locally. Unix sockets currently support macOS and Linux.
+`rusty-memoryd` is a small local daemon beside `rusty`, started on demand over
+a Unix socket (macOS and Linux). It holds lessons in SQLite and decides which
+one, if any, is worth showing the model. It never runs tools and never calls a
+model; the one model request memory makes goes through the agent's own client
+and budget. No Python, vector database or downloaded weights are needed.
 
 ```sh
-rusty --memory on "find the monorepo and inspect its workspace"
-rusty --memory deep --mode careful "investigate the failed migration"
+rusty --memory learn --goal "fix the failing tests" --verify "make check"
+rusty --memory recall "where do we deploy from?"
 rusty --memory off "fix this small bug"
 ```
 
-| Memory mode | Work |
-|---|---|
-| `legacy` (default) | Existing JSONL/BM25 memory; compatibility with current users. |
-| `off` | No advisor hooks, recall or writes from this agent. |
-| `on` | Local L1/L2 advisor with an online intervention selector; no advisor model calls. |
-| `deep` | Same fast path plus bounded background model analysis after failures or periodic tool observations. |
+## Levels
 
-These are independent of `careful`, `standard`, `vibe`, delegation and tool
-permissions. Careful still uses the existing single read-only checker. Deep
-memory does not add review rounds or authorize commands. A service startup
-failure degrades to memory off. Runtime hook failures return no advice.
+Each level includes the ones above it. Higher levels capture more, offer
+lessons more readily and prune harder, since more capture means more noise.
 
-```mermaid
-flowchart LR
-  User --> Agent["rusty: coding loop + tools"]
-  Agent -->|"begin / tool result / finish"| Service["rusty-memoryd: local Unix socket"]
-  Service -->|"0 or 1 bounded next-step hint"| Agent
-  Service --> L1["L1: versioned request + last 8 observations"]
-  Service <--> L2["L2: SQLite packed lessons/evidence + feedback policy"]
-  L1 -->|"deep mode, bounded queue"| Teacher["background model: proposed next step + evidence IDs"]
-  Teacher -->|"only matching state version"| Service
-```
+| Level | What it adds | Offered when score ≥ / per turn | Retired when |
+|---|---|---|---|
+| `off` | No memory. | – | – |
+| `legacy` | The older JSONL store, without the advisor. | – | – |
+| `recall` | Offers lessons you or the agent saved that match the request. Your preferences are added to every prompt. | 0.25 / 1 | an unvouched lesson has had no success in 28 days |
+| `learn` | The last four tool calls (arguments and error lines) join the request. Lessons record the files they describe and are re-checked before use. A goal's `--verify` check credits or charges the lessons it was offered. | 0.15 / 2 | mean < 0.3 after 2+ outcomes, or 28 days |
+| `reflect` | After a checked goal, one budgeted request says which offered lessons the work used and, only after a pass, keeps up to two short new lessons. Compaction's lessons are kept too. | 0.15 / 2 | mean < 0.35, or 21 days |
+| `deep` | Up to three new lessons per pass and more offered per turn. | 0.10 / 3 | mean < 0.4, or 14 days |
 
-## What learns today
+## How a lesson is chosen
 
-The selector is a small online logistic model with four inputs: bias, lexical
-overlap, smoothed explicit usefulness feedback, and whether a lesson is a
-preference. Candidate filtering is lexical; the intervention decision is learned.
-Initial weights and threshold are engineering defaults, **not calibrated
-probabilities or a claim of optimal retrieval**. Strongly relevant saved facts
-can resolve aliases such as a monorepo URL. Unmatched aliases remain unknown.
+Each lesson is scored **relevance × confidence × freshness**, and the best one
+above the level's threshold is offered as one short line.
 
-`/memory helpful` and `/memory harmful` rate the most recently delivered L2
-intervention in this session and update the project policy. Task completion
-alone is not treated as proof that a memory helped. The policy survives daemon
-restarts. This improves the advisor; it does not fine-tune the coding model.
+- **Relevance** is BM25 (k1 1.2, b 0.75) over an inverted index. Identifiers
+  are kept whole and split into their parts (`parseConfig`, `gen_fixtures`,
+  `src/tax_rate.rs`), so "tax rate" finds `taxRate`; plain words are lightly
+  stemmed ("tests" meets "test", "rounding" meets "round"). A lesson's anchored
+  paths count twice. The IDF is smoothed, ln((1+N)/(1+df)) + 1, so a word every
+  lesson shares still counts once; Okapi's own IDF drops it to nearly zero,
+  which leaves a store of similar lessons unable to match anything. The score
+  maps to 0-1 as s / (s + 2): one shared everyday word gives 0.33, three give
+  0.6. A search touches only the lessons that share a term with the query.
+- **Confidence** is a Beta posterior over outcomes, its mean less half a
+  standard deviation. You saving a lesson counts as three successes and a
+  failure; the agent, compaction or reflection count as one of each. Being
+  shown never changes it. A lesson the agent saved starts at 0.36, reaches
+  0.55 after one verified success and drops to 0.21 after one failure.
+- **Freshness** is 1 when every anchored file still has the git blob id it had
+  when the lesson was saved, 0.5 when one changed (the advice then says which
+  to re-check), and 0 when one is missing; the lesson is kept, since another
+  branch may still have the file. Blob ids are cached by size and mtime, so a
+  hook only `stat`s files it has already hashed.
 
-Deep analysis sees the bounded L1 request and observed tool evidence. It can
-propose one next step or stay silent. Evidence IDs must exist in the supplied
-observations; this checks provenance references, not semantic correctness.
-Queued jobs are skipped before inference when their state version is stale.
-Late proposals are discarded when the state version has changed. It cannot run
-tools or write reusable lessons. If a fresh hint arrives during main-model
-inference, deep mode can reconsider an unexecuted tool proposal before dispatch.
-This costs another coding-model request and is counted in the normal request
-totals; it is bounded by the four-intervention budget. It does not force another
-review after the task is done. Durable lessons come from `remember`, explicit
-user saves, or the CLI's existing context-compaction extraction; they are marked
-as saved but not independently verified. Nothing is promoted merely on eviction.
+Preferences are not ranked: they apply everywhere, so `begin` returns them
+(this project's and global ones, `rusty-memoryd remember --global`) for the
+system prompt every turn, and they never crowd lessons out of the advice slots.
 
-This is an initial usable service, not yet a trained behavior predictor. A next
-experiment is to collect explicitly rated interventions and held-out user
-corrections, then compare this selector with a learned ranker. Do not train on
-success labels without controlling for task difficulty and credit attribution.
+## How memory learns and forgets
+
+- **Credit is narrow.** Only a goal's fixed check counts. A pass credits the
+  lessons the goal was offered (with `reflect`, only those the model says the
+  work relied on); a fail charges the same set. A timeout or interruption
+  teaches nothing, and without `--verify` nothing is credited: a model saying
+  it finished is not evidence. `/memory helpful` and `/memory harmful` count as
+  two outcomes.
+- **New lessons start as candidates.** Reflection may only add lessons after a
+  pass, each one sentence under 200 characters naming its files; the parser
+  drops anything else, including invented preferences.
+- **Near-duplicates merge.** A new lesson whose terms overlap an existing one
+  of the same kind by 80% or more refreshes it instead of splitting its
+  outcomes across copies.
+- **Retirement** deletes and tombstones a lesson, so an import can't bring it
+  back. It runs in SQL when a project's lessons are loaded and after credit.
+  Only a success restarts the expiry clock; your own lessons never expire.
+- **A full store** (512 lessons) evicts the least trusted lesson nobody
+  vouched for. Eviction is about space, so it leaves no tombstone.
+
+## Why these choices
+
+- Adding every experience makes agents worse, because they copy retrieved
+  records, mistakes included; strict selective addition plus deletion of
+  low-utility records gave about +10% over naive growth
+  ([Xiong et al., ACL 2026](https://arxiv.org/abs/2505.16067)).
+- Itemised lessons with helpful and harmful counters, refined in place, beat
+  rewriting a summary ([ACE, ICLR 2026](https://arxiv.org/abs/2510.04618);
+  [ExpeL](https://arxiv.org/abs/2308.10144)).
+- On real repository tasks, short procedural lessons anchored to the files
+  they fix help a little; long transcripts and general-purpose memory systems
+  mostly hurt, and irrelevant text costs a few points
+  ([VibeMemBench](https://arxiv.org/abs/2609.23570);
+  [SWE-ContextBench](https://arxiv.org/abs/2602.08316)). Hence one short line at
+  a time, and a threshold below which nothing is offered.
+- GitHub's Copilot Memory checks each memory's code citations before use and
+  drops memories unused for 28 days
+  ([docs](https://docs.github.com/en/copilot/concepts/agents/copilot-memory)).
+- Keeping identifiers whole and split roughly doubled BM25's nDCG@10 on a code
+  retrieval set ([arXiv 2605.18561](https://arxiv.org/abs/2605.18561), preprint).
+
+**What BM25 can't do.** Lessons and queries here are short and full of exact
+names, paths, commands and error text, which is where lexical matching is
+strongest. It cannot bridge vocabulary: "tests" never meets `pytest`, nor
+"rounding" `quantize`. Stemming narrows that a little, anchored paths match
+the files a task touches, and the agent can search in its own words with the
+`recall` tool. Dense embeddings would close more of the gap but need
+downloaded weights; revisit them if evals show missed recalls.
+
+The constants (priors, the half deviation, thresholds, 0.3-0.4, 14-28 days)
+are engineering defaults, **not fitted values**. Compare levels with
+`EVAL_MEMORY="off recall learn reflect deep"` and repeats, and pin `--memory`
+in any experiment. `evals/multi/stale-anchor` moves a project's prices between
+sessions so a remembered location turns stale; `evals/multi/poisoned-lesson`
+plants a wrong rounding rule that memory should stop offering once checks fail.
 
 ## Bounded hot path and disk
 
-- L1: RAM only, at most 32 sessions, each with a 4 KiB request and eight
-  observations of at most 1 KiB arguments and 2 KiB output. Coding hooks do not
-  write a database journal or checkpoint. Finish clears request/observations;
-  a daemon restart loses L1 but preserves L2.
-- Hooks: bounded queue of eight; caller waits at most 50 ms. The transport has a
-  200 ms timeout so abandoned work also drains. Startup can take up to two
-  seconds; explicit memory management has a separate one-second deadline.
-- Advice: at most 800 bytes (`on`) or 1600 (`deep`), at most two/four
-  interventions per turn, respectively. Repeated lessons are suppressed.
-- L2: at most 512 active lessons across the local store. Text and evidence
-  use gzip when smaller, otherwise bounded raw UTF-8. Existing plain-text
-  lesson columns are migrated to packed blobs at service startup. The SQLite
-  database has a 16 MiB page quota, a 512 KiB page-cache target, in-memory
-  temporary tables and frequent WAL checkpoints with a 64 KiB retained-journal
-  target. These targets are not a hard whole-process or whole-folder quota.
-  Old duplicated event/checkpoint tables are removed and vacuumed once at
-  upgrade; no vacuum runs on the coding path.
-- Deep: one background worker, queue of four, at most four jobs per turn,
-  20-second request timeout.
-  The NVIDIA default model gets low reasoning effort and a 512-token reasoning
-  budget within a 2048-token output cap. Other providers get a generic request.
+- Sessions: RAM only, at most 32, each with a 4 KiB request and the last four
+  observations (1 KiB arguments, 2 KiB output). Hooks never write to disk; a
+  daemon restart loses sessions but keeps lessons.
+- Hooks: a queue of eight; the caller waits at most 50 ms, and the transport
+  times out at 200 ms so abandoned work drains. Management calls get a second.
+- Lessons: at most 512 across the store, plain TEXT rows indexed by project.
+  SQLite has a 16 MiB page quota, a 512 KiB page cache, in-memory temporary
+  tables and frequent WAL checkpoints. A store from an older schema is dropped
+  and recreated, not migrated.
 
-Socket/files/directories use 0600/0600/0700. Persistence refuses symlinked
-memory directories and files. A shared redactor covers Rusty hooks, direct
-service saves, imports, session/trajectory JSON, history and audit metadata.
-Imports containing recognizable credentials are rejected instead of silently
-changing canonical lesson IDs. Startup sanitizes older saved lessons; unsafe
-old IDs become tombstones. L1/tool observations are never written by the advisor.
-The CLI's sessions/history and explicitly saved L2 lessons remain intentional
-persistence; `--memory off` disables memory, not these separate session files.
-Infrastructure snapshots containing recognizable secrets are refused rather
-than persisting secrets or creating a redacted, invalid rollback artifact.
+Socket, files and directories use 0600/0600/0700, and persistence refuses
+symlinks. One redactor covers hooks, saves, imports, session and trajectory
+JSON, history and audit metadata; imports containing recognizable credentials
+are rejected. It covers known token shapes, credential fields and configured
+secret values, not arbitrary or encoded secrets. Files are access-controlled,
+not encrypted. Secure deletion and WAL truncation reduce retained bytes but
+don't erase swap, snapshots, backups or exported files.
 
-The redactor covers known token shapes, credential fields and configured secret
-values. It is not an exhaustive detector of arbitrary or encoded secrets. These
-files are access-controlled, not encrypted. SQLite secure deletion and WAL
-truncation reduce retained deleted bytes, but do not erase OS swap, filesystem
-snapshots, backups or already exported files. A forgotten lesson's tombstone
-prevents old imports from resurrecting it. Imports preserve the local feedback
-policy and reset imported lesson utility. The sidecar does not import legacy or
-global memory automatically; all companion lessons, including preferences, are
-project scoped.
-
-`/memory status` shows L1 counts, RAM-only persistence, learning updates,
-and background model requests/tokens/time. `--stats` and `--trajectory` include
-hook counts, deadlines missed, injections, total hook time and maximum hook time.
-The background-model totals are separate from the coding-model totals.
+`/memory` lists lessons with confidence, outcome counts, source and anchored
+files; `/memory status` shows counts for the project. `--stats` and
+`--trajectory` include hook counts, missed deadlines, injections and hook time.
 
 ## Local operation and cloud transfer
 
-The CLI starts the daemon on demand. To set its model environment explicitly:
-
-```sh
-RUSTY_MEMORY_MODEL=nvidia/nemotron-3-super-120b-a12b rusty-memoryd
-```
-
-Keep the same `RUSTY_PROJECT_ID` locally and in the cloud. Without an explicit
-identity, worktrees sharing a Git common directory share memory; unrelated
-clones do not. The daemon keeps the environment it was started with; restart it
-when changing provider/model settings (`rusty-memoryd stop`, then start it
-again). Automatically started daemons have their own process group, so stopping
-a coding turn with Ctrl-C does not terminate memory. The binary supports an isolated
-`--home` / `RUSTY_HOME` for separate accounts or experiments.
+Keep the same `RUSTY_PROJECT_ID` locally and in the cloud. Without one,
+worktrees sharing a Git common directory share memory; unrelated clones do
+not. Automatically started daemons have their own process group, so Ctrl-C in
+a coding turn doesn't stop memory. `--home` / `RUSTY_HOME` isolates a store.
 
 ```sh
 export RUSTY_PROJECT_ID=https://github.com/you/project
 rusty-memoryd remember --kind fact "The monorepo URL is https://github.com/you/project"
-rusty-memoryd status
+rusty-memoryd remember --kind preference --global "Answer in British English"
+rusty-memoryd list
 rusty-memoryd export project-memory.json.gz
-rusty-cloud run --repo "$RUSTY_PROJECT_ID" --memory-mode on \
+rusty-cloud run --repo "$RUSTY_PROJECT_ID" --memory-mode learn \
   --memory-input project-memory.json.gz --project-id "$RUSTY_PROJECT_ID" \
   --goal "fix the failing tests"
 ```
 
-Snapshots are scoped gzip JSON exports through the live service, not copies of
-an active SQLite/WAL database. The export file is private and created without
-replacing an existing file. Import with `rusty-memoryd import <file>` after
-setting the matching project ID. An unrelated scope or invalid lesson ID fails
-before modifying the database. There is no automatic cross-machine merge of
-feedback weights; each machine retains its local learner.
+Exports are scoped gzip JSON through the live service, never copies of an
+active database, and are created without replacing an existing file. Imports
+need the same project and schema version; outcomes don't travel, so an
+imported lesson earns trust again. The Daytona launcher uploads an optional
+memory snapshot, runs the daemon inside the same sandbox as the coding
+process, and exports `memory.json.gz` with the results.
 
-The Docker export and Daytona snapshot now include both binaries and hash both
-into the snapshot identity. The Daytona launcher uploads an optional memory
-snapshot, runs the service **inside the same sandbox** as the coding process,
-and exports `memory.json.gz` alongside the task results. Cloud session archives
-exclude raw advisor database/WAL/socket files. A missing memory export preserves
-the sandbox. This avoids a network hop for each memory hook; no Vercel service
-is required on the hot path. Hosted Daytona execution still needs its own live
-qualification; local shell stand-ins verify the launcher lifecycle.
+## Checks
 
-## Checks and acceptance evidence
-
-`cargo xtask qa` includes service tests and a real-CLI offline provider smoke.
-The latter verifies `write_file`, `read_file`, `edit_file`, Bash execution,
-the exact two-byte note payload, a preserved sentinel, scoped hint injection, memory off,
-hook deadlines and a generous tool/repetition budget.
-
-```sh
-cargo xtask memory-smoke --live --binary target/release/rusty \
-  --report memory-live.json
-```
-
+`cargo xtask qa` includes the service tests and an offline smoke through the
+real CLI at every level: file edits, Bash, a preserved sentinel, lesson
+injection, memory off, hook deadlines and tool budgets.
+`cargo xtask memory-smoke --live` runs the same cases on a hosted model, and
+`memory-live.yml` runs them only when dispatched by hand.
 `cargo xtask memory-bench` fills a store with 512 lessons and times 100 advice
-calls over the real socket against `target/release/rusty-memoryd`; it passes
-when p95 is under 20 ms and storage under 20 MiB.
-
-The verifiers and receipts stay outside the task directory. Each run records
-wall time, tokens, tools, repeated calls, hook metrics, background model metrics
-and local storage bytes. A provider failure or timeout has its own classification
-and remains a failed CI run; it is never silently counted as success.
-
-The easy smoke defaults to NVIDIA-hosted Nemotron Super in `vibe` mode;
-use `--model` to qualify another model. This is
-separate from the normal CLI default and the deep advisor model.
-
-GitHub's `memory-live.yml` runs the six easy cases only when manually dispatched,
-using the repository `NVIDIA_API_KEY` secret. Pushes and merges never start model
-calls automatically. It
-does not expose a secret to forked PRs. Deterministic checks run separately in
-`ci.yml`. This checks regression and overhead on small tasks, not FullStack-Bench
-performance or evidence that memory improves hard-task success. Establish that
-with paired, repeated off/on/deep trials and independently verified outcomes
-before changing the default mode or the inference policy.
+calls over the real socket; it passes when p95 is under 20 ms and storage
+under 20 MiB. None of this shows that memory improves hard tasks; establish
+that with paired, repeated trials across levels.

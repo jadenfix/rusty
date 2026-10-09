@@ -24,7 +24,7 @@ use crate::tips;
 use crate::tools;
 use crate::ui;
 use crate::verification::{self, CheckRecord, CheckSpec};
-use rusty::advisor::{Hooks, Mode as MemoryMode};
+use rusty::advisor::{Hooks, Level};
 
 const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
@@ -134,7 +134,7 @@ pub struct Agent {
     trajectory_saved: Option<Instant>,
     pub policy: Policy,
     pub memory: Memory,
-    pub memory_mode: MemoryMode,
+    pub memory_level: Level,
     pub advisor: Option<Hooks>,
     pub plan: Vec<PlanItem>,
     pub goal: Option<Goal>,
@@ -168,18 +168,25 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Saves what the user asked to remember.
     pub fn remember(&mut self, kind: &str, text: &str, global: bool) -> String {
-        if self.memory_mode == MemoryMode::Off {
+        self.remember_as(kind, text, global, "user", &[])
+    }
+
+    /// Saves a memory vouched for by `source` (user, agent, compaction or
+    /// reflect), anchored to `files` when the advisor checks anchors.
+    fn remember_as(&mut self, kind: &str, text: &str, global: bool, source: &str, files: &[String]) -> String {
+        if self.memory_level == Level::Off {
             return "memory is off".into();
         }
         if let Some(h) = &mut self.advisor {
-            return h.control("remember", json!({"kind":kind,"text":infra::redact(text).0,"global":false})).text;
+            return h.remember(kind, &infra::redact(text).0, source, files, global && kind == "preference").text;
         }
         self.memory.add(kind, text, global)
     }
 
     pub fn forget_memory(&mut self, id: &str) -> String {
-        if self.memory_mode == MemoryMode::Off {
+        if self.memory_level == Level::Off {
             return "memory is off".into();
         }
         if let Some(h) = &mut self.advisor {
@@ -213,7 +220,7 @@ impl Agent {
             trajectory_saved: None,
             policy,
             memory,
-            memory_mode: MemoryMode::Legacy,
+            memory_level: Level::Legacy,
             advisor: None,
             plan: Vec::new(),
             goal: None,
@@ -437,7 +444,7 @@ impl Agent {
             s.push_str(&self.project_notes);
             s.push('\n');
         }
-        let (mem, ids) = if self.memory_mode == MemoryMode::Legacy {
+        let (mem, ids) = if self.memory_level == Level::Legacy {
             self.memory.context_block(query, context::MEMORY_CHARS)
         } else {
             (String::new(), Vec::new())
@@ -445,6 +452,10 @@ impl Agent {
         if !mem.is_empty() {
             s.push_str("\nMemories relevant to this request (from earlier sessions; verify before relying on them):\n");
             s.push_str(&mem);
+        }
+        if let Some(prefs) = self.advisor.as_ref().map(Hooks::preferences).filter(|p| !p.is_empty()) {
+            s.push_str("\nThe user's saved preferences:\n");
+            s.push_str(prefs);
         }
         if let Some(g) = &self.goal {
             s.push_str(&format!("\nCurrent goal (keep working until it is done and verified): {}\n", g.objective));
@@ -509,7 +520,8 @@ impl Agent {
             json!({
                 "kind": {"type": "string", "enum": KINDS},
                 "text": {"type": "string", "description": "One self-contained sentence"},
-                "global": {"type": "boolean", "description": "True for user preferences that apply to every project"}
+                "global": {"type": "boolean", "description": "True for user preferences that apply to every project"},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Files the memory is about, so it is re-checked when they change"}
             }),
             &["kind", "text"],
         ));
@@ -659,17 +671,6 @@ impl Agent {
             }
             self.trace(&reply, started.elapsed());
 
-            // Fresh background analysis can arrive while the main model thinks.
-            // Reconsider an unexecuted tool proposal at most within the advisor budget.
-            if !reply.tool_calls.is_empty() {
-                if let Some(h) = &mut self.advisor {
-                    let advice = h.late_advice();
-                    if !advice.is_empty() {
-                        self.history.push(json!({"role":"user","content":advice}));
-                        continue;
-                    }
-                }
-            }
             let mut msg = json!({"role": "assistant", "content": reply.content});
             if !reply.tool_calls.is_empty() {
                 msg["tool_calls"] = Value::Array(
@@ -973,11 +974,21 @@ impl Agent {
         d.tool(&call.name, &args);
         let result = match call.name.as_str() {
             "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
-            "remember" => Ok(self.remember(
-                args["kind"].as_str().unwrap_or("fact"),
-                args["text"].as_str().unwrap_or(""),
-                args["global"].as_bool().unwrap_or(false),
-            )),
+            "remember" => {
+                let files: Vec<String> = args["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f.as_str().map(String::from))
+                    .collect();
+                Ok(self.remember_as(
+                    args["kind"].as_str().unwrap_or("fact"),
+                    args["text"].as_str().unwrap_or(""),
+                    args["global"].as_bool().unwrap_or(false),
+                    "agent",
+                    &files,
+                ))
+            }
             "recall" => Ok(self.recall(args["query"].as_str().unwrap_or(""))),
             "forget" => {
                 let id = args["id"].as_str().unwrap_or("");
@@ -1283,7 +1294,7 @@ impl Agent {
     }
 
     fn recall(&mut self, query: &str) -> String {
-        if self.memory_mode == MemoryMode::Off {
+        if self.memory_level == Level::Off {
             return "memory is off".into();
         }
         if let Some(h) = &mut self.advisor {
@@ -1497,8 +1508,20 @@ impl Agent {
         "goal closed".into()
     }
 
-    /// Works on a goal across as many turns as it takes, up to a limit.
+    /// Works on a goal across as many turns as it takes, up to a limit, then
+    /// lets memory learn from how its fixed acceptance check ended.
     pub fn run_goal(&mut self, objective: Option<&str>) -> Result<()> {
+        // A new goal clears the records; a resumed one keeps its earlier ones.
+        let first = if objective.is_some() { 0 } else { self.verification_records.len() };
+        if let Some(h) = &mut self.advisor {
+            h.take_delivered();
+        }
+        let result = self.drive_goal(objective);
+        self.learn_from_goal(first);
+        result
+    }
+
+    fn drive_goal(&mut self, objective: Option<&str>) -> Result<()> {
         let mut prompt = match objective {
             Some(obj) => {
                 self.verification_records.clear();
@@ -1576,6 +1599,66 @@ impl Agent {
                 context::NOTE
             );
         }
+    }
+
+    /// Credits or charges the lessons a goal used by its last fixed check
+    /// (pass or fail; a timeout or interruption teaches nothing). With
+    /// reflect, the model first says which offered lessons it actually used
+    /// and, only after a pass, distils at most two new ones.
+    fn learn_from_goal(&mut self, first: usize) {
+        let Some(h) = &mut self.advisor else { return };
+        let level = h.level;
+        let delivered = h.take_delivered();
+        if !level.credits() {
+            return;
+        }
+        let Some(passed) =
+            self.verification_records.get(first..).and_then(<[CheckRecord]>::last).and_then(CheckRecord::verdict)
+        else {
+            return;
+        };
+        let mut used: Vec<String> = delivered.iter().map(|(id, _)| id.clone()).collect();
+        if level.reflects() && !signal::interrupted() && self.client.budget.remaining().is_ok() {
+            if let Some(r) = self.reflect(passed, &delivered, level.new_lessons()) {
+                used = r.used;
+                for l in r.lessons {
+                    self.remember_as(&l.kind, &l.text, false, "reflect", &l.files);
+                }
+            }
+        }
+        if let (Some(h), false) = (&mut self.advisor, used.is_empty()) {
+            h.control("credit", json!({"ids": used, "verified": if passed { "pass" } else { "fail" }}));
+        }
+    }
+
+    /// One bounded request through the shared client, so it counts against
+    /// the run's budget. RUSTY_MEMORY_MODEL picks a model, else the agent's.
+    fn reflect(
+        &mut self,
+        passed: bool,
+        delivered: &[(String, String)],
+        max_new: usize,
+    ) -> Option<rusty::advisor::Reflection> {
+        let model = std::env::var("RUSTY_MEMORY_MODEL")
+            .ok()
+            .filter(|m| self.client.endpoint_for(m).is_ok())
+            .unwrap_or_else(|| self.model.clone());
+        let objective = self.goal.as_ref().map(|g| g.objective.clone()).unwrap_or_default();
+        let work = context::working_set(&self.history);
+        let prompt = rusty::advisor::reflect_prompt(&objective, passed, delivered, &work, max_new);
+        let messages = [
+            json!({"role": "system", "content": "You curate a coding agent's long-term memory. Reply with JSON only."}),
+            json!({"role": "user", "content": prompt}),
+        ];
+        let reply = self
+            .client
+            .chat(&model, &messages, &json!([]), 0.0, (ExecutionMode::Vibe, "memory"), &mut |_| !signal::interrupted())
+            .ok()?;
+        if let Some(u) = reply.usage {
+            self.totals.add_request(&model, u.prompt, u.completion);
+        }
+        let ids: Vec<String> = delivered.iter().map(|(id, _)| id.clone()).collect();
+        rusty::advisor::parse_reflection(&reply.content, &ids, passed, max_new)
     }
 
     // ------------------------------------------------------------- loop mode
@@ -1698,8 +1781,11 @@ impl Agent {
         if summary.is_empty() {
             bail!("the model returned an empty summary");
         }
-        for (kind, text) in &memories {
-            self.remember(kind, text, false);
+        // The advisor keeps unverified compaction lessons only from reflect up.
+        if self.advisor.as_ref().is_none_or(|h| h.level.reflects()) {
+            for (kind, text) in &memories {
+                self.remember_as(kind, text, false, "compaction", &[]);
+            }
         }
         self.memory.save();
         let tail = self.history.split_off(split);
@@ -1735,7 +1821,7 @@ impl Agent {
             "agent": "rusty",
             "version": env!("CARGO_PKG_VERSION"),
             "model": self.model,
-            "memory_mode": self.memory_mode,
+            "memory_mode": self.memory_level.name(),
             "memory": self.advisor.as_ref().map(|h| &h.metrics),
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),

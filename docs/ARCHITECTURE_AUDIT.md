@@ -11,18 +11,16 @@ framework, vector index or downloaded model weights.
 |---|---|---|
 | RAM-only L1; remove duplicated event/checkpoint tables | Avoid copying private tool traces to disk and eliminate hook writes/compression | Short-term observations disappear on service restart; saved L2 survives |
 | Keep SQLite for L2 | Transactions, crash recovery, imports and tombstones already work; a custom append log would need to rebuild them | Bundled SQLite is the largest added native dependency and is implemented in C; no new C code is authored |
-| Explicit miniz_oxide compression backend | Rust implementation; removes the unused zlib-rs package from the lockfile | Compression is not encryption |
-| Pack text and evidence only when smaller | Tiny/incompressible records avoid gzip expansion; no second compressor or codec crate | A one-byte raw marker and legacy gzip reader are maintained |
-| Cache lesson terms and short evidence | Tokenize each query once and avoid repeatedly inflating/scanning full evidence | Bounded cached terms consume some RAM; initial load still decompresses lessons |
-| Reuse a lazily initialized provider client | No TLS setup on the on/off path; deep requests can reuse connections | Deep inference still costs provider latency and tokens |
+| Plain TEXT lesson rows, indexed by project | At most 512 one-sentence lessons; packing saved little and needed a raw marker, a gzip reader and migrations | Rows are larger on disk than packed ones; exports are still gzip (explicit miniz_oxide backend) |
+| A BM25 inverted index cached per project | A search touches only lessons sharing a term with the query; rebuilt only when lessons change | Cached postings consume some RAM |
+| No model client in the daemon | Memory's one model request (reflection) goes through the agent's client and budget ledger; the daemon makes no network calls | A background model can no longer suggest steps mid-task |
 | One shared redactor and private persistence helpers | Cover hooks, direct saves/imports, history, sessions and audit metadata consistently | Pattern-based redaction cannot identify every arbitrary/encoded secret |
 
 SQLite uses a 512 KiB page-cache target, in-memory temporary storage, a 16 MiB
 main-database page quota and a 64 KiB retained-WAL target. These are component
 bounds, not a guarantee that the entire daemon or directory stays at that size.
-L1 is limited to 32 sessions with eight observations each; inference has one
-worker, a four-job queue and bounded inputs/responses. See [MEMORY.md](MEMORY.md)
-for the exact deadlines and retention rules.
+Sessions are limited to 32 with four observations each. See
+[MEMORY.md](MEMORY.md) for the exact deadlines and retention rules.
 
 Files use owner-only permissions and persistence refuses symlinks. Recognizable
 credentials are scrubbed from saved JSON, memory and audit metadata. Secret-
@@ -49,8 +47,9 @@ L1 sessions with eight observations. Receipts: [memory-audit.json](evidence/memo
 
 The meaningful savings are repeated retrieval work and disk writes. RSS and
 binary size changed little; these measurements do not establish end-to-end task
-speedups or global optimality. Fast compression is retained on small bounded L2
-records; gzip best compression is reserved for explicit exports.
+speedups or global optimality. They predate the memory levels, which dropped
+row packing and the background model; `cargo xtask memory-bench` gives current
+numbers.
 
 ## Dependencies, licenses and verification
 

@@ -1,5 +1,5 @@
 //! Real-process service tests. No model or cloud account is involved.
-use rusty::advisor::{rpc, Hooks, Mode, Request, Response};
+use rusty::advisor::{rpc, Hooks, Level, Request, Response};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -42,7 +42,7 @@ impl Service {
                 scope: "ready".into(),
                 session: "ready".into(),
                 seq: 0,
-                mode: Mode::On,
+                level: Level::Learn,
                 data: Value::Null,
             },
         )
@@ -55,7 +55,7 @@ impl Service {
     fn call(&self, op: &str, scope: &str, seq: u64, data: Value) -> Response {
         rpc(
             &self.root.join("memory/advisor.sock"),
-            &Request { op: op.into(), scope: scope.into(), session: "session".into(), seq, mode: Mode::On, data },
+            &Request { op: op.into(), scope: scope.into(), session: "session".into(), seq, level: Level::Learn, data },
         )
         .unwrap()
     }
@@ -75,9 +75,8 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
         drop(std::os::unix::net::UnixStream::connect(s.root.join("memory/advisor.sock")).unwrap());
         assert!(!s.call("status", "ready", 0, Value::Null).error);
     }
-    let id = s
-        .call("remember", "repo-a", 0, json!({"kind":"preference","text":"Always inspect workspace packages manifest"}))
-        .id;
+    let id =
+        s.call("remember", "repo-a", 0, json!({"kind":"fact","text":"Always inspect workspace packages manifest"})).id;
     assert!(!id.is_empty());
     assert!(!s.call("begin", "repo-a", 1, json!({"text":"inspect workspace packages manifest"})).error);
     assert_eq!(s.call("advice", "repo-a", 1, Value::Null).id, id);
@@ -102,7 +101,7 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
                 scope: "repo-a".into(),
                 session: "session".into(),
                 seq: 1,
-                mode: Mode::On,
+                level: Level::Learn,
                 data: Value::Null,
             },
         )
@@ -114,7 +113,8 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let status = s.call("status", "repo-a", 1, Value::Null).data;
-    assert_eq!(status["policy_updates"], 1);
+    // `/memory helpful` counts as two verified outcomes and survives a restart.
+    assert_eq!(status["outcomes"], 2);
     assert!(status["l1"].is_null(), "short-term observations survived restart");
     s.call("forget", "repo-a", 1, json!({"id":id}));
     assert!(!s.call("import", "repo-a", 1, snapshot).error);
@@ -126,7 +126,7 @@ fn stalled_service_does_not_hold_coding_hook() {
     let root = std::env::temp_dir().join(format!("rm-stall-{}", std::process::id()));
     std::fs::create_dir_all(root.join("memory")).unwrap();
     let listener = UnixListener::bind(root.join("memory/advisor.sock")).unwrap();
-    let mut hooks = Hooks::connect(&root, &root, Mode::On).unwrap();
+    let mut hooks = Hooks::connect(&root, &root, Level::Learn).unwrap();
     let start = Instant::now();
     assert!(hooks.advice().is_empty());
     assert!(start.elapsed() < Duration::from_millis(150), "hook exceeded deadline tolerance");
@@ -167,7 +167,7 @@ fn management_transport_honors_its_one_second_budget() {
             scope: "test".into(),
             session: "test".into(),
             seq: 0,
-            mode: Mode::On,
+            level: Level::Learn,
             data: Value::Null,
         },
     );
@@ -179,15 +179,17 @@ fn management_transport_honors_its_one_second_budget() {
 #[test]
 fn export_larger_than_hook_frame_roundtrips_and_invalid_import_rolls_back() {
     let s = Service::new();
-    for i in 0..40 {
-        assert!(!s.call("remember", "a", 0, json!({"text":format!("{i} {}","x".repeat(1500))})).error);
+    // Distinct words, so near-duplicate merging keeps every lesson.
+    for i in 0..60 {
+        let text: Vec<String> = (0..110).map(|j| format!("w{i}x{j}")).collect();
+        assert!(!s.call("remember", "a", 0, json!({"text":text.join(" ")})).error);
     }
     let mut snapshot = s.call("export", "a", 0, Value::Null).data;
     assert!(serde_json::to_vec(&snapshot).unwrap().len() > 32768);
     assert!(!s.call("import", "a", 0, snapshot.clone()).error);
     snapshot["lessons"][0]["id"] = json!("0000000000000000");
     assert!(s.call("import", "a", 0, snapshot).error);
-    assert_eq!(s.call("status", "a", 0, Value::Null).data["lessons"], 40);
+    assert_eq!(s.call("status", "a", 0, Value::Null).data["lessons"], 60);
 }
 
 #[test]
@@ -197,7 +199,7 @@ fn direct_ingress_redacts_secrets_and_l1_never_reaches_disk() {
         "remember",
         "privacy",
         0,
-        json!({"text":"DB_PASSWORD=secret-canary-12345","evidence":"Authorization: Bearer evidence-canary-12345"}),
+        json!({"text":"DB_PASSWORD=secret-canary-12345 Authorization: Bearer evidence-canary-12345"}),
     );
     assert!(!saved.error);
     let exported = s.call("export", "privacy", 0, Value::Null).data.to_string();
@@ -250,7 +252,7 @@ fn terminal_interrupt_does_not_kill_autostarted_memory() {
         PathBuf::from("/tmp").join(format!("rm-auto-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::create_dir_all(&root).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_rusty"))
-        .args(["--memory", "on", "--mode", "vibe"])
+        .args(["--memory", "learn", "--mode", "vibe"])
         .current_dir(&root)
         .env("RUSTY_HOME", &root)
         .env("HOME", &root)

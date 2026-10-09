@@ -90,7 +90,7 @@ impl RunState {
     }
 
     fn remembers(&self) -> bool {
-        matches!(self.memory(), "on" | "deep")
+        crate::advisor::Level::parse(self.memory()).is_some_and(crate::advisor::Level::advises)
     }
 
     /// `RUSTY_PROJECT_ID=... ` for commands that need the memory scope.

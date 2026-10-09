@@ -60,7 +60,9 @@ struct Cli {
     #[arg(long, env = "RUSTY_MODE")]
     mode: Option<String>,
 
-    /// Memory: legacy (existing store), off, on (local advisor), deep (background model)
+    /// Memory: off, legacy (the older store), recall (use saved lessons), learn
+    /// (also tool context, file checks, credit from --verify), reflect (also a
+    /// model review after checked goals) or deep (most aggressive)
     #[arg(long, env = "RUSTY_MEMORY", default_value = "legacy")]
     memory: String,
 
@@ -236,17 +238,16 @@ fn run() -> Result<i32> {
             println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));
         }
     }
-    agent.memory_mode = rusty::advisor::Mode::parse(&cli.memory)
-        .ok_or_else(|| anyhow!("unknown memory mode `{}` (legacy, off, on, deep)", cli.memory))?;
-    if agent.memory_mode == rusty::advisor::Mode::Deep && client.budget.enabled() {
-        return Err(anyhow!("deep memory runs a separate model process that cannot share this model budget yet; use --memory on, off or legacy"));
-    }
-    if matches!(agent.memory_mode, rusty::advisor::Mode::On | rusty::advisor::Mode::Deep) {
-        match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_mode) {
+    use rusty::advisor::Level;
+    agent.memory_level =
+        Level::parse(&cli.memory).ok_or_else(|| anyhow!("unknown memory level `{}` ({})", cli.memory, Level::NAMES))?;
+    if agent.memory_level.advises() {
+        match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_level)
+        {
             Ok(h) => agent.advisor = Some(h),
             Err(_) => {
                 eprintln!("memory advisor unavailable; continuing with memory off");
-                agent.memory_mode = rusty::advisor::Mode::Off;
+                agent.memory_level = Level::Off;
             }
         }
     }
@@ -348,7 +349,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
-            "memory_mode": agent.memory_mode,
+            "memory_mode": agent.memory_level.name(),
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
@@ -966,7 +967,7 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
 }
 
 fn memory_cmd(agent: &mut Agent, rest: &str) {
-    if agent.memory_mode == rusty::advisor::Mode::Off {
+    if agent.memory_level == rusty::advisor::Level::Off {
         println!("  memory is off");
         return;
     }

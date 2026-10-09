@@ -11,7 +11,7 @@ on:
         description: space-separated model ids (each needs its provider's key as a secret)
         default: nvidia/nemotron-3-super-120b-a12b
       memory:
-        description: "space-separated --memory settings to compare, e.g. off legacy on (empty: rusty's default)"
+        description: "space-separated --memory settings to compare, e.g. off learn reflect (empty: rusty's default)"
         default: ""
       repeats:
         description: runs of each task per model

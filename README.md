@@ -106,7 +106,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | | |
 |---|---|
 | **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
-| **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. |
+| **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. With `--memory learn` and up, lessons are tied to the files they describe, re-checked before use, and gain or lose confidence only when a goal's fixed check passes or fails ([docs/MEMORY.md](docs/MEMORY.md)). |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
 | **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
 | **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
@@ -303,14 +303,14 @@ on demand from GitHub with the repository's keys.
 ```bash
 cargo xtask qa           # offline checks
 cargo xtask qa --live    # plus live tests, the terminal check and every eval
-cargo xtask memory-smoke --live --binary target/release/rusty   # the six memory cases on NVIDIA
+cargo xtask memory-smoke --live --binary target/release/rusty   # the memory cases at every level on NVIDIA
 cargo xtask memory-bench # memory advice latency with 512 stored lessons (release build)
 cargo xtask eval multi   # just the multi-turn evals; logs land in target/evals/
 
 # the same tasks on several models, three runs each, compared in one table
 EVAL_MODELS="claude-opus-5-5 gpt-5 nvidia/nemotron-3-super-120b-a12b" EVAL_REPEATS=3 cargo xtask eval
-# the same, comparing memory settings (any --memory value) side by side
-EVAL_MEMORY="off legacy on" EVAL_REPEATS=3 cargo xtask eval multi
+# the same, comparing memory levels side by side
+EVAL_MEMORY="off learn reflect" EVAL_REPEATS=3 cargo xtask eval multi
 cargo xtask eval-report target/evals/*.jsonl   # pool earlier runs into one table
 ```
 
@@ -359,7 +359,7 @@ this version of rusty and the remote workspace must already exist.
 ```bash
 cargo build --bins
 target/debug/rusty-cloud hybrid --sandbox <id> --workspace /home/daytona/work \
-    --mode standard --agents swarm --swarm-max 3 --memory-mode on \
+    --mode standard --agents swarm --swarm-max 3 --memory-mode learn \
     --prompt "Use three workers to inspect the project, then fix and verify the bug."
 ```
 
@@ -374,7 +374,7 @@ placement choices and evidence are in [docs/CLOUD.md](docs/CLOUD.md).
 
 The core CLI is one static binary. `docker build --target bin -o out .` produces
 `rusty` and the optional `rusty-memoryd` companion for Linux.
-[docs/MEMORY.md](docs/MEMORY.md) covers opt-in `--memory off|on|deep`, the
+[docs/MEMORY.md](docs/MEMORY.md) covers the memory levels `--memory off|recall|learn|reflect|deep`, the
 RAM-only L1, packed L2, learning from feedback, live checks and cloud transfer.
 [docs/ARCHITECTURE_AUDIT.md](docs/ARCHITECTURE_AUDIT.md) records the storage,
 dependency and privacy tradeoffs. Redistributed binaries include `LICENSE` and
@@ -408,7 +408,9 @@ src/
   llm.rs          streaming client on a background thread, tool-call assembly, key rotation
   tools.rs        read, write, edit, list, search, glob, outline, bash
   permissions.rs  the command classifier
-  memory.rs       memory store and BM25 retrieval
+  memory.rs       legacy memory store and BM25 retrieval
+  advisor.rs      memory levels and the advisor: lessons, confidence, file anchors, credit (rusty-memoryd)
+  recall.rs       identifier-aware tokenizer and BM25 inverted index
   context.rs      budgets, elision, compaction, the working set
   skills.rs       built-in and user skills
   tips.rs         token tips from real usage
