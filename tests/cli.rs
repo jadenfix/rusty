@@ -2333,6 +2333,38 @@ fn root_budget_counts_rotated_keys_and_stream_retries() {
 }
 
 #[test]
+fn a_budget_ledger_spans_restarted_runs() {
+    let s = Sandbox::new("budget-ledger");
+    let ledger = s.home.join("episode.json");
+    let run = |replies| {
+        let (url, server) = scripted_endpoint(replies);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_BUDGET_LEDGER", &ledger)
+            .args(["--yolo", "--memory", "off", "--max-requests", "2", "look around"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out, server.join().unwrap())
+    };
+    let done = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
+    let (out, requests) = run(vec![done]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 1);
+    // The restarted run has one request left, not two.
+    let (out, requests) = run(vec![bash_reply("ls")]);
+    assert_eq!(requests.len(), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("model budget exhausted"));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    assert_eq!(
+        (saved["requests"].as_u64(), saved["attempts"].as_u64(), saved["runs"].as_u64()),
+        (Some(2), Some(2), Some(2))
+    );
+    assert_eq!(saved["denied_requests"], 1, "{saved}");
+}
+
+#[test]
 fn root_budget_refuses_before_first_post_and_validates_limits() {
     let s = Sandbox::new("budget-preflight");
     let (out, requests, trace) = budget_run(&s, &["--max-budget-tokens", "1", "inspect"], vec![]);
@@ -2650,6 +2682,11 @@ fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
     assert_eq!(requests.len(), 2);
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert_eq!(trace["model_budget"]["rate_limited"], 1);
+    // A gateway sees both attempts and counts only the answered one.
+    assert_eq!(
+        (trace["model_budget"]["attempts"].as_u64(), trace["model_budget"]["http_ok"].as_u64()),
+        (Some(2), Some(1))
+    );
 }
 
 #[test]
@@ -3112,4 +3149,24 @@ fn a_mistyped_mcp_read_does_not_escalate_auto_mode() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("switched up"));
     assert_eq!(server.join().unwrap().len(), 2, "a read needs no careful review");
+}
+
+#[test]
+fn attempts_without_a_response_are_counted_as_transport_errors() {
+    let s = Sandbox::new("budget-transport");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", "http://127.0.0.1:9")
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--memory", "off", "--max-requests", "2", "--trajectory", "t.json", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.project.join("t.json")).unwrap()).unwrap();
+    let b = &trace["model_budget"];
+    assert!(b["transport_errors"].as_u64().unwrap() >= 1, "{b}");
+    assert_eq!(b["transport_errors"], b["attempts"], "{b}");
+    assert_eq!(b["http_ok"], 0, "{b}");
 }

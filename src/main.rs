@@ -207,13 +207,16 @@ fn run() -> Result<i32> {
         return Ok(if ok { 0 } else { 1 });
     }
     let mut client = Client::from_env()?;
-    if cli.max_requests.is_some() || cli.max_budget_tokens.is_some() || cli.budget_secs.is_some() {
+    let bounded = cli.max_requests.is_some() || cli.max_budget_tokens.is_some() || cli.budget_secs.is_some();
+    let ledger = std::env::var_os("RUSTY_BUDGET_LEDGER").filter(|p| !p.is_empty()).map(PathBuf::from);
+    if bounded || ledger.is_some() {
         let defaults = budget::Limits::default();
-        client = client.with_budget(budget::Limits {
+        let limits = bounded.then(|| budget::Limits {
             requests: cli.max_requests.unwrap_or(defaults.requests),
             tokens: cli.max_budget_tokens.unwrap_or(defaults.tokens),
             seconds: cli.budget_secs.unwrap_or(defaults.seconds),
         });
+        client = client.with_budget(limits, ledger.as_deref())?;
     }
     let client = Arc::new(client);
     if cli.list_models {
