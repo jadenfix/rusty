@@ -128,6 +128,11 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// Tools offered to the model: full, or shell (bash and the goal and
+    /// loop controls only), for interface experiments
+    #[arg(long, env = "RUSTY_TOOLSET", default_value = "full")]
+    toolset: String,
+
     /// Print the values this build accepts, as JSON, and exit
     #[arg(long)]
     capabilities: bool,
@@ -256,6 +261,11 @@ fn run() -> Result<i32> {
             }
         }
     }
+    agent.shell_only = match cli.toolset.as_str() {
+        "full" => false,
+        "shell" => true,
+        other => return Err(anyhow!("unknown toolset `{other}` (full, shell)")),
+    };
     agent.agents = settings.agents.clone();
     agent.tips = settings.tips;
     agent.model_override = cli.model.clone();
@@ -360,6 +370,7 @@ fn capabilities() -> serde_json::Value {
         "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
         "tools": ["local", "daytona"],
+        "toolset": ["full", "shell"],
         "verify": {"supported": true, "timeout_secs": [1, 600]},
         "mcp": {"transports": ["stdio"]},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs"],

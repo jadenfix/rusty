@@ -43,6 +43,20 @@ a production target switches a turn to careful mid-run.
 The checker's findings go back to the model and do not decide acceptance.
 The fixed `--verify` check is the same in every mode.
 
+## Interface configurations
+
+The tool interface is an experimental variable. More tools are not evidence
+of a better agent. `--toolset shell` (or `RUSTY_TOOLSET=shell`) offers the
+lead a shell and the goal and loop controls, nothing else:
+
+- no file or search tools, no background commands, no plan or memory tools;
+- no subagents and no MCP tools;
+- any other tool name the model calls is refused before it runs.
+
+Pin it with `--mode standard`, `--agents off` and `--memory off` for a bash-only
+configuration. Careful mode's checker would still get its read-only tools.
+`--toolset full` is the default.
+
 ## Evidence and scope
 
 The private `CheckRecord` fields are constructed from executor observations.

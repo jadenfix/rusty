@@ -119,6 +119,8 @@ pub struct Agent {
     pub mode_reason: String,
     pub model_override: Option<String>,
     pub delegation_override: bool,
+    /// `--toolset shell`: the lead gets bash and the control tools only.
+    pub shell_only: bool,
     pending_goal: Option<Value>,
     /// Careful mode still owes one checker review for this turn or goal.
     checker_owed: bool,
@@ -199,6 +201,7 @@ impl Agent {
             mode_reason: String::new(),
             model_override: None,
             delegation_override: false,
+            shell_only: false,
             pending_goal: None,
             checker_owed: false,
             cwd,
@@ -462,6 +465,10 @@ impl Agent {
         s
     }
 
+    /// What `--toolset shell` offers: a shell, plus the control calls that
+    /// end a goal or schedule a loop.
+    const SHELL_TOOLS: &'static [&'static str] = &["bash", "goal_done", "loop_next"];
+
     fn tool_defs(&self) -> Value {
         let mut defs: Vec<Value> = tools::definitions()
             .as_array()
@@ -557,6 +564,9 @@ impl Agent {
                 }),
                 &[],
             ));
+        }
+        if self.shell_only {
+            defs.retain(|d| Self::SHELL_TOOLS.contains(&d["function"]["name"].as_str().unwrap_or("")));
         }
         Value::Array(defs)
     }
@@ -924,6 +934,9 @@ impl Agent {
     }
 
     fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+        if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
+            return format!("error: unknown tool `{}`; this run offers only bash", call.name);
+        }
         if self.is_worker
             && !matches!(
                 call.name.as_str(),
