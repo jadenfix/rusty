@@ -62,7 +62,20 @@ neither, so it claims less.
 - **Refused.** Rusty refuses:
   - calls a deny rule names;
   - anything that changes state in read-only mode;
-  - a destructive call nobody is there to approve (a person must type `yes`);
+  - a destructive call nobody is there to approve (a person must type `yes`).
+    Destructive means it loses data, history or infrastructure that can't be
+    brought back:
+    - force pushes, branch deletion and history rewrites;
+    - `rm -rf` of the home directory, the root or the whole workspace;
+    - cloud deletes (instances, databases, buckets, stacks);
+    - `kubectl delete namespace` and `kubectl drain`;
+    - `helm uninstall`, `terraform destroy` and `terraform state rm`;
+    - SQL `DROP`, `TRUNCATE`, and `DELETE`/`UPDATE` without `WHERE`;
+    - volume and database resets;
+    - MCP tools whose name or annotation says they delete.
+
+    The full list is the `destructive_things_always_need_a_person` test in
+    `src/permissions.rs`;
   - in careful mode, a kubectl, helm or terraform change whose dry run hasn't
     run in this session against the same files and target.
 - **Made recoverable where possible.** Before a mutating kubectl, helm or
@@ -105,15 +118,40 @@ neither, so it claims less.
 ## Benchmark-motivated changes
 
 A Rusty change made after reading a benchmark failure turns that example into
-development evidence for later versions; headline results then need fresh,
-frozen tasks. Each such change is listed here when it lands.
+development evidence for later versions. Headline results then need fresh,
+frozen tasks. Each change motivated by a FullStack-Bench trace is listed
+here, from its commit message.
 
-| Commit | Benchmark task | What the trace showed |
-|---|---|---|
+| PR | Commit | What changed | FullStack-Bench evidence |
+|---|---|---|---|
+| #32 | d3c7149 | `RUSTY_ALLOW_DESTRUCTIVE` lets a harness sandbox run destructive calls unattended | retire-node-2's correct solution drains a node, which the unattended guard refuses |
+| #35 | a3fc710 | Stop redacting namespaced names such as `secret:access` and doc placeholders | Promotion task: the grant to write was `secret:access`; about 70 calls spent on a name the model could not see |
+| #35 | 6be4eb4 | The redaction note says a hidden value still works, and how to pass it | Database task: credentials re-fetched eight times, minting a production credential each time |
+| #35 | 8e56497 | Retry a stream that drops while the model is reasoning | About one Nemotron call in four hundred dropped mid-stream, ending three of eight runs |
+| #35 | d535143 | A stalled goal turn ends the turn, not the goal | A run lost 22 of 25 goal turns and left no closing state to verify |
+| #37 | e84aab2 | Use tools from stdio MCP servers | SimCloud's access simulation, pending IAM changes, tracing and secrets exist only over MCP. One run invoked `simcloud-mcp` as a CLI; another shipped before an IAM change propagated |
+| #41 | 97aae34 | Tell the model how much of a bounded budget is left | A run spent all 250 calls with the goal still open |
+| #41 | bb82eff | Check every stated requirement before closing a goal | Runs fixed one code path and left others unmet; one made retries idempotent but never refunded the duplicates |
+| #50 | 36aad47 | Send a mistyped MCP tool name to the tool it means, under that tool's permissions | `mcp__simcloud#get_resource` failed as unknown, and an unresolved read was classed as a risky change |
+| #51 | 95a3513 | Let the model use a redacted secret by name | stop-double-charges: about 30 of 137 calls looped on credentials shown as `[redacted]` |
+| #51 | 32445a9 | When bash can't find an `mcp__` name, point back to the tool | Same trial: `mcp__simcloud__db_credentials` run as a shell command five times |
+| #51 | 5608f55 | A secret tool's `value` field is treated as a secret | Same trial: a live payments key reached the model unredacted |
+| #52 | 630dd62 | Don't send an identical read result twice in a row | ship-checkout-v2: the same `get_resource` call eight times in a row |
 
-None so far. The MCP, budget, completion, safety and capabilities changes came
-from code review, Rusty's own eval runs and the study protocol, not from
-inspecting benchmark task failures.
+These changes predate the frozen reporting configuration. The trials above,
+and their task families, are development evidence for every later Rusty
+version.
+
+Changes from 2026-10-09 on (#55–#60) were not made from task failures. They
+came from:
+
+- a code audit of the MCP client (#55);
+- Rusty's own eval throttling and the benchmark gateway's accounting (#56);
+- the study protocol: claims, safety, `--capabilities`, toolsets and the
+  docs (#57–#60).
+
+`--memory off` for benchmark runs (4c5af14) is a cohort rule, not a fix for
+a failure.
 
 ## What careful mode changes
 
