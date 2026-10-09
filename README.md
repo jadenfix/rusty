@@ -134,6 +134,8 @@ rusty "why does the build fail?"              # one shot
 rusty --goal "get cargo test green" --verify "cargo test" --yolo
 rusty -c                                      # resume the last session here
 rusty --doctor                                # which providers are set up and answering
+rusty --capabilities                          # accepted values as JSON, for harnesses
+rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
 ```
 
 Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next

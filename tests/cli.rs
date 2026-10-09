@@ -3232,3 +3232,48 @@ fn attempts_without_a_response_are_counted_as_transport_errors() {
     assert_eq!(b["transport_errors"], b["attempts"], "{b}");
     assert_eq!(b["http_ok"], 0, "{b}");
 }
+
+#[test]
+fn capabilities_list_only_values_the_flags_accept() {
+    let s = Sandbox::new("capabilities");
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").arg("--capabilities").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["memory"], serde_json::json!(["off", "recall", "learn", "reflect", "deep"]));
+    assert_eq!(caps["mcp"]["transports"], serde_json::json!(["stdio"]));
+    // An old value the flag now rejects is not offered.
+    let out = s.cmd().args(["--memory", "legacy", "hi"]).output().unwrap();
+    assert!(!out.status.success() && !caps["memory"].to_string().contains("legacy"));
+}
+
+#[test]
+fn a_shell_toolset_offers_and_runs_only_bash() {
+    let s = Sandbox::new("toolset-shell");
+    std::fs::write(s.project.join("notes.txt"), "kept").unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("read_file", serde_json::json!({"path": "notes.txt"})),
+        bash_reply("cat notes.txt"),
+        serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--toolset", "shell", "read the notes"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let offered: Vec<String> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(offered, ["bash"]);
+    let seen = requests[1]["messages"].to_string();
+    assert!(seen.contains("this run offers only bash"), "{seen}");
+    assert!(requests[2]["messages"].to_string().contains("kept"));
+    let out = s.cmd().args(["--toolset", "editor", "hi"]).output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("unknown toolset"));
+}

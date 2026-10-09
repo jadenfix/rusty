@@ -128,6 +128,15 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// Tools offered to the model: full, or shell (bash and the goal and
+    /// loop controls only), for interface experiments
+    #[arg(long, env = "RUSTY_TOOLSET", default_value = "full")]
+    toolset: String,
+
+    /// Print the values this build accepts, as JSON, and exit
+    #[arg(long)]
+    capabilities: bool,
+
     /// Start the project's MCP servers, print a JSON report and exit nonzero
     /// if a required server or tool is missing
     #[arg(long)]
@@ -164,6 +173,10 @@ fn run() -> Result<i32> {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
     let cwd = std::env::current_dir()?.canonicalize()?;
+    if cli.capabilities {
+        println!("{}", capabilities());
+        return Ok(0);
+    }
     if cli.mcp_check {
         let (_, reports) = mcp::Mcp::connect(&cwd)?;
         let ok = !reports.iter().any(mcp::Report::blocks);
@@ -262,6 +275,11 @@ fn run() -> Result<i32> {
             }
         }
     }
+    agent.shell_only = match cli.toolset.as_str() {
+        "full" => false,
+        "shell" => true,
+        other => return Err(anyhow!("unknown toolset `{other}` (full, shell)")),
+    };
     agent.agents = settings.agents.clone();
     agent.tips = settings.tips;
     agent.model_override = cli.model.clone();
@@ -342,6 +360,37 @@ fn run() -> Result<i32> {
     }
     agent.write_trajectory()?;
     Ok(0)
+}
+
+/// Bumped when a harness-facing flag, exit code or `--stats` key changes
+/// meaning (docs/VERIFICATION.md, "Harness contract").
+const CONTRACT: u32 = 1;
+
+/// What this build accepts, so a harness can refuse an unsupported setting
+/// before any model call. Each list is filtered through the parser that
+/// reads the flag, so it can't claim a value the flag would reject.
+fn capabilities() -> serde_json::Value {
+    let accepted = |values: &[&'static str], ok: &dyn Fn(&str) -> bool| -> Vec<&'static str> {
+        values.iter().copied().filter(|v| ok(v)).collect()
+    };
+    let memory: Vec<&str> = rusty::advisor::Level::NAMES.split(", ").collect();
+    let mut modes = vec!["auto"];
+    modes.extend(accepted(&["careful", "standard", "vibe"], &|v| ExecutionMode::parse(v).is_some()));
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "contract": CONTRACT,
+        "memory": accepted(&memory, &|v| rusty::advisor::Level::parse(v).is_some()),
+        "mode": modes,
+        "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
+        "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
+        "tools": ["local", "daytona"],
+        "toolset": ["full", "shell"],
+        "verify": {"supported": true, "timeout_secs": [1, 600]},
+        "mcp": {"transports": ["stdio"], "check": true},
+        "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
+        // Records a harness may read from --stats and the trajectory.
+        "stats": ["model_budget", "claims", "safety", "goal"],
+    })
 }
 
 /// One JSON line on stderr for scripts and evals.
