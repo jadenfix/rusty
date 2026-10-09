@@ -1364,7 +1364,11 @@ impl Agent {
                         d.line(&format!(
                             "  {mark} {} {}",
                             desc,
-                            ui::dim(&format!("· {calls} calls · {}s · {short_model}", took.as_secs()))
+                            ui::dim(&format!(
+                                "· {calls} tool call{} · {}s · {short_model}",
+                                if calls == 1 { "" } else { "s" },
+                                took.as_secs()
+                            ))
                         ));
                     }
                     reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
@@ -1398,6 +1402,12 @@ impl Agent {
         if let Some(shared) = shared {
             out.push(format!("## Findings the workers shared\n{}", ui::truncate(&shared, 6_000)));
         }
+        // Workers over-report; the lead turns their reports into an answer.
+        out.push(
+            "Workers can be wrong. Before you rely on a finding or report it, confirm it in the code; merge \
+             duplicates, and keep confirmed problems apart from suggestions."
+                .into(),
+        );
         out.join("\n\n")
     }
 

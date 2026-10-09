@@ -808,7 +808,7 @@ fn verify(dest: &Path) -> BTreeMap<&'static str, bool> {
         .skip(1)
         .filter(|s| {
             s.split_once(' ')
-                .is_some_and(|(n, rest)| rest.starts_with("calls") && n.parse::<u32>().is_ok_and(|n| n > 0))
+                .is_some_and(|(n, rest)| rest.starts_with("tool call") && n.parse::<u32>().is_ok_and(|n| n > 0))
         })
         .count();
     let memory = &trace["memory"];
