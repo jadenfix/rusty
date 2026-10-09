@@ -254,6 +254,8 @@ Stats, trajectories and saved sessions include `model_budget`:
 |---|---|
 | `attempts` | every HTTP inference attempt sent, rate-limited ones included: what a proxy or gateway sees |
 | `requests` | attempts counted against `--max-requests` (a 429 is given back, see `rate_limited`) |
+| `http_ok` | attempts the provider answered with a 2xx status, as a gateway counting only successful responses would |
+| `retry_wait_seconds` | time spent waiting to retry after rate limits, overloads and dropped streams |
 | `charged_tokens` / `known_tokens` | admission tokens held / usage the provider reported |
 | `unknown_usage_requests` | requests with no complete usage report, in flight included |
 | `active_requests`, `denied_requests`, `by_role` | in flight now, refused admission, per role |
@@ -281,11 +283,15 @@ role `memory`; the memory daemon makes no model calls. Other already running
 processes are outside this root's scope.
 
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
-over functional passing. A nonzero process exit cannot be `pass` either. The
+over functional passing. Each run gets its own budget ledger, so a killed
+process still records its provider waits. By a rule fixed before any run, a
+timeout that spent at least half its wall time waiting on provider retries is
+scored `infra` ("provider throttling"), not counted against the agent. The
+wait is kept in the row as `retry_wait_seconds`. A nonzero process exit cannot be `pass` either. The
 independent patch result stays in `functional_pass`, so a correct patch with a
 fatal provider failure remains visible without becoming a healthy success.
-Per-process budget snapshots are retained in eval rows, including multi-session
-runs; they are not summed into a fictitious shared cross-process allowance.
+Budget snapshots are retained in eval rows. In a multi-session run they share
+the run's ledger, so each session's snapshot is cumulative up to its exit.
 
 Run the deterministic runtime and scoring counterexamples before live work:
 

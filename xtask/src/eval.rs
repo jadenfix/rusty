@@ -31,6 +31,10 @@
 //! A single-turn task may include verify.txt with a fixed acceptance command.
 //! It then runs with --goal and --verify; the independent check.sh still
 //! grades the actual result and stays outside the working copy.
+//! Each run gets a budget ledger (RUSTY_BUDGET_LEDGER) in its home. A
+//! timeout that spent at least half its wall time waiting on provider
+//! retries is scored infra, since it measures the provider, not the agent.
+//!
 //! EVAL_BINARY selects an already qualified artifact instead of rebuilding it.
 //! Keep its source revision and hash in the experiment's artifact receipt.
 
@@ -330,6 +334,9 @@ fn agent(
         .args(args)
         .current_dir(work)
         .env("RUSTY_HOME", home)
+        // One ledger per run: it outlives a killed process, so a timeout
+        // still shows how long the provider kept the agent waiting.
+        .env("RUSTY_BUDGET_LEDGER", home.join("budget.json"))
         .envs(run.env())
         .env("NO_COLOR", "1")
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -458,6 +465,10 @@ fn run_task(cfg: &Config, task: &Task, run: &Run, jsonl: &Mutex<()>) -> Result<(
     result
 }
 
+/// The share of a timed-out run's wall time spent waiting on provider retries
+/// at which the timeout counts as infrastructure rather than the agent.
+const THROTTLED_SHARE: f64 = 0.5;
+
 /// Functional correctness is independent of a healthy completed execution.
 /// A passing patch cannot hide a fatal provider error or nonzero process exit.
 fn verdict(exit: &Exit, functional: bool, stdout: &[u8], stderr: &[u8]) -> &'static str {
@@ -500,6 +511,15 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     let stderr = std::fs::read(home.join("stderr")).unwrap_or_default();
     let functional = check(cfg, task, work, home, run)?;
     let verdict = verdict(&exit, functional, &stdout, &stderr);
+    // Predeclared: a timeout that spent at least half its wall time waiting
+    // on provider retries measures the provider, not the agent.
+    let ledger: Value = std::fs::read_to_string(home.join("budget.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let waited = ledger["retry_wait_seconds"].as_f64().unwrap_or(0.0);
+    let throttled = verdict == "timeout" && waited >= THROTTLED_SHARE * secs.max(1) as f64;
+    let verdict = if throttled { "infra" } else { verdict };
 
     let cell = match run.memory {
         "" => model.replace('/', "_"),
@@ -507,7 +527,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     };
     let dest = cfg.logs.join(cell).join(format!("{}.{rep}", task.name));
     std::fs::create_dir_all(&dest)?;
-    for f in ["stdout", "stderr", "check", "run", "trajectory.json"] {
+    for f in ["stdout", "stderr", "check", "run", "trajectory.json", "budget.json"] {
         let _ = std::fs::copy(home.join(f), dest.join(f));
     }
 
@@ -519,6 +539,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     let total = |k: &str| stats.iter().map(|r| r[k].as_i64().unwrap_or(0)).sum::<i64>();
     let (requests, prompt, completion) = (total("requests"), total("prompt"), total("completion"));
     let reason: Vec<String> = match verdict {
+        _ if throttled => vec![format!("provider throttling: {waited:.0}s of {secs}s spent waiting to retry")],
         "fail" => {
             let check = String::from_utf8_lossy(&std::fs::read(home.join("check")).unwrap_or_default()).into_owned();
             last_line(&check).into_iter().collect()
@@ -550,6 +571,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     let goal = stats.last().map(|r| r["goal"].clone()).unwrap_or(Value::Null);
     row["false_completion"] = Value::Bool(goal == "done" && !functional);
     row["functional_pass"] = Value::Bool(functional);
+    row["retry_wait_seconds"] = Value::from((waited * 10.0).round() / 10.0);
     row["goal"] = goal;
     row["model_budgets"] = Value::Array(stats.iter().filter_map(|r| r.get("model_budget").cloned()).collect());
     row["binary"] = Value::String(cfg.bin.display().to_string());
@@ -849,6 +871,45 @@ mod tests {
         assert_eq!(row["verdict"], "infra");
         assert!(!row["reason"].as_array().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_timeout_spent_waiting_on_the_provider_is_infra() {
+        use std::os::unix::fs::PermissionsExt;
+        for (waited, want) in [(30.0, "infra"), (0.0, "timeout")] {
+            let root = temp_dir().unwrap();
+            let taskdir = root.join("task");
+            std::fs::create_dir_all(taskdir.join("files")).unwrap();
+            std::fs::write(taskdir.join("prompt.txt"), "repair the file").unwrap();
+            std::fs::write(taskdir.join("check.sh"), "false").unwrap();
+            let bin = root.join("fake-agent");
+            let script = format!(
+                "#!/bin/sh\nprintf '{{\"retry_wait_seconds\": {waited}}}' > \"$RUSTY_BUDGET_LEDGER\"\nexec sleep 30\n"
+            );
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cfg = Config {
+                root: root.clone(),
+                bin,
+                limit: Duration::from_secs(1),
+                out: root.join("results.jsonl"),
+                logs: root.join("logs"),
+                transcripts: false,
+            };
+            let task = Task { name: "throttled".into(), dir: taskdir };
+            let (work, home) = (root.join("work"), root.join("home"));
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            File::create(&cfg.out).unwrap();
+            score(&cfg, &task, &Run { model: "scripted", memory: "", rep: 1 }, &work, &home, &Mutex::new(())).unwrap();
+            let row: Value = serde_json::from_str(std::fs::read_to_string(&cfg.out).unwrap().trim()).unwrap();
+            assert_eq!(row["verdict"], want, "{row}");
+            assert_eq!(row["retry_wait_seconds"], waited, "{row}");
+            if want == "infra" {
+                assert!(row["reason"][0].as_str().unwrap().starts_with("provider throttling"), "{row}");
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

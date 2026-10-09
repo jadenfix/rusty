@@ -28,6 +28,12 @@ struct State {
     attempts: u64,
     /// Attempts counted against the request limit (a 429 is given back).
     requests: u64,
+    /// Attempts the provider answered with a 2xx status, as a gateway that
+    /// only counts successful responses would.
+    http_ok: u64,
+    /// Time spent waiting to retry after rate limits, overloads and dropped
+    /// streams: provider time, not the agent's.
+    retry_wait_seconds: f64,
     charged_tokens: u64,
     known_tokens: u64,
     settled_requests: u64,
@@ -188,6 +194,18 @@ impl Budget {
         }
         Ok(Reservation { budget: self.clone(), tokens, role: role.into() })
     }
+    /// An admitted attempt that got a 2xx response.
+    pub fn note_ok(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.http_ok += 1;
+        self.record(&mut s);
+    }
+    /// Time spent waiting before a retry.
+    pub fn note_wait(&self, waited: Duration) {
+        let mut s = self.state.lock().unwrap();
+        s.retry_wait_seconds += waited.as_secs_f64();
+        self.record(&mut s);
+    }
     /// Admissions refused so far; a rise across a call means it ran out.
     pub fn denied(&self) -> u64 {
         self.state.lock().unwrap().denied_requests
@@ -240,6 +258,8 @@ impl Budget {
             state: State {
                 attempts: s.attempts,
                 requests: s.requests,
+                http_ok: s.http_ok,
+                retry_wait_seconds: s.retry_wait_seconds,
                 charged_tokens: s.charged_tokens,
                 known_tokens: s.known_tokens,
                 settled_requests: s.settled_requests,
@@ -384,8 +404,11 @@ mod tests {
         b.reserve("lead", 10).unwrap().settle(3, 2, Some(0.25));
         b.reserve("lead", 10).unwrap().settle(3, 2, None);
         b.reserve("lead", 10).unwrap().settle(3, 2, Some(f64::NAN));
+        b.note_ok();
+        b.note_wait(Duration::from_millis(1500));
         let s = b.snapshot().state;
         assert_eq!((s.attempts, s.requests, s.rate_limited), (4, 3, 1));
+        assert_eq!((s.http_ok, s.retry_wait_seconds), (1, 1.5));
         assert_eq!((s.reported_cost_usd, s.cost_reported_requests), (0.25, 1));
     }
     #[test]

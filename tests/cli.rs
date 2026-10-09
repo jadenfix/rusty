@@ -2682,6 +2682,11 @@ fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
     assert_eq!(requests.len(), 2);
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert_eq!(trace["model_budget"]["rate_limited"], 1);
+    // A gateway sees both attempts and counts only the answered one.
+    assert_eq!(
+        (trace["model_budget"]["attempts"].as_u64(), trace["model_budget"]["http_ok"].as_u64()),
+        (Some(2), Some(1))
+    );
 }
 
 #[test]

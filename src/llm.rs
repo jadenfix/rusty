@@ -378,7 +378,12 @@ impl Client {
                 }
                 attempts += 1;
                 match req.send() {
-                    Ok(r) if r.status().is_success() => return Ok(Sent { response: r, reservation }),
+                    Ok(r) if r.status().is_success() => {
+                        if reservation.is_some() {
+                            self.budget.note_ok();
+                        }
+                        return Ok(Sent { response: r, reservation });
+                    }
                     Ok(r) => {
                         let status = r.status().as_u16();
                         if let Some(secs) = r
@@ -420,7 +425,10 @@ impl Client {
         }
     }
     fn wait_retry(&self, wait: Duration, last_err: &str) -> Result<()> {
-        wait_or_interrupt(wait.min(self.budget.remaining()?), last_err)?;
+        let started = std::time::Instant::now();
+        let waited = wait_or_interrupt(wait.min(self.budget.remaining()?), last_err);
+        self.budget.note_wait(started.elapsed());
+        waited?;
         self.budget.remaining()?;
         Ok(())
     }
