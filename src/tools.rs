@@ -430,6 +430,8 @@ fn run_owned(
     }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Secrets the model saw only as ${RUSTY_SECRET_n} handles.
+    cmd.envs(rusty::privacy::secret_env());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
