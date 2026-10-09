@@ -389,7 +389,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "completion", "safety", "goal"],
+        "stats": ["model_budget", "claims", "safety", "goal"],
     })
 }
 

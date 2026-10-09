@@ -478,6 +478,13 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
 | 130 | interrupted |
 | 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
 
+**Capabilities.** `rusty --capabilities` prints, as JSON, the values this
+build accepts and a `contract` number that changes whenever anything in this
+section changes meaning. The values cover memory levels, modes, agents,
+permissions, tool locations, toolsets, MCP transports and the MCP check,
+verify limits, budget flags and the ledger, and the stats records. It needs
+no key, so a harness can refuse an unsupported setting before any model call.
+
 **Outputs.**
 
 - **`--stats`** prints one JSON line on stderr at exit with these keys:
