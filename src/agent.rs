@@ -1360,7 +1360,11 @@ impl Agent {
                         d.line(&format!(
                             "  {mark} {} {}",
                             desc,
-                            ui::dim(&format!("· {calls} calls · {}s · {short_model}", took.as_secs()))
+                            ui::dim(&format!(
+                                "· {calls} tool call{} · {}s · {short_model}",
+                                if calls == 1 { "" } else { "s" },
+                                took.as_secs()
+                            ))
                         ));
                     }
                     reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
