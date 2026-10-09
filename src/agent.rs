@@ -27,6 +27,7 @@ use crate::verification::{self, CheckRecord, CheckSpec};
 use rusty::advisor::{Hooks, Mode as MemoryMode};
 
 const MAX_STEPS: usize = 80;
+const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
 const WORKER_STEPS: usize = 30;
 const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
 
@@ -697,7 +698,7 @@ impl Agent {
                     continue;
                 }
                 if reply.finish_reason.as_deref() == Some("length") {
-                    d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
+                    d.line(&ui::warn(TOKEN_LIMIT_NOTE));
                 }
                 if reply.finish_reason.as_deref() != Some("length") && changed && !in_goal && self.checker_owed {
                     if let Err(e) = self.review_completion(&query, &mut d) {
@@ -810,7 +811,7 @@ impl Agent {
             }
             if reply.finish_reason.as_deref() == Some("length") {
                 self.pending_goal = None;
-                d.line(&ui::warn("  (the reply hit the token limit; say \"continue\" to resume)"));
+                d.line(&ui::warn(TOKEN_LIMIT_NOTE));
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
