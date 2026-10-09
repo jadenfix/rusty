@@ -234,6 +234,12 @@ impl Agent {
     }
 
     pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.apply_mode(mode);
+    }
+
+    /// A mode brings its model (`RUSTY_<MODE>_MODEL`) unless the user chose one,
+    /// and its delegation default unless the user set delegation themselves.
+    fn apply_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
         self.model = self.model_override.clone().or_else(|| mode.model()).unwrap_or_else(crate::config::default_model);
         if !self.delegation_override {
@@ -265,14 +271,10 @@ impl Agent {
         d.line(&format!("  {} {}", ui::accent(&format!("◇ {name}")), ui::dim(&format!("auto · {}", self.mode_reason))));
     }
 
-    /// Switches profile without touching the model or permissions; used when
-    /// rusty picks the mode itself.
+    /// Switches mode when rusty picks it itself; permissions never change.
     fn apply_profile(&mut self, mode: ExecutionMode, reason: String) {
-        self.execution_mode = mode;
+        self.apply_mode(mode);
         self.mode_reason = reason;
-        if !self.delegation_override {
-            self.agents.mode = if mode == ExecutionMode::Vibe { AgentsMode::Auto } else { AgentsMode::Off };
-        }
     }
 
     /// Moves an auto-picked turn up to careful, once, and says why.
