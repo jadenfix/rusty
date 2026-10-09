@@ -469,6 +469,19 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   `requiredTools`, is missing. A normal run with that config fails at startup
   instead of starting without the tools.
 
+  Each server in its report says what Rusty can't use, so a harness can tell
+  a coverage limitation from a failure:
+  - `reason: unsupported_transport`: the server is `url`, `sse` or `http`.
+    Only stdio is supported, so this is a coverage limitation.
+  - `ignored` (for example `["resources", "prompts"]`): features the server
+    offers that Rusty doesn't use. Only tools are used, so a task that needs
+    one of these is a coverage limitation.
+  - `bad_config`, `start_failed` and `handshake_failed`: the server didn't
+    come up. Check the operator's own health probe before calling this a
+    harness failure.
+  - `discovery_failed` and `missing_tools`: Rusty didn't get the tools. If
+    the server is healthy, this is a harness failure.
+
 **Exit status.**
 
 | Code | Meaning |

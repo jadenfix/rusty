@@ -67,6 +67,8 @@ struct Server {
     lines: Receiver<String>,
     next_id: u64,
     tools: Vec<Tool>,
+    /// Features the server offers that rusty doesn't use.
+    ignored: Vec<String>,
 }
 
 /// What became of one configured server, for `--mcp-check` and errors.
@@ -84,6 +86,10 @@ pub struct Report {
     reason: Option<&'static str>,
     tools: usize,
     missing: Vec<String>,
+    /// Server features rusty doesn't use, such as resources and prompts.
+    /// A task that needs one is a coverage limitation, not a failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ignored: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -144,6 +150,7 @@ impl Mcp {
                 reason: None,
                 tools: 0,
                 missing: Vec::new(),
+                ignored: Vec::new(),
                 error: None,
             };
             let started = match (&parsed, cfg.and_then(|c| c.command.as_ref())) {
@@ -165,6 +172,7 @@ impl Mcp {
                     report.status = "ok";
                     report.reason = (!report.missing.is_empty()).then_some("missing_tools");
                     report.tools = server.tools.len();
+                    report.ignored = server.ignored.clone();
                     servers.push(server);
                 }
                 Err((reason, e)) => {
@@ -273,16 +281,25 @@ impl Server {
                 }
             }
         });
-        Ok(Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new() })
+        Ok(Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new(), ignored: Vec::new() })
     }
 
     fn initialize(&mut self) -> Result<()> {
-        self.request(
+        let init = self.request(
             "initialize",
             json!({"protocolVersion": PROTOCOL, "capabilities": {},
                    "clientInfo": {"name": "rusty", "version": env!("CARGO_PKG_VERSION")}}),
             HANDSHAKE,
         )?;
+        // Only tools are used; logging and completions need nothing of us.
+        let used = ["tools", "logging", "completions", "experimental"];
+        self.ignored = init["capabilities"]
+            .as_object()
+            .into_iter()
+            .flat_map(|c| c.keys())
+            .filter(|k| !used.contains(&k.as_str()))
+            .cloned()
+            .collect();
         self.notify("notifications/initialized")
     }
 
@@ -502,7 +519,7 @@ mod tests {
                 class: verb_class(t),
             })
             .collect();
-        Server { name: name.into(), child, stdin, lines: mpsc::channel().1, next_id: 1, tools }
+        Server { name: name.into(), child, stdin, lines: mpsc::channel().1, next_id: 1, tools, ignored: Vec::new() }
     }
 
     fn names(servers: &[Server]) -> Vec<String> {
