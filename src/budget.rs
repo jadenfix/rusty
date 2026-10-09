@@ -287,6 +287,19 @@ impl Budget {
     }
 }
 
+impl Drop for Budget {
+    /// Releases the ledger lock now. Closing the file isn't enough: a child
+    /// forked meanwhile shares the open file until it execs, and holds the
+    /// lock with it.
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some((_, file)) = &self.ledger {
+            // SAFETY: flock on a descriptor this budget owns.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// An exclusive lock on `<ledger>.lock`, held until the file is closed. The
 /// kernel drops it when the process dies, so a crash never leaves it stuck.
 fn lock(ledger: &Path) -> Result<File> {
