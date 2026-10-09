@@ -110,9 +110,24 @@ downloaded weights; revisit them if evals show missed recalls.
 
 The constants (priors, the half deviation, thresholds, 0.3-0.4, 14-28 days)
 are engineering defaults, **not fitted values**. Compare levels with
-`EVAL_MEMORY="off recall learn reflect deep"` and repeats. `evals/multi/stale-anchor` moves a project's prices between
-sessions so a remembered location turns stale; `evals/multi/poisoned-lesson`
-plants a wrong rounding rule that memory should stop offering once checks fail.
+`EVAL_MEMORY="off recall learn reflect deep"` and repeats. The multi-session
+memory tasks test different things:
+
+- `evals/multi/memory-only-fact` is the only one that can show memory
+  helping. Session 1 reads a test seed from an onboarding note. The workspace
+  is then reset to a fresh copy without the note, and only session 2's own
+  run of the suite is graded. Without memory it can't pass.
+- `evals/multi/memory-handoff` grades whether a lesson was saved, so
+  `--memory off` fails it by construction. Its second session can find the
+  test command in the Makefile, so a pass shows the mechanism works, not
+  that memory helped.
+- `evals/multi/stale-anchor` and `evals/multi/poisoned-lesson` test harm:
+  - in `stale-anchor`, a project's prices move between sessions, so a
+    remembered location goes stale;
+  - in `poisoned-lesson`, a wrong rounding rule is planted that memory
+    should stop offering once checks fail.
+
+  Both can be solved without memory.
 
 ## Bounded hot path and disk
 
