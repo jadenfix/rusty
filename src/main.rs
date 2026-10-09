@@ -128,6 +128,11 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// Start the project's MCP servers, print a JSON report and exit nonzero
+    /// if a required server or tool is missing
+    #[arg(long)]
+    mcp_check: bool,
+
     /// Project directory (defaults to the current directory)
     #[arg(short = 'C', long)]
     dir: Option<PathBuf>,
@@ -159,6 +164,12 @@ fn run() -> Result<i32> {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
     let cwd = std::env::current_dir()?.canonicalize()?;
+    if cli.mcp_check {
+        let (_, reports) = mcp::Mcp::connect(&cwd)?;
+        let ok = !reports.iter().any(mcp::Report::blocks);
+        println!("{}", serde_json::json!({ "ok": ok, "servers": reports }));
+        return Ok(if ok { 0 } else { 1 });
+    }
 
     let mut settings = Settings::load();
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
