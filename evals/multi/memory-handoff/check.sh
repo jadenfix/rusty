@@ -5,8 +5,5 @@ try:
     median([]); raise SystemExit('no ValueError')
 except ValueError:
     pass
-" && grep -rqs "median" tests/ && {
-  # Whichever memory ran: the legacy store, or the advisor's lessons.
-  cat "$RUSTY_HOME"/projects/*/memory.jsonl 2>/dev/null
-  "$(dirname "$RUSTY_BIN")/rusty-memoryd" list 2>/dev/null
-} | grep -qiE "make check|gen_fixtures"
+" && grep -rqs "median" tests/ \
+  && "$(dirname "$RUSTY_BIN")/rusty-memoryd" list 2>/dev/null | grep -qiE "make check|gen_fixtures"

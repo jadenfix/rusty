@@ -106,7 +106,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 | | |
 |---|---|
 | **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
-| **Real memory** | Typed records (`preference`, `fact`, `decision`, `gotcha`), ranked with BM25 against each request and injected within a budget. Not a file pasted into every prompt. With `--memory learn` and up, lessons are tied to the files they describe, re-checked before use, and gain or lose confidence only when a goal's fixed check passes or fails ([docs/MEMORY.md](docs/MEMORY.md)). |
+| **Real memory** | Typed lessons (`preference`, `fact`, `decision`, `gotcha`) offered one at a time when BM25 relevance × confidence × file freshness clears a bar, not a file pasted into every prompt. Lessons are tied to the files they describe and gain or lose confidence only when a goal's fixed check passes or fails. `--memory off · recall · learn · reflect · deep` sets how aggressively memory captures, applies and prunes ([docs/MEMORY.md](docs/MEMORY.md)). Benchmark runs should pass `--memory off`. |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
 | **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
 | **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
@@ -408,7 +408,6 @@ src/
   llm.rs          streaming client on a background thread, tool-call assembly, key rotation
   tools.rs        read, write, edit, list, search, glob, outline, bash
   permissions.rs  the command classifier
-  memory.rs       legacy memory store and BM25 retrieval
   advisor.rs      memory levels and the advisor: lessons, confidence, file anchors, credit (rusty-memoryd)
   recall.rs       identifier-aware tokenizer and BM25 inverted index
   context.rs      budgets, elision, compaction, the working set

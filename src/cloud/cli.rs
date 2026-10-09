@@ -120,7 +120,7 @@ struct RunArgs {
     /// Static Linux rusty binary the snapshot was built from
     #[arg(long)]
     binary: Option<PathBuf>,
-    #[arg(long, default_value = "legacy", value_parser = ["off", "legacy", "recall", "learn", "reflect", "deep"])]
+    #[arg(long, default_value = "learn", value_parser = ["off", "recall", "learn", "reflect", "deep"])]
     memory_mode: String,
     /// Scoped gzip export from rusty-memoryd
     #[arg(long)]

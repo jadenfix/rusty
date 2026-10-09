@@ -86,7 +86,7 @@ pub struct RunState {
 
 impl RunState {
     pub fn memory(&self) -> &str {
-        self.memory_mode.as_deref().unwrap_or("legacy")
+        self.memory_mode.as_deref().unwrap_or("learn")
     }
 
     fn remembers(&self) -> bool {

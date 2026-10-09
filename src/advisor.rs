@@ -17,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 const FRAME: usize = 32_768;
 const TRANSFER: usize = 4 * 1024 * 1024;
@@ -28,7 +28,7 @@ const HOOK_MS: u64 = 50;
 const OBSERVATIONS: usize = 4;
 /// Lessons a client remembers offering, for crediting a goal.
 const DELIVERED: usize = 16;
-const KINDS: [&str; 5] = ["preference", "fact", "decision", "gotcha", "todo"];
+pub const KINDS: [&str; 5] = ["preference", "fact", "decision", "gotcha", "todo"];
 const SOURCES: [&str; 4] = ["user", "agent", "compaction", "reflect"];
 /// The scope for preferences that apply to every project.
 const GLOBAL: &str = "global";
@@ -45,13 +45,11 @@ const DUPLICATE: f64 = 0.8;
 pub enum Level {
     /// No memory at all.
     Off,
-    /// The older JSONL store, without the advisor.
-    #[default]
-    Legacy,
     /// Offers saved lessons that match the request.
     Recall,
     /// Also reads recent tool output, checks lessons against their files and
     /// learns from a goal's fixed check.
+    #[default]
     Learn,
     /// Also asks the model, after a checked goal, which lessons it used, and
     /// keeps short new lessons from passes and from compaction.
@@ -61,12 +59,11 @@ pub enum Level {
 }
 
 impl Level {
-    pub const NAMES: &'static str = "off, legacy, recall, learn, reflect, deep";
+    pub const NAMES: &'static str = "off, recall, learn, reflect, deep";
 
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim() {
             "off" => Self::Off,
-            "legacy" => Self::Legacy,
             "recall" => Self::Recall,
             "learn" => Self::Learn,
             "reflect" => Self::Reflect,
@@ -77,7 +74,6 @@ impl Level {
     pub fn name(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Legacy => "legacy",
             Self::Recall => "recall",
             Self::Learn => "learn",
             Self::Reflect => "reflect",
@@ -152,12 +148,7 @@ pub fn clip(s: &str, bytes: usize) -> String {
     }
     s[..n].to_owned()
 }
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-fn hash(s: &str) -> u64 {
-    s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
-}
+use crate::{fnv as hash, unix_now as now};
 fn lesson_id(scope: &str, kind: &str, text: &str) -> String {
     format!("{:016x}", hash(&format!("{scope}:{kind}:{text}")))
 }
@@ -1271,12 +1262,13 @@ mod tests {
 
     #[test]
     fn levels_build_on_each_other() {
-        let all = [Level::Off, Level::Legacy, Level::Recall, Level::Learn, Level::Reflect, Level::Deep];
+        let all = [Level::Off, Level::Recall, Level::Learn, Level::Reflect, Level::Deep];
         for l in all {
             assert_eq!(Level::parse(l.name()), Some(l));
         }
-        assert_eq!(Level::parse("v2"), None);
-        assert!(!Level::Legacy.advises() && Level::Recall.advises());
+        assert_eq!((Level::parse("v2"), Level::parse("legacy")), (None, None));
+        assert_eq!(Level::default(), Level::Learn);
+        assert!(!Level::Off.advises() && Level::Recall.advises());
         assert!(!Level::Recall.observes() && !Level::Recall.credits());
         assert!(
             Level::Learn.observes() && Level::Learn.anchors() && Level::Learn.credits() && !Level::Learn.reflects()
