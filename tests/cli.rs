@@ -2939,6 +2939,10 @@ fn required_mcp_servers_and_tools_fail_closed() {
             "\"reason\":\"unsupported_transport\"",
         ),
         (r#"{"mcpServers": {"odd": {"command": 7, "required": true}}}"#, "\"reason\":\"bad_config\""),
+        (
+            r#"{"mcpServers": {"sse": {"type": "sse", "command": "flags-mcp", "required": true}}}"#,
+            "\"reason\":\"unsupported_transport\"",
+        ),
     ] {
         std::fs::write(s.project.join(".mcp.json"), config).unwrap();
         let out = check();

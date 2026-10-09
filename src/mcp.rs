@@ -36,6 +36,9 @@ struct Config {
 struct ServerConfig {
     command: Option<String>,
     url: Option<String>,
+    /// `stdio` when given; any other transport is unsupported.
+    #[serde(rename = "type")]
+    transport: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -145,9 +148,10 @@ impl Mcp {
             };
             let started = match (&parsed, cfg.and_then(|c| c.command.as_ref())) {
                 (Err(e), _) => Err(("bad_config", anyhow!("bad entry: {e}"))),
-                (Ok(c), None) if c.url.is_some() => {
+                (Ok(c), _) if c.url.is_some() || c.transport.as_deref().is_some_and(|t| t != "stdio") => {
                     report.status = "skipped";
-                    Err(("unsupported_transport", anyhow!("only stdio servers are supported, not `url`")))
+                    let what = c.transport.as_deref().unwrap_or("url");
+                    Err(("unsupported_transport", anyhow!("only stdio servers are supported, not `{what}`")))
                 }
                 (Ok(_), None) => Err(("bad_config", anyhow!("no `command`"))),
                 (Ok(c), Some(command)) => Server::start(&name, command, c, cwd),
