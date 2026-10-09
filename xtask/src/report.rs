@@ -158,6 +158,35 @@ pub fn report(rows: &[Value]) -> String {
         lines.push(format!("| {t} | {} |", cells.join(" | ")));
     }
 
+    // With repeats, a task counts for pass@k when any attempt passed and for
+    // pass^k only when every attempt did: the second is what a deployed agent
+    // that gets one try would see; best-of-k picked with the hidden grader is not.
+    if tasks
+        .iter()
+        .any(|t| models.iter().any(|m| rows.iter().filter(|r| &key(r) == m && &text(r, "task") == t).count() > 1))
+    {
+        lines.push(String::new());
+        lines.push("| model | tasks | pass@k | pass^k |".into());
+        lines.push("|---|---|---|---|".into());
+        for m in &models {
+            let (mut n, mut any, mut all) = (0, 0, 0);
+            for t in &tasks {
+                let runs: Vec<&str> = rows
+                    .iter()
+                    .filter(|r| &key(r) == m && &text(r, "task") == t && verdict(r) != "infra")
+                    .map(verdict)
+                    .collect();
+                if runs.is_empty() {
+                    continue;
+                }
+                n += 1;
+                any += runs.contains(&"pass") as usize;
+                all += runs.iter().all(|v| *v == "pass") as usize;
+            }
+            lines.push(format!("| `{m}` | {n} | {any}/{n} | {all}/{n} |"));
+        }
+    }
+
     // Claims are the runtime's view, grading the independent one; they sit
     // side by side so a gate that refuses everything can't pass for honesty.
     if rows.iter().any(|r| r["completion"].as_array().is_some_and(|c| !c.is_empty())) {
@@ -248,6 +277,11 @@ mod tests {
 | a-task | 0/0 ⚠⚠ | 0/1 ⧗ |
 | b-task | 1/2 ✓✗ |  |
 
+| model | tasks | pass@k | pass^k |
+|---|---|---|---|
+| `m/one` | 1 | 1/1 | 0/1 |
+| `m/two` | 1 | 0/1 | 0/1 |
+
 Infrastructure errors (not scored):
 - 1× request failed: connection refused
 - 1× (no message)
@@ -281,6 +315,15 @@ Misses:
         assert!(text.contains("| `m` | 1/1 |"), "{text}");
         assert!(text.contains("| task | `m · v2` | `m · off` | `m` |"), "{text}");
         assert!(text.contains("- `m · off` t #1: fail"), "{text}");
+    }
+
+    #[test]
+    fn pass_hat_k_needs_every_attempt() {
+        let out = report(&rows(JSONL));
+        // m/one: b-task passes once in two (pass@k yes, pass^k no); a-task is all infra.
+        assert!(out.contains("| `m/one` | 1 | 1/1 | 0/1 |"), "{out}");
+        let single = r#"{"task": "t", "model": "m", "rep": 1, "verdict": "pass", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": []}"#;
+        assert!(!report(&rows(single)).contains("pass^k"), "one attempt per task has no k");
     }
 
     #[test]

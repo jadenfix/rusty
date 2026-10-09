@@ -302,6 +302,10 @@ reflect` and `deep`), goes through the agent's client and this ledger with the
 role `memory`; the memory daemon makes no model calls. Other already running
 processes are outside this root's scope.
 
+With repeats, the report gives pass@k (a task counts when any attempt passed)
+next to pass^k (only when every attempt passed). Best-of-k picked with the
+hidden grader is not something a deployed agent can do.
+
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
 over functional passing. A nonzero process exit cannot be `pass` either. The
 independent patch result stays in `functional_pass`, so a correct patch with a
