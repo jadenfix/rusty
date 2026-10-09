@@ -3168,14 +3168,16 @@ fn completion_claims_are_counted_apart_from_acceptance() {
     assert_eq!(server.join().unwrap().len(), 3);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stats: serde_json::Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
-    let c = &stats["completion"];
+    // `completion` stays the completion-token count; the claims have their own key.
+    assert!(stats["completion"].is_u64(), "{stats}");
+    let c = &stats["claims"];
     assert_eq!(
         (c["proposed"].as_u64(), c["check_failed"].as_u64(), c["accepted"].as_u64()),
         (Some(2), Some(1), Some(1))
     );
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.project.join("t.json")).unwrap()).unwrap();
-    assert_eq!(trace["completion"], *c);
+    assert_eq!(trace["claims"], *c);
 }
 
 #[test]

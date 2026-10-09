@@ -24,7 +24,7 @@ afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
 
-`--stats` and the trajectory count what happened to each claim in `completion`:
+`--stats` and the trajectory count what happened to each claim in `claims`:
 
 - `proposed` and `blocked` count `goal_done` calls;
 - `accepted` counts claims that closed the goal;
@@ -452,9 +452,12 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   - `model_budget` (the table above);
   - `secs`, `interrupted`;
   - `goal` (`done`, `blocked`, `open` or null);
+  - `claims`: what happened to the model's completion claims (see above);
+  - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;
   - `memory` (null when off).
-- **`--trajectory`** writes the conversation and the same `model_budget`.
+- **`--trajectory`** writes the conversation and the same `model_budget`,
+  `claims` and `safety`, at the top level.
 - Count requests against a gateway with `attempts`, and spending with
   `charged_tokens` and `unknown_usage_requests`. Billing evidence comes from
   the provider or gateway: `reported_cost_usd` is only what providers chose

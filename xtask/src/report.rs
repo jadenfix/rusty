@@ -189,9 +189,9 @@ pub fn report(rows: &[Value]) -> String {
 
     // Claims are the runtime's view, grading the independent one; they sit
     // side by side so a gate that refuses everything can't pass for honesty.
-    if rows.iter().any(|r| r["completion"].as_array().is_some_and(|c| !c.is_empty())) {
+    if rows.iter().any(|r| r["claims"].as_array().is_some_and(|c| !c.is_empty())) {
         let claims = |r: &Value, f: &str| {
-            r["completion"].as_array().into_iter().flatten().filter_map(|c| c[f].as_u64()).sum::<u64>()
+            r["claims"].as_array().into_iter().flatten().filter_map(|c| c[f].as_u64()).sum::<u64>()
         };
         lines.push(String::new());
         lines.push("| model | claims proposed | accepted by runtime | accepted, graded fail | graded pass |".into());
@@ -328,8 +328,8 @@ Misses:
 
     #[test]
     fn claims_are_shown_beside_independent_grading() {
-        let jsonl = r#"{"task": "t", "model": "m", "rep": 1, "verdict": "fail", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": true, "functional_pass": false, "completion": [{"proposed": 3, "accepted": 1}]}
-{"task": "t", "model": "m", "rep": 2, "verdict": "pass", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": false, "functional_pass": true, "completion": [{"proposed": 1, "accepted": 1}]}"#;
+        let jsonl = r#"{"task": "t", "model": "m", "rep": 1, "verdict": "fail", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": true, "functional_pass": false, "claims": [{"proposed": 3, "accepted": 1}]}
+{"task": "t", "model": "m", "rep": 2, "verdict": "pass", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": false, "functional_pass": true, "claims": [{"proposed": 1, "accepted": 1}]}"#;
         let out = report(&rows(jsonl));
         assert!(out.contains("| `m` | 4 | 2 | 1 | 1/2 |"), "{out}");
         assert!(!report(&rows(JSONL)).contains("claims proposed"), "older rows have no claims table");

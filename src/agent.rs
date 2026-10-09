@@ -1885,7 +1885,7 @@ impl Agent {
             "archived_messages": self.archived.len(),
             "goal": self.goal,
             "verification": self.verification_records,
-            "completion": self.completion,
+            "claims": self.completion,
             "safety": self.safety,
             "activities": self.activities.records(),
             "model_budget": self.budget_snapshot(),
