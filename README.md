@@ -309,6 +309,8 @@ cargo xtask eval multi   # just the multi-turn evals; logs land in target/evals/
 
 # the same tasks on several models, three runs each, compared in one table
 EVAL_MODELS="claude-opus-5-5 gpt-5 nvidia/nemotron-3-super-120b-a12b" EVAL_REPEATS=3 cargo xtask eval
+# the same, comparing memory settings (any --memory value) side by side
+EVAL_MEMORY="off legacy on" EVAL_REPEATS=3 cargo xtask eval multi
 cargo xtask eval-report target/evals/*.jsonl   # pool earlier runs into one table
 ```
 

@@ -7,6 +7,11 @@
 //!   ## session      start a new process (memory must carry over)
 //!   ## env K=V      set an environment variable from here on
 //!   ## goal         the next line runs as an autonomous --goal
+//!   ## verify CMD   the goal's fixed acceptance command (--verify CMD)
+//!   ## run CMD      the harness runs CMD in the working copy before the next
+//!                   session; the agent never sees it. RUSTY_HOME, RUSTY_BIN,
+//!                   RUSTY_MEMORY and EVAL_DIR are set, so it can change the
+//!                   code between sessions or seed memory
 //!
 //!     cargo xtask eval                  # everything, EVAL_JOBS at a time (default 4)
 //!     cargo xtask eval multi            # only multi-turn tasks
@@ -17,6 +22,11 @@
 //! EVAL_REPEATS=3 runs each pair three times. EVAL_TIMEOUT (default 600) caps
 //! each rusty process in seconds; EVAL_TRANSCRIPTS=0 drops the miss details
 //! from the log. The summary compares models.
+//!
+//! EVAL_MEMORY="off legacy on" runs every model under each memory setting
+//! (any value `rusty --memory` takes). Each row records its
+//! setting and the summary groups by model and memory. Unset, rusty's own
+//! default applies and rows carry no memory field.
 //!
 //! A single-turn task may include verify.txt with a fixed acceptance command.
 //! It then runs with --goal and --verify; the independent check.sh still
@@ -114,40 +124,57 @@ pub fn tasks(evals: &Path, filter: &str) -> Result<Vec<Task>> {
 }
 
 /// One rusty process of a multi-turn task.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Session {
     /// `K=V` pairs from the `## env` lines read so far.
     pub env: Vec<String>,
     /// Run the first line as `--goal` instead of piping every line in.
     pub goal: bool,
+    /// The goal's fixed acceptance command.
+    pub verify: Option<String>,
+    /// Harness commands to run before this session starts.
+    pub pre: Vec<String>,
     pub lines: Vec<String>,
 }
 
-/// Splits turns.txt into the processes to run.
+/// Splits turns.txt into the processes to run. `## run` lines after the
+/// last session become a final session with no lines, run before the check.
 pub fn sessions(turns: &str) -> Vec<Session> {
     let mut out = Vec::new();
-    let (mut env, mut buf, mut goal) = (Vec::new(), Vec::new(), false);
-    let mut flush = |env: &Vec<String>, buf: &mut Vec<String>, goal: &mut bool| {
-        if !buf.is_empty() {
-            out.push(Session { env: env.clone(), goal: *goal, lines: std::mem::take(buf) });
-            *goal = false;
+    let mut env = Vec::new();
+    let mut next = Session::default();
+    // A goal, verify or run seen before any line stays with the next session.
+    let mut flush = |env: &Vec<String>, next: &mut Session, end: bool| {
+        if !next.lines.is_empty() || (end && !next.pre.is_empty()) {
+            next.env = env.clone();
+            out.push(std::mem::take(next));
         }
     };
     for line in turns.split('\n') {
         match line {
-            "## session" => flush(&env, &mut buf, &mut goal),
+            "## session" => flush(&env, &mut next, false),
             "## goal" => {
-                flush(&env, &mut buf, &mut goal);
-                goal = true;
+                flush(&env, &mut next, false);
+                next.goal = true;
             }
             "" => {}
-            l => match l.strip_prefix("## env ") {
-                Some(kv) => env.push(kv.to_string()),
-                None => buf.push(l.to_string()),
-            },
+            l => {
+                if let Some(kv) = l.strip_prefix("## env ") {
+                    env.push(kv.to_string());
+                } else if let Some(cmd) = l.strip_prefix("## verify ") {
+                    next.verify = Some(cmd.to_string());
+                } else if let Some(cmd) = l.strip_prefix("## run ") {
+                    if !next.lines.is_empty() {
+                        flush(&env, &mut next, false);
+                    }
+                    next.pre.push(cmd.to_string());
+                } else {
+                    next.lines.push(l.to_string());
+                }
+            }
         }
     }
-    flush(&env, &mut buf, &mut goal);
+    flush(&env, &mut next, true);
     out
 }
 
@@ -190,6 +217,11 @@ pub fn run(filter: &str) -> Result<bool> {
     let models = var("EVAL_MODELS").or_else(|| var("RUSTY_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.into());
     let repeats = number("EVAL_REPEATS", 1)?;
     let jobs = number("EVAL_JOBS", 4)?.max(1) as usize;
+    // An empty setting leaves rusty's own default in force.
+    let memories: Vec<String> = match var("EVAL_MEMORY") {
+        Some(list) => list.split_whitespace().map(str::to_string).collect(),
+        None => vec![String::new()],
+    };
     let now = SystemTime::now();
     let stamp = format!("{}-{}-{:09}", stamp(now), std::process::id(), now.duration_since(UNIX_EPOCH)?.subsec_nanos());
     let cfg = Config {
@@ -206,21 +238,24 @@ pub fn run(filter: &str) -> Result<bool> {
     let tasks = tasks(&cfg.root.join("evals"), filter)?;
     let mut queue = Vec::new();
     for model in models.split_whitespace() {
-        for rep in 1..=repeats {
-            queue.extend(tasks.iter().map(|t| (t, model, rep)));
+        for memory in &memories {
+            for rep in 1..=repeats {
+                queue.extend(tasks.iter().map(|t| (t, Run { model, memory, rep })));
+            }
         }
     }
-    println!("models {models} · {repeats}x · timeout {limit}s per session");
+    let memory = var("EVAL_MEMORY").map(|m| format!(" · memory {m}")).unwrap_or_default();
+    println!("models {models}{memory} · {repeats}x · timeout {limit}s per session");
     let next = AtomicUsize::new(0);
     let broken = AtomicUsize::new(0);
     let jsonl = Mutex::new(());
     std::thread::scope(|s| {
         for _ in 0..jobs.min(queue.len()) {
             s.spawn(|| {
-                while let Some((task, model, rep)) = queue.get(next.fetch_add(1, Ordering::SeqCst)) {
-                    if let Err(e) = run_task(&cfg, task, model, *rep, &jsonl) {
+                while let Some((task, run)) = queue.get(next.fetch_add(1, Ordering::SeqCst)) {
+                    if let Err(e) = run_task(&cfg, task, run, &jsonl) {
                         broken.fetch_add(1, Ordering::SeqCst);
-                        eprintln!("{} {model} #{rep}: {e:#}", task.name);
+                        eprintln!("{} {} #{}: {e:#}", task.name, run.label(), run.rep);
                     }
                 }
             });
@@ -233,6 +268,33 @@ pub fn run(filter: &str) -> Result<bool> {
     match broken.into_inner() {
         0 => report,
         n => bail!("{n} run(s) could not be carried out; see the errors above"),
+    }
+}
+
+/// One cell of the eval matrix: which model, under which memory setting
+/// (empty for rusty's default), and which repeat.
+struct Run<'a> {
+    model: &'a str,
+    memory: &'a str,
+    rep: u64,
+}
+
+impl Run<'_> {
+    /// `model`, or `model · memory` when a memory setting is pinned.
+    fn label(&self) -> String {
+        match self.memory {
+            "" => self.model.to_string(),
+            m => format!("{} · {m}", self.model),
+        }
+    }
+
+    /// The environment every process of this run gets.
+    fn env(&self) -> Vec<(&'static str, &str)> {
+        let mut env = vec![("RUSTY_MODEL", self.model)];
+        if !self.memory.is_empty() {
+            env.push(("RUSTY_MEMORY", self.memory));
+        }
+        env
     }
 }
 
@@ -254,7 +316,7 @@ fn agent(
     cfg: &Config,
     work: &Path,
     home: &Path,
-    model: &str,
+    run: &Run,
     env: &[String],
     args: &[&str],
     input: Option<String>,
@@ -268,7 +330,7 @@ fn agent(
         .args(args)
         .current_dir(work)
         .env("RUSTY_HOME", home)
-        .env("RUSTY_MODEL", model)
+        .envs(run.env())
         .env("NO_COLOR", "1")
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout)
@@ -309,16 +371,28 @@ fn agent(
 }
 
 /// Runs every session; timed out if any one of them was.
-fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, model: &str) -> Result<Exit> {
+fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> Result<Exit> {
     let turns = std::fs::read_to_string(task.dir.join("turns.txt"))?;
+    let sessions = sessions(&turns);
+    validate(&sessions).with_context(|| format!("{}: turns.txt", task.name))?;
     let mut timed_out = false;
     let mut success = true;
-    for s in sessions(&turns) {
+    for s in sessions {
+        for cmd in &s.pre {
+            setup(cfg, task, work, home, run, &s.env, cmd)?;
+        }
+        if s.lines.is_empty() {
+            continue;
+        }
         let exit = if s.goal {
-            agent(cfg, work, home, model, &s.env, &["--goal", &s.lines[0]], None)?
+            let mut args = vec!["--goal", s.lines[0].as_str()];
+            if let Some(check) = &s.verify {
+                args.extend(["--verify", check.as_str()]);
+            }
+            agent(cfg, work, home, run, &s.env, &args, None)?
         } else {
             let input: String = s.lines.iter().map(|l| format!("{l}\n")).collect();
-            agent(cfg, work, home, model, &s.env, &[], Some(input))?
+            agent(cfg, work, home, run, &s.env, &[], Some(input))?
         };
         timed_out |= matches!(exit, Exit::TimedOut);
         success &= matches!(exit, Exit::Done(true));
@@ -326,9 +400,59 @@ fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, model: &str) -
     Ok(if timed_out { Exit::TimedOut } else { Exit::Done(success) })
 }
 
-fn run_task(cfg: &Config, task: &Task, model: &str, rep: u64, jsonl: &Mutex<()>) -> Result<()> {
+/// A fixed check only means something on a goal, so a stray one is a task bug.
+fn validate(sessions: &[Session]) -> Result<()> {
+    match sessions.iter().position(|s| s.verify.is_some() && !s.goal) {
+        Some(i) => bail!("session {} has `## verify` but is not a `## goal`", i + 1),
+        None => Ok(()),
+    }
+}
+
+/// A `## run` command: harness setup between sessions, hidden from the agent.
+/// It failing means the task could not be set up, not that the agent failed.
+fn setup(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run, env: &[String], cmd: &str) -> Result<()> {
+    let log = OpenOptions::new().create(true).append(true).open(home.join("run"))?;
+    let mut c = Command::new("bash");
+    c.args(["-c", cmd])
+        .current_dir(work)
+        .env("RUSTY_HOME", home)
+        .env("RUSTY_BIN", &cfg.bin)
+        .env("EVAL_DIR", &task.dir)
+        .envs(run.env())
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    for kv in env {
+        if let Some((k, v)) = kv.split_once('=') {
+            c.env(k, v);
+        }
+    }
+    let status = c.status()?;
+    if !status.success() {
+        bail!("## run {cmd}: {status}");
+    }
+    Ok(())
+}
+
+/// Stops a memory daemon the run started, so it doesn't outlive its home.
+fn stop_memory(cfg: &Config, home: &Path) {
+    let daemon = cfg.bin.with_file_name("rusty-memoryd");
+    if home.join("memory/advisor.sock").exists() && daemon.is_file() {
+        let _ = Command::new(daemon)
+            .arg("--home")
+            .arg(home)
+            .arg("stop")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn run_task(cfg: &Config, task: &Task, run: &Run, jsonl: &Mutex<()>) -> Result<()> {
     let (work, home) = (temp_dir()?, temp_dir()?);
-    let result = score(cfg, task, model, rep, &work, &home, jsonl);
+    let result = score(cfg, task, run, &work, &home, jsonl);
+    stop_memory(cfg, &home);
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&home);
     result
@@ -354,11 +478,12 @@ fn verdict(exit: &Exit, functional: bool, stdout: &[u8], stderr: &[u8]) -> &'sta
     }
 }
 
-fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &Path, jsonl: &Mutex<()>) -> Result<()> {
+fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: &Mutex<()>) -> Result<()> {
+    let (model, rep) = (run.model, run.rep);
     let _ = copy_dir(&task.dir.join("files"), work);
     let start = Instant::now();
     let exit = if task.dir.join("turns.txt").is_file() {
-        run_multi(cfg, task, work, home, model)?
+        run_multi(cfg, task, work, home, run)?
     } else {
         let prompt = std::fs::read_to_string(task.dir.join("prompt.txt"))?;
         let check_path = task.dir.join("verify.txt");
@@ -367,18 +492,22 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
             bail!("{}: verify.txt must contain a nonempty acceptance command", task.name);
         }
         let args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
-        agent(cfg, work, home, model, &[], &args, None)?
+        agent(cfg, work, home, run, &[], &args, None)?
     };
     let secs = start.elapsed().as_secs();
 
     let stdout = std::fs::read(home.join("stdout")).unwrap_or_default();
     let stderr = std::fs::read(home.join("stderr")).unwrap_or_default();
-    let functional = check(task, work, home)?;
+    let functional = check(cfg, task, work, home, run)?;
     let verdict = verdict(&exit, functional, &stdout, &stderr);
 
-    let dest = cfg.logs.join(model.replace('/', "_")).join(format!("{}.{rep}", task.name));
+    let cell = match run.memory {
+        "" => model.replace('/', "_"),
+        m => format!("{}.{}", model.replace('/', "_"), m.replace([',', '/'], "+")),
+    };
+    let dest = cfg.logs.join(cell).join(format!("{}.{rep}", task.name));
     std::fs::create_dir_all(&dest)?;
-    for f in ["stdout", "stderr", "check", "trajectory.json"] {
+    for f in ["stdout", "stderr", "check", "run", "trajectory.json"] {
         let _ = std::fs::copy(home.join(f), dest.join(f));
     }
 
@@ -424,11 +553,15 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
     row["goal"] = goal;
     row["model_budgets"] = Value::Array(stats.iter().filter_map(|r| r.get("model_budget").cloned()).collect());
     row["binary"] = Value::String(cfg.bin.display().to_string());
+    if !run.memory.is_empty() {
+        row["memory"] = Value::String(run.memory.to_string());
+    }
     {
         let _lock = jsonl.lock().unwrap();
         OpenOptions::new().append(true).open(&cfg.out)?.write_all(format!("{row}\n").as_bytes())?;
     }
-    let short: String = model.chars().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect();
+    let label = run.label();
+    let short: String = label.chars().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect();
     let why: String = reason.join(" ").chars().take(80).collect();
     println!(
         "{} {:<18} {short:<24} {verdict:<8} {secs:>4}s  {} session(s)  {:>5.0}k tok  {why}",
@@ -442,7 +575,7 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
     // it changed, and the check's output (artifacts aren't always easy to fetch).
     if cfg.transcripts && matches!(verdict, "fail" | "timeout") {
         let mut miss =
-            format!("::group::{} {model} #{rep}: {verdict}\n--- agent (last 60 lines)\n", task.name).into_bytes();
+            format!("::group::{} {label} #{rep}: {verdict}\n--- agent (last 60 lines)\n", task.name).into_bytes();
         miss.extend_from_slice(tail(&stdout, 60));
         miss.extend_from_slice(b"--- changes\n");
         let diff = Command::new("diff")
@@ -462,14 +595,17 @@ fn score(cfg: &Config, task: &Task, model: &str, rep: u64, work: &Path, home: &P
     Ok(())
 }
 
-/// Runs the task's hidden check in the agent's working copy.
-fn check(task: &Task, work: &Path, home: &Path) -> Result<bool> {
+/// Runs the task's hidden check in the agent's working copy. RUSTY_BIN and
+/// RUSTY_MEMORY let a check ask rusty what it remembered.
+fn check(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> Result<bool> {
     let log = File::create(home.join("check"))?;
     let status = Command::new("bash")
         .arg(task.dir.join("check.sh"))
         .current_dir(work)
         .env("EVAL_DIR", &task.dir)
         .env("RUSTY_HOME", home)
+        .env("RUSTY_BIN", &cfg.bin)
+        .envs(run.env())
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -707,7 +843,7 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         File::create(&cfg.out).unwrap();
-        score(&cfg, &task, "scripted", 1, &work, &home, &Mutex::new(())).unwrap();
+        score(&cfg, &task, &Run { model: "scripted", memory: "", rep: 1 }, &work, &home, &Mutex::new(())).unwrap();
         let row: Value = serde_json::from_str(std::fs::read_to_string(&cfg.out).unwrap().trim()).unwrap();
         assert_eq!(row["functional_pass"], true);
         assert_eq!(row["verdict"], "infra");
@@ -766,24 +902,82 @@ mod tests {
             [
                 Session {
                     env: vec!["RUSTY_CONTEXT_TOKENS=26000".into()],
-                    goal: false,
-                    lines: vec!["first".into(), "second".into()]
+                    lines: vec!["first".into(), "second".into()],
+                    ..Session::default()
                 },
-                Session { env: vec!["RUSTY_CONTEXT_TOKENS=26000".into()], goal: false, lines: vec!["third".into()] },
+                Session {
+                    env: vec!["RUSTY_CONTEXT_TOKENS=26000".into()],
+                    lines: vec!["third".into()],
+                    ..Session::default()
+                },
                 Session {
                     env: vec!["RUSTY_CONTEXT_TOKENS=26000".into(), "A=1".into()],
                     goal: true,
-                    lines: vec!["build it".into()]
+                    lines: vec!["build it".into()],
+                    ..Session::default()
                 },
                 Session {
                     env: vec!["RUSTY_CONTEXT_TOKENS=26000".into(), "A=1".into()],
-                    goal: false,
-                    lines: vec!["last".into()]
+                    lines: vec!["last".into()],
+                    ..Session::default()
                 },
             ]
         );
         assert!(sessions("").is_empty());
         assert!(sessions("## session\n\n## session\n").is_empty());
+    }
+
+    #[test]
+    fn run_and_verify_attach_to_the_right_session() {
+        let turns =
+            "## run seed one\nfirst\n## run sed -i s/a/b/ f\n## goal\n## verify make check\nfix it\n## run tail";
+        let s = sessions(turns);
+        assert_eq!(s.len(), 3);
+        assert_eq!((s[0].pre.clone(), s[0].lines.clone()), (vec!["seed one".to_string()], vec!["first".to_string()]));
+        // A run between lines of one session starts the next one.
+        assert_eq!(s[1].pre, ["sed -i s/a/b/ f"]);
+        assert!(s[1].goal);
+        assert_eq!(s[1].verify.as_deref(), Some("make check"));
+        assert_eq!(s[1].lines, ["fix it"]);
+        // Trailing runs still happen, before the check.
+        assert_eq!(s[2], Session { pre: vec!["tail".into()], ..Session::default() });
+        assert!(validate(&s).is_ok());
+        assert!(validate(&sessions("## verify true\nnot a goal")).is_err());
+        let split = sessions("one\n## run between\ntwo");
+        assert_eq!(split.iter().map(|s| s.lines.clone()).collect::<Vec<_>>(), [["one"], ["two"]]);
+    }
+
+    #[test]
+    fn memory_setting_labels_and_env() {
+        let pinned = Run { model: "m/x", memory: "l1,l2", rep: 1 };
+        assert_eq!(pinned.label(), "m/x · l1,l2");
+        assert_eq!(pinned.env(), [("RUSTY_MODEL", "m/x"), ("RUSTY_MEMORY", "l1,l2")]);
+        let default = Run { model: "m/x", memory: "", rep: 1 };
+        assert_eq!(default.label(), "m/x");
+        assert_eq!(default.env(), [("RUSTY_MODEL", "m/x")]);
+    }
+
+    #[test]
+    fn setup_runs_hidden_commands_and_fails_loudly() {
+        let root = temp_dir().unwrap();
+        let (work, home) = (root.join("work"), root.join("home"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let cfg = Config {
+            root: root.clone(),
+            bin: root.join("rusty"),
+            limit: Duration::from_secs(5),
+            out: root.join("out.jsonl"),
+            logs: root.join("logs"),
+            transcripts: false,
+        };
+        let task = Task { name: "t".into(), dir: root.clone() };
+        let run = Run { model: "m", memory: "v2", rep: 1 };
+        let env = ["A=1".to_string()];
+        setup(&cfg, &task, &work, &home, &run, &env, "printf '%s %s' \"$RUSTY_MEMORY\" \"$A\" > seen").unwrap();
+        assert_eq!(std::fs::read_to_string(work.join("seen")).unwrap(), "v2 1");
+        assert!(setup(&cfg, &task, &work, &home, &run, &env, "exit 3").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
