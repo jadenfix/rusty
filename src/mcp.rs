@@ -88,7 +88,20 @@ impl Mcp {
     }
 
     pub fn is_tool(name: &str) -> bool {
-        name.starts_with(PREFIX)
+        name.get(..PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
+    }
+
+    /// The exposed tool a name means: itself, or the one tool it matches once
+    /// separators are ignored, so `mcp__simcloud#get_resource` still works.
+    pub fn resolve(&self, name: &str) -> Option<String> {
+        let tools = || self.servers.iter().flat_map(|s| &s.tools);
+        if tools().any(|t| t.exposed == name) {
+            return Some(name.to_string());
+        }
+        let key = loose(name);
+        let mut matches = tools().filter(|t| loose(&t.exposed) == key);
+        let found = matches.next()?;
+        matches.next().is_none().then(|| found.exposed.clone())
     }
 
     /// OpenAI-style function definitions for every tool.
@@ -219,6 +232,11 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Lowercase letters and digits only.
+fn loose(name: &str) -> String {
+    name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
 fn call_timeout() -> Duration {
