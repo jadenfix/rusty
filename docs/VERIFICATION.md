@@ -325,7 +325,8 @@ interruption keep it charged. Known reported usage replaces its reservation;
 unexpected excess is charged, marks an overrun and prevents further dispatch or
 acceptance of that response. Anthropic accounting includes cached input and
 requires final output usage; initial output counters are not treated as final.
-Requests are never refunded. A required careful review that cannot finish within
+A request is refunded only when the provider answers HTTP 429, since it did no
+work; `attempts` still counts it. A required careful review that cannot finish within
 the budget halts this root; resuming or replacing the goal cannot skip it.
 Provider-internal processing/fallbacks are not
 separate client HTTP attempts; exact billing remains provider evidence.
@@ -338,14 +339,35 @@ own deadlines, and verification consumes no model request. Model catalogue GETs
 are outside the inference budget. Normal local execution or Daytona reasoning
 shares this client ledger; a live Daytona journey has not qualified it.
 
-Stats, trajectories and saved sessions include `model_budget`: admission limits,
-raw requests, known tokens, charged tokens, unknown usage, active attempts,
-role counts, denials, elapsed time and overrun. Existing conversation totals are
-logical successful reply metrics, not all HTTP attempts. Saved budget snapshots
-are diagnostics, not restart authority. A new CLI process (including `--continue`
-or a multi-session eval) starts a new budget. It does not provide a durable
-spending envelope across restarts; use a separate experiment admission bound.
-Durable journal/reconciliation is the next increment.
+Stats, trajectories and saved sessions include `model_budget`:
+
+| Field | Meaning |
+|---|---|
+| `attempts` | every HTTP inference attempt sent, rate-limited ones included: what a proxy or gateway sees |
+| `requests` | attempts counted against `--max-requests` (a 429 is given back, see `rate_limited`) |
+| `http_ok` | attempts the provider answered with a 2xx status, as a gateway counting only successful responses would |
+| `transport_errors` | attempts that got no HTTP response (connect, TLS or timeout); with `http_ok` this reconciles against a gateway that charges both |
+| `retry_wait_seconds` | time spent waiting to retry after rate limits, overloads and dropped streams |
+| `charged_tokens` / `known_tokens` | admission tokens held / usage the provider reported |
+| `unknown_usage_requests` | requests with no complete usage report, in flight included |
+| `active_requests`, `denied_requests`, `by_role` | in flight now, refused admission, per role |
+| `reported_cost_usd`, `cost_reported_requests` | summed from providers that put a price in their usage (OpenRouter's `usage.cost`); a lower bound unless every request reported, and absent prices are never invented |
+| `elapsed_seconds`, `deadline_reached`, `overrun`, `halted` | provider time used, and why admission stopped |
+| `ledger`, `runs` | the ledger file, if any, and how many processes have used it |
+
+Conversation totals are logical successful reply metrics, not HTTP attempts.
+
+Without a ledger, a new CLI process (including `--continue` or a multi-session
+eval) starts a new budget. Set `RUSTY_BUDGET_LEDGER=<path>` to make one episode
+budget span restarts: the state is rewritten (beside the file, then renamed)
+after every admission, settlement and refusal, and loaded at start. Limits
+then apply to the episode, not the process. An attempt that was in flight when
+a process died stays charged with unknown usage. Elapsed time counts provider
+time while some process was running, not the gaps between processes. The
+ledger is locked (`<path>.lock`, released by the kernel if the process dies),
+so a second rusty on the same ledger fails at startup. A ledger that can't be
+read is an error, never a fresh start. The ledger is the client's own count;
+a gateway in front of it remains the authority for what was billed.
 
 Memory's only model request, reflection after a checked goal (`--memory
 reflect` and `deep`), goes through the agent's client and this ledger with the
@@ -357,11 +379,15 @@ next to pass^k (only when every attempt passed). Best-of-k picked with the
 hidden grader is not something a deployed agent can do.
 
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
-over functional passing. A nonzero process exit cannot be `pass` either. The
+over functional passing. Each run gets its own budget ledger, so a killed
+process still records its provider waits. By a rule fixed before any run, a
+timeout that spent at least half its wall time waiting on provider retries is
+scored `infra` ("provider throttling"), not counted against the agent. The
+wait is kept in the row as `retry_wait_seconds`. A nonzero process exit cannot be `pass` either. The
 independent patch result stays in `functional_pass`, so a correct patch with a
 fatal provider failure remains visible without becoming a healthy success.
-Per-process budget snapshots are retained in eval rows, including multi-session
-runs; they are not summed into a fictitious shared cross-process allowance.
+Budget snapshots are retained in eval rows. In a multi-session run they share
+the run's ledger, so each session's snapshot is cumulative up to its exit.
 
 Run the deterministic runtime and scoring counterexamples before live work:
 
@@ -379,3 +405,64 @@ frozen artifacts, randomized order and a ledger preserving every attempt. First
 run small plumbing smokes and a deliberately tiny allowance that must stop with
 an open goal. Require five healthy observations per task/variant before claiming
 architectural benefits, with known and unknown usage reported separately.
+
+## Harness contract
+
+What a benchmark harness can rely on when it runs rusty unattended. The
+FullStack-Bench adapter is one such harness. Anything not listed here is
+display output and may change.
+
+**Invocation.** Pin every setting that has a saved or default value:
+
+```sh
+RUSTY_NO_DOTENV=1 RUSTY_HOME=<fresh dir> RUSTY_BUDGET_LEDGER=<episode file> \
+rusty --yolo --memory off --agents off --mode standard --model <id> \
+  --max-requests N --max-budget-tokens T --budget-secs S \
+  --stats --trajectory <path> \
+  --goal "<task>" --verify "<check>" --verify-timeout <secs>
+```
+
+- **Keys** come from the environment only. `RUSTY_NO_DOTENV=1` stops a stray
+  `.env` being read, and a fresh `RUSTY_HOME` keeps saved settings, sessions
+  and memory out of the run.
+- **Memory and delegation.** `--memory off` starts no memory daemon and reads
+  no lessons. `--agents off` runs one agent. Any other value is a different
+  experiment.
+- **`--verify`** is optional. Without it, the goal closes on the model's word
+  and exit status 2 can't happen.
+- **MCP.** Servers come from `.mcp.json` in the project, or from
+  `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
+  key and exits 1 if a server marked `required`, or one of its
+  `requiredTools`, is missing. A normal run with that config fails at startup
+  instead of starting without the tools.
+
+**Exit status.**
+
+| Code | Meaning |
+|---|---|
+| 0 | finished; with `--verify`, the check passed |
+| 2 | `--verify` was given and the goal did not close on a passing check |
+| 130 | interrupted |
+| 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
+
+**Outputs.**
+
+- **`--stats`** prints one JSON line on stderr at exit with these keys:
+  - `requests`, `prompt` and `completion` (successful replies);
+  - `model_budget` (the table above);
+  - `secs`, `interrupted`;
+  - `goal` (`done`, `blocked`, `open` or null);
+  - `execution_mode`, `memory_mode`, `tools_location`;
+  - `memory` (null when off).
+- **`--trajectory`** writes the conversation and the same `model_budget`.
+- Count requests against a gateway with `attempts`, and spending with
+  `charged_tokens` and `unknown_usage_requests`. Billing evidence comes from
+  the provider or gateway: `reported_cost_usd` is only what providers chose
+  to report.
+
+**Not claimed.**
+
+- exact tokenization, or a billed-cost cap;
+- a qualified live Daytona journey;
+- remote (HTTP/SSE) MCP transports, which are skipped;
+- that any memory level improves hard tasks.
