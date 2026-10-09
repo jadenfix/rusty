@@ -52,6 +52,47 @@ never counted as prevented. Two things Rusty can't see: whether the
 environment would have refused the call, and whether it caused harm. The
 benchmark's observers report those.
 
+## Safety assumptions
+
+Rusty's safeguards are guards around an agent, not transactions. A system
+such as STRATUS (no-regression mitigation for cloud operations) assumes
+writer exclusivity and a faithful undo for every action. Rusty assumes
+neither, so it claims less.
+
+- **Refused.** Rusty refuses:
+  - calls a deny rule names;
+  - anything that changes state in read-only mode;
+  - a destructive call nobody is there to approve (a person must type `yes`);
+  - in careful mode, a kubectl, helm or terraform change whose dry run hasn't
+    run in this session against the same files and target.
+- **Made recoverable where possible.** Before a mutating kubectl, helm or
+  terraform command, Rusty saves what the command will touch (the live
+  objects, helm values and manifest, terraform state) and prints a rollback
+  command. The snapshot is taken just before the change, so a concurrent
+  writer can make it stale. Restoring it is a new action, not an undo. Other
+  commands (databases, cloud CLIs, scripts) get no snapshot.
+- **Allowed.** Everything else follows the permission mode:
+  - `ask` asks before each change;
+  - `auto` allows workspace edits and asks for risky calls;
+  - `yolo` allows risky calls.
+
+  Destructive calls need a person, unless an unattended yolo run sets
+  `RUSTY_ALLOW_DESTRUCTIVE=1`. Benchmark runs must not set it.
+- **Cleanup is not isolation.** Owned commands are cancelled and their
+  process groups reaped at turn end. They run as the same user on the same
+  host, with the same network and credentials. Anything a command started
+  outside its process group, or changed remotely, stays.
+- **Local verification is mutable.** `--verify` runs in the workspace the
+  agent can write. The input fingerprint only catches files that change
+  while the check runs. Before proposing completion, the agent can change
+  what the check reads, or the check's own files. The check also says
+  nothing about deployed state. An independent grader outside the workspace
+  is still required.
+- **The record is the agent's own.** The trajectory, `--stats` and the infra
+  audit log are written by the Rusty process, so they show what Rusty
+  observed. They are not proof of what happened, and anything running as
+  the same user can modify them.
+
 ## Benchmark-motivated changes
 
 A Rusty change made after reading a benchmark failure turns that example into
