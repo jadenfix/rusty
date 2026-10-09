@@ -3088,3 +3088,23 @@ fn a_mistyped_mcp_read_does_not_escalate_auto_mode() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("switched up"));
     assert_eq!(server.join().unwrap().len(), 2, "a read needs no careful review");
 }
+
+#[test]
+fn attempts_without_a_response_are_counted_as_transport_errors() {
+    let s = Sandbox::new("budget-transport");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", "http://127.0.0.1:9")
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--memory", "off", "--max-requests", "2", "--trajectory", "t.json", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.project.join("t.json")).unwrap()).unwrap();
+    let b = &trace["model_budget"];
+    assert!(b["transport_errors"].as_u64().unwrap() >= 1, "{b}");
+    assert_eq!(b["transport_errors"], b["attempts"], "{b}");
+    assert_eq!(b["http_ok"], 0, "{b}");
+}

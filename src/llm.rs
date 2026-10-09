@@ -407,7 +407,12 @@ impl Client {
                             _ => bail!(last_err),
                         }
                     }
-                    Err(e) => last_err = format!("request failed: {e}"),
+                    Err(e) => {
+                        if reservation.is_some() {
+                            self.budget.note_transport_error();
+                        }
+                        last_err = format!("request failed: {e}");
+                    }
                 }
                 ep.key_idx.store((idx + 1) % keys.len(), Ordering::Relaxed);
             }

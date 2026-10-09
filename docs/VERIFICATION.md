@@ -255,6 +255,7 @@ Stats, trajectories and saved sessions include `model_budget`:
 | `attempts` | every HTTP inference attempt sent, rate-limited ones included: what a proxy or gateway sees |
 | `requests` | attempts counted against `--max-requests` (a 429 is given back, see `rate_limited`) |
 | `http_ok` | attempts the provider answered with a 2xx status, as a gateway counting only successful responses would |
+| `transport_errors` | attempts that got no HTTP response (connect, TLS or timeout); with `http_ok` this reconciles against a gateway that charges both |
 | `retry_wait_seconds` | time spent waiting to retry after rate limits, overloads and dropped streams |
 | `charged_tokens` / `known_tokens` | admission tokens held / usage the provider reported |
 | `unknown_usage_requests` | requests with no complete usage report, in flight included |

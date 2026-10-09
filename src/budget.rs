@@ -31,6 +31,8 @@ struct State {
     /// Attempts the provider answered with a 2xx status, as a gateway that
     /// only counts successful responses would.
     http_ok: u64,
+    /// Attempts that got no HTTP response at all (connect, TLS or timeout).
+    transport_errors: u64,
     /// Time spent waiting to retry after rate limits, overloads and dropped
     /// streams: provider time, not the agent's.
     retry_wait_seconds: f64,
@@ -200,6 +202,12 @@ impl Budget {
         s.http_ok += 1;
         self.record(&mut s);
     }
+    /// An admitted attempt that got no HTTP response.
+    pub fn note_transport_error(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.transport_errors += 1;
+        self.record(&mut s);
+    }
     /// Time spent waiting before a retry.
     pub fn note_wait(&self, waited: Duration) {
         let mut s = self.state.lock().unwrap();
@@ -259,6 +267,7 @@ impl Budget {
                 attempts: s.attempts,
                 requests: s.requests,
                 http_ok: s.http_ok,
+                transport_errors: s.transport_errors,
                 retry_wait_seconds: s.retry_wait_seconds,
                 charged_tokens: s.charged_tokens,
                 known_tokens: s.known_tokens,
@@ -405,10 +414,11 @@ mod tests {
         b.reserve("lead", 10).unwrap().settle(3, 2, None);
         b.reserve("lead", 10).unwrap().settle(3, 2, Some(f64::NAN));
         b.note_ok();
+        b.note_transport_error();
         b.note_wait(Duration::from_millis(1500));
         let s = b.snapshot().state;
         assert_eq!((s.attempts, s.requests, s.rate_limited), (4, 3, 1));
-        assert_eq!((s.http_ok, s.retry_wait_seconds), (1, 1.5));
+        assert_eq!((s.http_ok, s.transport_errors, s.retry_wait_seconds), (1, 1, 1.5));
         assert_eq!((s.reported_cost_usd, s.cost_reported_requests), (0.25, 1));
     }
     #[test]
