@@ -1830,7 +1830,7 @@ impl Agent {
             "archived_messages": self.archived.len(),
             "goal": self.goal,
             "verification": self.verification_records,
-            "completion": self.completion,
+            "claims": self.completion,
             "activities": self.activities.records(),
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},

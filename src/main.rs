@@ -360,7 +360,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
-            "completion": agent.completion,
+            "claims": agent.completion,
             "memory_mode": agent.memory_level.name(),
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
