@@ -69,6 +69,9 @@ pub struct ToolCall {
 pub struct Usage {
     pub prompt: u64,
     pub completion: u64,
+    /// What the provider says the request cost, when it says (OpenRouter's
+    /// `usage.cost`, in US dollars).
+    pub cost: Option<f64>,
 }
 
 #[derive(Default, Debug)]
@@ -132,9 +135,14 @@ impl Client {
         Ok(Self { http, endpoints, budget: crate::budget::Budget::unbounded() })
     }
 
-    pub fn with_budget(mut self, limits: crate::budget::Limits) -> Self {
-        self.budget = crate::budget::Budget::new(limits);
-        self
+    /// Limits, a ledger that outlives the process, or both.
+    pub fn with_budget(
+        mut self,
+        limits: Option<crate::budget::Limits>,
+        ledger: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        self.budget = crate::budget::Budget::open(limits, ledger)?;
+        Ok(self)
     }
 
     pub fn key_count(&self) -> usize {
@@ -432,7 +440,7 @@ fn settle(reservation: Option<crate::budget::Reservation>, result: &Result<Reply
     if let (Some(r), Ok(reply)) = (reservation, result) {
         if reply.finish_reason.as_deref().is_some_and(|f| f != "interrupted") {
             if let Some(u) = reply.usage {
-                r.settle(u.prompt, u.completion);
+                r.settle(u.prompt, u.completion, u.cost);
             }
         }
     }
@@ -576,7 +584,11 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
 }
 
 fn usage_of(u: &Value) -> Option<Usage> {
-    Some(Usage { prompt: u["prompt_tokens"].as_u64()?, completion: u["completion_tokens"].as_u64()? })
+    Some(Usage {
+        prompt: u["prompt_tokens"].as_u64()?,
+        completion: u["completion_tokens"].as_u64()?,
+        cost: u["cost"].as_f64(),
+    })
 }
 
 /// Folds one streamed tool-call fragment into the accumulated list.
