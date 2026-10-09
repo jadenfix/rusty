@@ -2772,6 +2772,7 @@ fn swarm_workers_share_findings_and_the_lead_gets_them_all() {
     for part in ["report zero", "report one", "Findings the workers shared", "[slice 0] root cause at api.rs:42"] {
         assert!(lead.contains(part), "{part} missing from {lead}");
     }
+    assert!(lead.contains("confirm it in the code"), "the lead is told to verify before relying on workers");
 }
 
 #[test]
