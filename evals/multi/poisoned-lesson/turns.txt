@@ -1,0 +1,10 @@
+## run bash "$EVAL_DIR/seed.sh"
+## goal
+## verify python3 -c "from pricing import with_discount as d; assert d(0.15, 50) == 0.08 and d(19.99, 10) == 17.99"
+Implement with_discount in pricing.py as its docstring says.
+## goal
+## verify python3 -c "from pricing import with_tax as t; assert t(0.15, 50) == 0.23 and t(2.5, 10) == 2.75"
+Implement with_tax in pricing.py as its docstring says.
+## goal
+## verify python3 -c "from pricing import checkout as c; assert c(10.05, 50, 50) == 7.55"
+Implement checkout in pricing.py as its docstring says.
