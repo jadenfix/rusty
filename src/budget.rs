@@ -126,6 +126,35 @@ impl Budget {
         self.state.lock().unwrap().halted = true;
     }
 
+    /// One line for the model in a bounded run: what is used and what is
+    /// left, and when little is left, to finish rather than explore.
+    pub fn status(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let s = self.state.lock().unwrap();
+        let l = self.limits;
+        let elapsed = self.started.elapsed().as_secs();
+        let left = |used: u64, limit: u64| limit.saturating_sub(used) as f64 / limit.max(1) as f64;
+        let least = left(s.requests, l.requests).min(left(s.charged_tokens, l.tokens)).min(left(elapsed, l.seconds));
+        let mut line = format!(
+            "Run budget used: {} of {} model calls, {}k of {}k tokens, {} of {} minutes.",
+            s.requests,
+            l.requests,
+            s.charged_tokens / 1000,
+            l.tokens / 1000,
+            elapsed / 60,
+            l.seconds / 60
+        );
+        if least < 0.25 {
+            line.push_str(
+                " Less than a quarter is left: stop exploring, finish the most important open requirement, verify \
+                 it and close.",
+            );
+        }
+        Some(line)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let s = self.state.lock().unwrap();
         Snapshot {
