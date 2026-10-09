@@ -386,7 +386,7 @@ fn capabilities() -> serde_json::Value {
         "tools": ["local", "daytona"],
         "toolset": ["full", "shell"],
         "verify": {"supported": true, "timeout_secs": [1, 600]},
-        "mcp": {"transports": ["stdio"], "check": true},
+        "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
         "stats": ["model_budget", "claims", "safety", "goal"],

@@ -2844,7 +2844,7 @@ const FAKE_MCP: &str = r#"while IFS= read -r line; do
   echo "mcp> $line" >> "$RUSTY_TEST_CALLS"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
-    *'"initialize"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}" ;;
+    *'"initialize"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{},\"resources\":{}}}}" ;;
     *'"tools/list"'*'"cursor":"p2"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"delete_flag\",\"description\":\"Delete a flag\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"reset_flags\",\"description\":\"Reset all flags\",\"annotations\":{\"destructiveHint\":true}}]}}" ;;
     *'"tools/list"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"get_flag\",\"description\":\"Read a flag\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}}}}],\"nextCursor\":\"p2\"}}" ;;
     *'"tools/call"'*) echo "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}"; echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"flag checkout.engine = v2\"}]}}" ;;
@@ -2954,6 +2954,7 @@ fn required_mcp_servers_and_tools_fail_closed() {
     let flags = &report["servers"].as_array().unwrap().iter().find(|r| r["server"] == "flags").unwrap();
     assert_eq!((flags["status"].as_str(), flags["tools"].as_u64()), (Some("ok"), Some(3)), "{report}");
     assert_eq!(report["ok"], true, "optional servers that fail don't block: {report}");
+    assert_eq!(flags["ignored"], serde_json::json!(["resources"]), "{report}");
 
     let reason = |name: &str| {
         report["servers"].as_array().unwrap().iter().find(|r| r["server"] == name).unwrap()["reason"].clone()
