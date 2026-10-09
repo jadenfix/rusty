@@ -266,3 +266,54 @@ fn ask_without_a_terminal_refuses_changes_and_the_turn_still_ends() {
     let last = r.seen.last().unwrap()["messages"].to_string();
     assert!(last.contains("needs approval"), "{last}");
 }
+
+#[test]
+fn a_swarm_tells_the_lead_which_neighbouring_files_no_worker_opened() {
+    let seen: Seen = Arc::default();
+    let log = seen.clone();
+    // Workers read settings.toml and report; the lead swarms once, then answers.
+    let server = serve(Arc::new(move |req: Request| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        log.lock().unwrap().push(body.clone());
+        let history = body["messages"].to_string();
+        if is_worker(&body) {
+            if !history.contains("\"name\":\"read_file\"") {
+                return call("read_file", json!({"path": "settings.toml"}));
+            }
+            return say("Report: settings look fine.");
+        }
+        if !history.contains("\"name\":\"swarm\"") {
+            let tasks: Vec<_> =
+                (0..2).map(|i| json!({"description": format!("part {i}"), "prompt": "check the settings"})).collect();
+            return call("swarm", json!({ "tasks": tasks }));
+        }
+        say("All done.")
+    }));
+    let dir = TempDir::new("coverage");
+    let (home, project) = (dir.path().join("home"), dir.path().join("project"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("settings.toml"), "[app]\nport = 8080\n").unwrap();
+    std::fs::write(project.join("secrets.toml"), "[db]\nhost = \"db\"\n").unwrap();
+    let out = Command::new(RUSTY)
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("RUSTY_HOME", &home)
+        .env("RUSTY_NO_DOTENV", "1")
+        .env("RUSTY_INFRA", "off")
+        .env("NVIDIA_API_KEY", "offline-test-key")
+        .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
+        .env("NO_COLOR", "1")
+        .args(["--agents", "swarm", "--mode", "standard", "--yolo", "--", "audit the config"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let lead = seen.iter().rev().find(|b| !is_worker(b)).unwrap()["messages"].to_string();
+    let section = lead.split("## Not opened by any worker").nth(1).expect("a coverage section");
+    let listed = section.split("workers read: ").nth(1).and_then(|r| r.split(". ").next()).unwrap_or("");
+    assert_eq!(listed, "secrets.toml", "{section}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 file beside what the workers read went unopened"));
+}

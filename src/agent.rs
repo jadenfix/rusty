@@ -162,6 +162,8 @@ pub struct Agent {
     request_role: &'static str,
     /// A swarm worker's board, its index, how many notes it has seen and its label.
     board: Option<(crate::swarm::Board, usize, usize, String)>,
+    /// Files a worker opened, so the lead can see what a swarm never looked at.
+    opened: std::collections::BTreeSet<PathBuf>,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -233,6 +235,7 @@ impl Agent {
             is_worker: false,
             request_role: "lead",
             board: None,
+            opened: Default::default(),
             progress: None,
         }
     }
@@ -959,6 +962,11 @@ impl Agent {
                 return format!("error: arguments were not valid JSON ({e}). Call the tool again with valid JSON.")
             }
         };
+        if self.is_worker && self.board.is_some() {
+            if let Ok(cwd) = self.cwd.canonicalize() {
+                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
+            }
+        }
         if let Some(p) = &self.progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
@@ -1362,7 +1370,10 @@ impl Agent {
                     Ok(Ok(_)) if answer.is_empty() => "returned nothing".to_string(),
                     Ok(Ok(_)) => answer,
                 };
-                if tx.send((i, desc, model, report, w.totals.clone(), t0.elapsed())).is_err() {
+                if tx
+                    .send((i, desc, model, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
+                    .is_err()
+                {
                     break;
                 }
             });
@@ -1370,11 +1381,13 @@ impl Agent {
         drop(tx);
 
         let mut reports = vec![String::new(); n];
+        let mut opened = std::collections::BTreeSet::new();
         let mut done = 0;
         while done < n {
             match rx.recv_timeout(Duration::from_millis(60)) {
-                Ok((i, desc, model, report, totals, took)) => {
+                Ok((i, desc, model, report, totals, took, files)) => {
                     done += 1;
+                    opened.extend(files);
                     self.totals.merge(&totals);
                     let calls = counters[i].load(Ordering::Relaxed);
                     let failed = report.starts_with("failed:");
@@ -1421,6 +1434,25 @@ impl Agent {
         out.extend(reports.iter().filter(|r| !r.is_empty()).map(|r| ui::truncate(r, per).to_string()));
         if let Some(shared) = shared {
             out.push(format!("## Findings the workers shared\n{}", ui::truncate(&shared, 6_000)));
+        }
+        let (missed, total) =
+            self.cwd.canonicalize().map(|cwd| crate::swarm::unopened_neighbours(&cwd, &opened)).unwrap_or_default();
+        if !missed.is_empty() {
+            if display::view() != View::Adhd {
+                d.line(&format!(
+                    "  {}",
+                    ui::dim(&format!(
+                        "◌ {total} file{} beside what the workers read went unopened",
+                        if total == 1 { "" } else { "s" }
+                    ))
+                ));
+            }
+            let more = if total > missed.len() { format!(" (+{} more)", total - missed.len()) } else { String::new() };
+            out.push(format!(
+                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. If the task needs \
+                 full coverage, check them yourself or give them to another worker.",
+                missed.join(", ")
+            ));
         }
         // Workers over-report; the lead turns their reports into an answer.
         out.push(
