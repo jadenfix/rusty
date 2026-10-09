@@ -24,6 +24,20 @@ afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
 
+`--stats` and the trajectory count what happened to each claim in `completion`:
+
+- `proposed` and `blocked` count `goal_done` calls;
+- `accepted` counts claims that closed the goal;
+- the refusals are `check_failed`, `check_error`, `commands_running`,
+  `sent_to_review` (careful mode's one review) and `discarded` (the turn
+  stalled, was interrupted or hit the output limit).
+
+The counts cover the whole process. They measure the runtime, not the work: a
+lower accepted false-completion rate shows the gate refusing claims, not
+better repairs. A runtime that never accepted anything would look perfectly
+honest. Report proposals and acceptances against every attempt, and next to an
+independent grader's verdict on the final state.
+
 ## Evidence and scope
 
 The private `CheckRecord` fields are constructed from executor observations.

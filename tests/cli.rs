@@ -3051,3 +3051,30 @@ fn a_mistyped_mcp_read_does_not_escalate_auto_mode() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("switched up"));
     assert_eq!(server.join().unwrap().len(), 2, "a read needs no careful review");
 }
+
+#[test]
+fn completion_claims_are_counted_apart_from_acceptance() {
+    let s = Sandbox::new("completion-events");
+    let done = || tool_reply("goal_done", serde_json::json!({"evidence": "fixed"}));
+    let (url, server) = scripted_endpoint(vec![done(), bash_reply("touch fixed"), done()]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--stats", "--trajectory", "t.json"])
+        .args(["--goal", "make the check pass", "--verify", "test -f fixed"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 3);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    let c = &stats["completion"];
+    assert_eq!(
+        (c["proposed"].as_u64(), c["check_failed"].as_u64(), c["accepted"].as_u64()),
+        (Some(2), Some(1), Some(1))
+    );
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.project.join("t.json")).unwrap()).unwrap();
+    assert_eq!(trace["completion"], *c);
+}

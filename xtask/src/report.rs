@@ -158,6 +158,30 @@ pub fn report(rows: &[Value]) -> String {
         lines.push(format!("| {t} | {} |", cells.join(" | ")));
     }
 
+    // Claims are the runtime's view, grading the independent one; they sit
+    // side by side so a gate that refuses everything can't pass for honesty.
+    if rows.iter().any(|r| r["completion"].as_array().is_some_and(|c| !c.is_empty())) {
+        let claims = |r: &Value, f: &str| {
+            r["completion"].as_array().into_iter().flatten().filter_map(|c| c[f].as_u64()).sum::<u64>()
+        };
+        lines.push(String::new());
+        lines.push("| model | claims proposed | accepted by runtime | accepted, graded fail | graded pass |".into());
+        lines.push("|---|---|---|---|---|".into());
+        for m in &models {
+            let mine: Vec<&Value> = rows.iter().filter(|r| &key(r) == m && verdict(r) != "infra").collect();
+            let sum = |f: &str| mine.iter().map(|r| claims(r, f)).sum::<u64>();
+            let count = |f: &str| mine.iter().filter(|r| r[f] == true).count();
+            lines.push(format!(
+                "| `{m}` | {} | {} | {} | {}/{} |",
+                sum("proposed"),
+                sum("accepted"),
+                count("false_completion"),
+                count("functional_pass"),
+                mine.len()
+            ));
+        }
+    }
+
     let mut causes: Vec<(String, usize)> = Vec::new();
     for r in rows.iter().filter(|r| verdict(r) == "infra") {
         let why = prefix(&reason(r).unwrap_or_else(|| "(no message)".into()), 120);
@@ -257,6 +281,15 @@ Misses:
         assert!(text.contains("| `m` | 1/1 |"), "{text}");
         assert!(text.contains("| task | `m · v2` | `m · off` | `m` |"), "{text}");
         assert!(text.contains("- `m · off` t #1: fail"), "{text}");
+    }
+
+    #[test]
+    fn claims_are_shown_beside_independent_grading() {
+        let jsonl = r#"{"task": "t", "model": "m", "rep": 1, "verdict": "fail", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": true, "functional_pass": false, "completion": [{"proposed": 3, "accepted": 1}]}
+{"task": "t", "model": "m", "rep": 2, "verdict": "pass", "secs": 1, "sessions": 1, "requests": 1, "prompt": 1, "completion": 1, "reason": [], "false_completion": false, "functional_pass": true, "completion": [{"proposed": 1, "accepted": 1}]}"#;
+        let out = report(&rows(jsonl));
+        assert!(out.contains("| `m` | 4 | 2 | 1 | 1/2 |"), "{out}");
+        assert!(!report(&rows(JSONL)).contains("claims proposed"), "older rows have no claims table");
     }
 
     #[test]

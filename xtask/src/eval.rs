@@ -552,6 +552,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     row["functional_pass"] = Value::Bool(functional);
     row["goal"] = goal;
     row["model_budgets"] = Value::Array(stats.iter().filter_map(|r| r.get("model_budget").cloned()).collect());
+    row["completion"] = Value::Array(stats.iter().filter_map(|r| r.get("completion").cloned()).collect());
     row["binary"] = Value::String(cfg.bin.display().to_string());
     if !run.memory.is_empty() {
         row["memory"] = Value::String(run.memory.to_string());

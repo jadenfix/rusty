@@ -30,6 +30,31 @@ const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue
 const WORKER_STEPS: usize = 30;
 const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
 
+/// What happened to the model's claims that a goal is done, kept apart from
+/// whether the work is right: a runtime that refuses every claim looks honest
+/// without being useful, so proposals and acceptances are counted against
+/// each other and against an independent grader, never in place of it.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Completion {
+    /// `goal_done` calls claiming the goal is met.
+    pub proposed: u64,
+    /// `goal_done` calls saying the goal is blocked.
+    pub blocked: u64,
+    /// Claims the runtime accepted, closing the goal as done.
+    pub accepted: u64,
+    /// Claims refused because the fixed check failed.
+    pub check_failed: u64,
+    /// Claims refused because the fixed check couldn't run.
+    pub check_error: u64,
+    /// Claims refused while owned commands were still running.
+    pub commands_running: u64,
+    /// Claims held for careful mode's one review, then re-proposed or not.
+    pub sent_to_review: u64,
+    /// Claims discarded when their turn stalled, was interrupted or hit the
+    /// output limit.
+    pub discarded: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanItem {
     pub text: String,
@@ -139,6 +164,7 @@ pub struct Agent {
     pub goal_check: Option<CheckSpec>,
     /// Observations are exported, but never reloaded as acceptance authority.
     pub verification_records: Vec<CheckRecord>,
+    pub completion: Completion,
     pub activities: crate::activity::Activities,
     loop_ctl: Option<LoopCtl>,
     pub agents: AgentsConfig,
@@ -213,6 +239,7 @@ impl Agent {
             goal: None,
             goal_check: None,
             verification_records: Vec::new(),
+            completion: Completion::default(),
             activities: crate::activity::Activities::default(),
             loop_ctl: None,
             agents: AgentsConfig::default(),
@@ -786,7 +813,7 @@ impl Agent {
             }
             self.checkpoint_trajectory();
             if outcome.is_err() {
-                self.pending_goal = None;
+                self.discard_claim();
                 if stalled && in_goal {
                     // Ending the whole run here throws away an open goal's remaining
                     // turns and its verification; run_goal bounds repeated stalls.
@@ -799,20 +826,22 @@ impl Agent {
                 break;
             }
             if signal::interrupted() {
-                self.pending_goal = None;
+                self.discard_claim();
                 outcome = Ok(false);
                 break;
             }
             if reply.finish_reason.as_deref() == Some("length") {
-                self.pending_goal = None;
+                self.discard_claim();
                 d.line(&ui::warn(TOKEN_LIMIT_NOTE));
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
                 let blocked = args["blocked"].as_bool().unwrap_or(false);
                 if !blocked && self.activities.running() > 0 {
+                    self.completion.commands_running += 1;
                     self.history.push(json!({"role":"user","content":format!("{}Completion rejected: owned commands are still running. Wait for or cancel them before proposing completion; their output is not verification evidence.", context::NOTE)}));
                 } else if self.checker_owed && !blocked {
+                    self.completion.sent_to_review += 1;
                     if let Err(e) = self.review_completion(&query, &mut d) {
                         outcome = Err(e);
                         break;
@@ -1432,7 +1461,19 @@ impl Agent {
 
     // ------------------------------------------------------------- goal mode
 
+    /// Drops a pending claim that its turn can no longer judge.
+    fn discard_claim(&mut self) {
+        if self.pending_goal.take().is_some() {
+            self.completion.discarded += 1;
+        }
+    }
+
     fn finish_goal(&mut self, args: &Value) -> String {
+        if args["blocked"].as_bool().unwrap_or(false) {
+            self.completion.blocked += 1;
+        } else {
+            self.completion.proposed += 1;
+        }
         self.pending_goal = Some(args.clone());
         "completion proposed; acceptance happens after this reply's remaining calls and any required review".into()
     }
@@ -1448,10 +1489,14 @@ impl Agent {
                         let reason = record.summary();
                         self.verification_records.push(record);
                         if !passed {
+                            self.completion.check_failed += 1;
                             return reason;
                         }
                     }
-                    Err(e) => return format!("fixed verification could not run: {e:#}"),
+                    Err(e) => {
+                        self.completion.check_error += 1;
+                        return format!("fixed verification could not run: {e:#}");
+                    }
                 }
             }
         }
@@ -1459,6 +1504,7 @@ impl Agent {
         g.status = if args["blocked"].as_bool().unwrap_or(false) {
             GoalStatus::Blocked(evidence)
         } else {
+            self.completion.accepted += 1;
             GoalStatus::Done(evidence)
         };
         "goal closed".into()
@@ -1784,6 +1830,7 @@ impl Agent {
             "archived_messages": self.archived.len(),
             "goal": self.goal,
             "verification": self.verification_records,
+            "completion": self.completion,
             "activities": self.activities.records(),
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
