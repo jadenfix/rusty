@@ -1,8 +1,12 @@
-//! Process-owned model admission ledger, shared by every call on the client.
-//! Not a tokenizer, billing cap, whole-task deadline or durable restart journal.
-use anyhow::{bail, Result};
-use serde::Serialize;
+//! Model admission ledger, shared by every call on the client. With
+//! `RUSTY_BUDGET_LEDGER` it is also written to a file after every change, so
+//! a restarted rusty carries on the same episode's budget instead of starting
+//! at zero. Not a tokenizer or a billing cap.
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,24 +21,44 @@ impl Default for Limits {
         Self { requests: 256, tokens: 4_000_000, seconds: 3600 }
     }
 }
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct State {
+    /// Every HTTP attempt sent, rate-limited ones included: what a proxy sees.
+    attempts: u64,
+    /// Attempts counted against the request limit (a 429 is given back).
     requests: u64,
+    /// Attempts the provider answered with a 2xx status, as a gateway that
+    /// only counts successful responses would.
+    http_ok: u64,
+    /// Attempts that got no HTTP response at all (connect, TLS or timeout).
+    transport_errors: u64,
+    /// Time spent waiting to retry after rate limits, overloads and dropped
+    /// streams: provider time, not the agent's.
+    retry_wait_seconds: f64,
     charged_tokens: u64,
     known_tokens: u64,
     settled_requests: u64,
     active_requests: u64,
     denied_requests: u64,
     rate_limited: u64,
+    /// Summed from providers that report a price in their usage; the others
+    /// leave it out, so it is a lower bound unless every request reported.
+    reported_cost_usd: f64,
+    cost_reported_requests: u64,
     overrun: bool,
     halted: bool,
     by_role: BTreeMap<String, u64>,
+    /// Processes that have used this ledger, this one included.
+    runs: u64,
+    /// Elapsed provider time carried over from earlier processes.
+    elapsed_seconds: f64,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
     limits: Option<Limits>,
     enabled: bool,
-    elapsed_seconds: f64,
+    ledger: Option<PathBuf>,
     deadline_reached: bool,
     unknown_usage_requests: u64,
     #[serde(flatten)]
@@ -44,21 +68,69 @@ pub struct Budget {
     limits: Limits,
     enabled: bool,
     started: Instant,
+    /// Provider time spent by earlier processes on the same ledger.
+    prior: Duration,
+    ledger: Option<(PathBuf, File)>,
     state: Mutex<State>,
 }
 impl Budget {
+    #[cfg(test)]
     pub fn new(limits: Limits) -> Arc<Self> {
-        Arc::new(Self { limits, enabled: true, started: Instant::now(), state: Mutex::new(State::default()) })
+        Self::open(Some(limits), None).expect("a budget without a ledger always opens")
     }
-    /// Legacy sessions still collect diagnostic accounting without enforcement.
-    /// A bounded run must opt in; independent deep-memory jobs remain separate.
+    /// Unbounded runs still collect accounting without enforcement.
     pub fn unbounded() -> Arc<Self> {
-        Arc::new(Self {
-            limits: Limits { requests: u64::MAX, tokens: u64::MAX, seconds: u64::MAX },
-            enabled: false,
+        Self::open(None, None).expect("a budget without a ledger always opens")
+    }
+    /// A budget, resumed from `ledger` when it names an existing file. The
+    /// ledger is locked for the life of the process, so two runs can't
+    /// spend one episode's budget twice; a ledger that can't be read is an
+    /// error rather than a fresh start.
+    pub fn open(limits: Option<Limits>, ledger: Option<&Path>) -> Result<Arc<Self>> {
+        let mut state = State::default();
+        let ledger = match ledger {
+            None => None,
+            Some(path) => {
+                let lock = lock(path)?;
+                if path.exists() {
+                    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                    state = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                }
+                Some((path.to_path_buf(), lock))
+            }
+        };
+        // In-flight requests of a process that died stay charged and unknown.
+        state.active_requests = 0;
+        state.runs += 1;
+        let budget = Self {
+            limits: limits.unwrap_or(Limits { requests: u64::MAX, tokens: u64::MAX, seconds: u64::MAX }),
+            enabled: limits.is_some(),
             started: Instant::now(),
-            state: Mutex::new(State::default()),
-        })
+            prior: Duration::from_secs_f64(state.elapsed_seconds.max(0.0)),
+            ledger,
+            state: Mutex::new(state),
+        };
+        budget.persist(&mut budget.state.lock().unwrap())?;
+        Ok(Arc::new(budget))
+    }
+    fn elapsed(&self) -> Duration {
+        self.prior + self.started.elapsed()
+    }
+    /// Rewrites the ledger file, if any, whole: written beside it, then
+    /// renamed over it, so a crash leaves the old copy or the new one.
+    fn persist(&self, s: &mut State) -> Result<()> {
+        let Some((path, _)) = &self.ledger else { return Ok(()) };
+        s.elapsed_seconds = self.elapsed().as_secs_f64();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&*s)?)
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .with_context(|| format!("writing the budget ledger {}", path.display()))
+    }
+    /// Persists after a change that has no caller to report to.
+    fn record(&self, s: &mut State) {
+        if let Err(e) = self.persist(s) {
+            eprintln!("warning: {e:#}");
+        }
     }
     /// Provider admission/response time; shell tools retain their own deadlines.
     pub fn remaining(&self) -> Result<Duration> {
@@ -72,7 +144,7 @@ impl Budget {
         if !self.enabled {
             return Ok(Duration::from_secs(600));
         }
-        let remaining = Duration::from_secs(self.limits.seconds).saturating_sub(self.started.elapsed());
+        let remaining = Duration::from_secs(self.limits.seconds).saturating_sub(self.elapsed());
         if remaining.is_zero() {
             bail!("model budget exhausted: provider deadline reached");
         }
@@ -83,7 +155,7 @@ impl Budget {
     /// accounting; providers may tokenize differently or exceed their declared cap.
     pub fn reserve(self: &Arc<Self>, role: &str, tokens: u64) -> Result<Reservation> {
         let mut s = self.state.lock().unwrap();
-        let deadline = self.started.elapsed() >= Duration::from_secs(self.limits.seconds);
+        let deadline = self.elapsed() >= Duration::from_secs(self.limits.seconds);
         if s.halted
             || s.overrun
             || deadline
@@ -91,6 +163,7 @@ impl Budget {
             || tokens > self.limits.tokens.saturating_sub(s.charged_tokens)
         {
             s.denied_requests += 1;
+            self.record(&mut s);
             let reason = if s.halted {
                 "this root is halted after a required review budget failure".to_string()
             } else if s.overrun {
@@ -107,11 +180,39 @@ impl Budget {
             };
             bail!("model budget exhausted: {role}: {reason}");
         }
+        s.attempts += 1;
         s.requests += 1;
         s.charged_tokens += tokens;
         s.active_requests += 1;
         *s.by_role.entry(role.into()).or_default() += 1;
+        // Nothing is sent that the ledger hasn't recorded.
+        if let Err(e) = self.persist(&mut s) {
+            s.attempts -= 1;
+            s.requests -= 1;
+            s.charged_tokens -= tokens;
+            s.active_requests -= 1;
+            *s.by_role.entry(role.into()).or_default() -= 1;
+            return Err(e);
+        }
         Ok(Reservation { budget: self.clone(), tokens, role: role.into() })
+    }
+    /// An admitted attempt that got a 2xx response.
+    pub fn note_ok(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.http_ok += 1;
+        self.record(&mut s);
+    }
+    /// An admitted attempt that got no HTTP response.
+    pub fn note_transport_error(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.transport_errors += 1;
+        self.record(&mut s);
+    }
+    /// Time spent waiting before a retry.
+    pub fn note_wait(&self, waited: Duration) {
+        let mut s = self.state.lock().unwrap();
+        s.retry_wait_seconds += waited.as_secs_f64();
+        self.record(&mut s);
     }
     /// Admissions refused so far; a rise across a call means it ran out.
     pub fn denied(&self) -> u64 {
@@ -119,7 +220,9 @@ impl Budget {
     }
     /// Required-review budget failure cannot be bypassed by resuming a goal.
     pub fn halt(&self) {
-        self.state.lock().unwrap().halted = true;
+        let mut s = self.state.lock().unwrap();
+        s.halted = true;
+        self.record(&mut s);
     }
 
     /// One line for the model in a bounded run: what is used and what is
@@ -130,7 +233,7 @@ impl Budget {
         }
         let s = self.state.lock().unwrap();
         let l = self.limits;
-        let elapsed = self.started.elapsed().as_secs();
+        let elapsed = self.elapsed().as_secs();
         let left = |used: u64, limit: u64| limit.saturating_sub(used) as f64 / limit.max(1) as f64;
         let least = left(s.requests, l.requests).min(left(s.charged_tokens, l.tokens)).min(left(elapsed, l.seconds));
         let mut line = format!(
@@ -156,24 +259,50 @@ impl Budget {
         Snapshot {
             limits: self.enabled.then_some(self.limits),
             enabled: self.enabled,
-            elapsed_seconds: self.started.elapsed().as_secs_f64(),
-            deadline_reached: self.started.elapsed() >= Duration::from_secs(self.limits.seconds),
+            ledger: self.ledger.as_ref().map(|(p, _)| p.clone()),
+            deadline_reached: self.elapsed() >= Duration::from_secs(self.limits.seconds),
             // In-flight attempts have no complete usage yet either.
             unknown_usage_requests: s.requests - s.settled_requests,
             state: State {
+                attempts: s.attempts,
                 requests: s.requests,
+                http_ok: s.http_ok,
+                transport_errors: s.transport_errors,
+                retry_wait_seconds: s.retry_wait_seconds,
                 charged_tokens: s.charged_tokens,
                 known_tokens: s.known_tokens,
                 settled_requests: s.settled_requests,
                 active_requests: s.active_requests,
                 denied_requests: s.denied_requests,
                 rate_limited: s.rate_limited,
+                reported_cost_usd: s.reported_cost_usd,
+                cost_reported_requests: s.cost_reported_requests,
                 overrun: s.overrun,
                 halted: s.halted,
                 by_role: s.by_role.clone(),
+                runs: s.runs,
+                elapsed_seconds: self.elapsed().as_secs_f64(),
             },
         }
     }
+}
+
+/// An exclusive lock on `<ledger>.lock`, held until the file is closed. The
+/// kernel drops it when the process dies, so a crash never leaves it stuck.
+fn lock(ledger: &Path) -> Result<File> {
+    use std::os::fd::AsRawFd;
+    let path = ledger.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(anyhow!("budget ledger {} is in use by another process", ledger.display()));
+    }
+    Ok(file)
 }
 pub struct Reservation {
     budget: Arc<Budget>,
@@ -184,13 +313,18 @@ impl Reservation {
     /// Consume once, only for a complete response with both usage counters.
     /// Partial/error/interrupted streams keep the reservation even when partial
     /// usage appeared. Unexpected excess is charged and stops future admission.
-    pub fn settle(self, prompt: u64, completion: u64) {
+    pub fn settle(self, prompt: u64, completion: u64, cost_usd: Option<f64>) {
         let mut s = self.budget.state.lock().unwrap();
         let actual = prompt.saturating_add(completion);
         s.charged_tokens = s.charged_tokens.saturating_sub(self.tokens).saturating_add(actual);
         s.known_tokens = s.known_tokens.saturating_add(actual);
         s.settled_requests += 1;
+        if let Some(cost) = cost_usd.filter(|c| c.is_finite() && *c >= 0.0) {
+            s.reported_cost_usd += cost;
+            s.cost_reported_requests += 1;
+        }
         s.overrun |= s.charged_tokens > self.budget.limits.tokens;
+        self.budget.record(&mut s);
     }
 }
 impl Reservation {
@@ -205,6 +339,7 @@ impl Reservation {
             *n -= 1;
         }
         s.rate_limited += 1;
+        self.budget.record(&mut s);
     }
 }
 impl Drop for Reservation {
@@ -242,7 +377,7 @@ mod tests {
         let b = Budget::new(Limits { requests: 2, tokens: 100, seconds: 30 });
         let r = b.reserve("lead", 100).unwrap();
         assert!(b.reserve("review", 1).is_err());
-        r.settle(10, 5);
+        r.settle(10, 5, None);
         drop(b.reserve("review", 85).unwrap());
         assert!(b.reserve("compaction", 1).is_err());
         let s = b.snapshot();
@@ -263,12 +398,53 @@ mod tests {
     #[test]
     fn overrun_overflow_and_expired_deadlines_fail_closed() {
         let b = Budget::new(Limits { requests: 3, tokens: 100, seconds: 30 });
-        b.reserve("lead", 10).unwrap().settle(u64::MAX, 1);
+        b.reserve("lead", 10).unwrap().settle(u64::MAX, 1, None);
         assert!(b.snapshot().state.overrun);
         assert!(b.reserve("worker", 1).is_err());
         assert!(b.remaining().is_err());
         let expired = Budget::new(Limits { seconds: 0, ..Limits::default() });
         assert!(expired.reserve("lead", 1).is_err());
         assert!(expired.remaining().is_err());
+    }
+    #[test]
+    fn attempts_count_what_a_proxy_sees_and_costs_add_up() {
+        let b = Budget::new(Limits { requests: 5, tokens: 1000, seconds: 30 });
+        b.reserve("lead", 10).unwrap().refund_rate_limited();
+        b.reserve("lead", 10).unwrap().settle(3, 2, Some(0.25));
+        b.reserve("lead", 10).unwrap().settle(3, 2, None);
+        b.reserve("lead", 10).unwrap().settle(3, 2, Some(f64::NAN));
+        b.note_ok();
+        b.note_transport_error();
+        b.note_wait(Duration::from_millis(1500));
+        let s = b.snapshot().state;
+        assert_eq!((s.attempts, s.requests, s.rate_limited), (4, 3, 1));
+        assert_eq!((s.http_ok, s.transport_errors, s.retry_wait_seconds), (1, 1, 1.5));
+        assert_eq!((s.reported_cost_usd, s.cost_reported_requests), (0.25, 1));
+    }
+    #[test]
+    fn a_ledger_carries_one_episode_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("rusty-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("budget.json");
+        let _ = std::fs::remove_file(&path);
+        let limits = Some(Limits { requests: 3, tokens: 1000, seconds: 30 });
+        {
+            let b = Budget::open(limits, Some(&path)).unwrap();
+            assert!(Budget::open(limits, Some(&path)).is_err(), "one process at a time");
+            b.reserve("lead", 100).unwrap().settle(40, 10, None);
+            // Never settled, as when the process dies mid-request: the
+            // attempt stays charged and its usage unknown.
+            drop(b.reserve("lead", 100).unwrap());
+        }
+        let b = Budget::open(limits, Some(&path)).unwrap();
+        let s = b.snapshot();
+        assert_eq!((s.state.requests, s.state.charged_tokens, s.state.runs), (2, 150, 2));
+        assert_eq!((s.unknown_usage_requests, s.state.active_requests), (1, 0));
+        b.reserve("lead", 1).unwrap();
+        assert!(b.reserve("lead", 1).is_err(), "the limit spans both processes");
+        drop(b);
+        std::fs::write(&path, "not json").unwrap();
+        assert!(Budget::open(limits, Some(&path)).is_err(), "a damaged ledger never resets to zero");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

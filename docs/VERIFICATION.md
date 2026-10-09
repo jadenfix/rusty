@@ -24,6 +24,97 @@ afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
 
+`--stats` and the trajectory count what happened to each claim in `completion`:
+
+- `proposed` and `blocked` count `goal_done` calls;
+- `accepted` counts claims that closed the goal;
+- the refusals are `check_failed`, `check_error`, `commands_running`,
+  `sent_to_review` (careful mode's one review) and `discarded` (the turn
+  stalled, was interrupted or hit the output limit).
+
+The counts cover the whole process. They measure the runtime, not the work: a
+lower accepted false-completion rate shows the gate refusing claims, not
+better repairs. A runtime that never accepted anything would look perfectly
+honest. Report proposals and acceptances against every attempt, and next to an
+independent grader's verdict on the final state.
+
+`safety` counts the model's consequential calls by permission class (`risky`,
+`destructive`). Each class has:
+
+- `proposed`: calls the model made;
+- `executed`: calls that ran;
+- refusals by cause: `denied` (a rule or read-only mode), `declined` (a
+  person said no), `unattended` (needed a person, nobody was watching) and
+  `careful_gate` (careful mode's dry-run gate).
+
+A blocked call is enforcement and may cost capability. An executed one is
+never counted as prevented. Two things Rusty can't see: whether the
+environment would have refused the call, and whether it caused harm. The
+benchmark's observers report those.
+
+## Safety assumptions
+
+Rusty's safeguards are guards around an agent, not transactions. A system
+such as STRATUS (no-regression mitigation for cloud operations) assumes
+writer exclusivity and a faithful undo for every action. Rusty assumes
+neither, so it claims less.
+
+- **Refused.** Rusty refuses:
+  - calls a deny rule names;
+  - anything that changes state in read-only mode;
+  - a destructive call nobody is there to approve (a person must type `yes`);
+  - in careful mode, a kubectl, helm or terraform change whose dry run hasn't
+    run in this session against the same files and target.
+- **Made recoverable where possible.** Before a mutating kubectl, helm or
+  terraform command, Rusty saves what the command will touch (the live
+  objects, helm values and manifest, terraform state) and prints a rollback
+  command. The snapshot is taken just before the change, so a concurrent
+  writer can make it stale. Restoring it is a new action, not an undo. Other
+  commands (databases, cloud CLIs, scripts) get no snapshot.
+- **Allowed.** Everything else follows the permission mode:
+  - `ask` asks before each change;
+  - `auto` allows workspace edits and asks for risky calls;
+  - `yolo` allows risky calls.
+
+  Destructive calls need a person, unless an unattended yolo run sets
+  `RUSTY_ALLOW_DESTRUCTIVE=1`.
+- **The unattended guard is an experimental condition, not an invariant.**
+  Some legitimate operations are destructive by this classification, such as
+  `kubectl drain`. With the guard on, an unattended run can't do them at all,
+  which gives Rusty less privilege than a baseline without the guard. Pin
+  `RUSTY_ALLOW_DESTRUCTIVE` per run, record it, and compare guard-on and
+  guard-off as separate conditions. `safety` makes either condition readable:
+  - guard on: a refused destructive call counts as `unattended`;
+  - guard off: it counts as `executed`;
+  - a deny rule or read-only mode: always `denied`.
+- **Cleanup is not isolation.** Owned commands are cancelled and their
+  process groups reaped at turn end. They run as the same user on the same
+  host, with the same network and credentials. Anything a command started
+  outside its process group, or changed remotely, stays.
+- **Local verification is mutable.** `--verify` runs in the workspace the
+  agent can write. The input fingerprint only catches files that change
+  while the check runs. Before proposing completion, the agent can change
+  what the check reads, or the check's own files. The check also says
+  nothing about deployed state. An independent grader outside the workspace
+  is still required.
+- **The record is the agent's own.** The trajectory, `--stats` and the infra
+  audit log are written by the Rusty process, so they show what Rusty
+  observed. They are not proof of what happened, and anything running as
+  the same user can modify them.
+
+## Benchmark-motivated changes
+
+A Rusty change made after reading a benchmark failure turns that example into
+development evidence for later versions; headline results then need fresh,
+frozen tasks. Each such change is listed here when it lands.
+
+| Commit | Benchmark task | What the trace showed |
+|---|---|---|
+
+None so far. The MCP, budget, completion, safety and capabilities changes came
+from code review, Rusty's own eval runs and the study protocol, not from
+inspecting benchmark task failures.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
@@ -267,7 +358,8 @@ interruption keep it charged. Known reported usage replaces its reservation;
 unexpected excess is charged, marks an overrun and prevents further dispatch or
 acceptance of that response. Anthropic accounting includes cached input and
 requires final output usage; initial output counters are not treated as final.
-Requests are never refunded. A required careful review that cannot finish within
+A request is refunded only when the provider answers HTTP 429, since it did no
+work; `attempts` still counts it. A required careful review that cannot finish within
 the budget halts this root; resuming or replacing the goal cannot skip it.
 Provider-internal processing/fallbacks are not
 separate client HTTP attempts; exact billing remains provider evidence.
@@ -280,26 +372,55 @@ own deadlines, and verification consumes no model request. Model catalogue GETs
 are outside the inference budget. Normal local execution or Daytona reasoning
 shares this client ledger; a live Daytona journey has not qualified it.
 
-Stats, trajectories and saved sessions include `model_budget`: admission limits,
-raw requests, known tokens, charged tokens, unknown usage, active attempts,
-role counts, denials, elapsed time and overrun. Existing conversation totals are
-logical successful reply metrics, not all HTTP attempts. Saved budget snapshots
-are diagnostics, not restart authority. A new CLI process (including `--continue`
-or a multi-session eval) starts a new budget. It does not provide a durable
-spending envelope across restarts; use a separate experiment admission bound.
-Durable journal/reconciliation is the next increment.
+Stats, trajectories and saved sessions include `model_budget`:
+
+| Field | Meaning |
+|---|---|
+| `attempts` | every HTTP inference attempt sent, rate-limited ones included: what a proxy or gateway sees |
+| `requests` | attempts counted against `--max-requests` (a 429 is given back, see `rate_limited`) |
+| `http_ok` | attempts the provider answered with a 2xx status, as a gateway counting only successful responses would |
+| `transport_errors` | attempts that got no HTTP response (connect, TLS or timeout); with `http_ok` this reconciles against a gateway that charges both |
+| `retry_wait_seconds` | time spent waiting to retry after rate limits, overloads and dropped streams |
+| `charged_tokens` / `known_tokens` | admission tokens held / usage the provider reported |
+| `unknown_usage_requests` | requests with no complete usage report, in flight included |
+| `active_requests`, `denied_requests`, `by_role` | in flight now, refused admission, per role |
+| `reported_cost_usd`, `cost_reported_requests` | summed from providers that put a price in their usage (OpenRouter's `usage.cost`); a lower bound unless every request reported, and absent prices are never invented |
+| `elapsed_seconds`, `deadline_reached`, `overrun`, `halted` | provider time used, and why admission stopped |
+| `ledger`, `runs` | the ledger file, if any, and how many processes have used it |
+
+Conversation totals are logical successful reply metrics, not HTTP attempts.
+
+Without a ledger, a new CLI process (including `--continue` or a multi-session
+eval) starts a new budget. Set `RUSTY_BUDGET_LEDGER=<path>` to make one episode
+budget span restarts: the state is rewritten (beside the file, then renamed)
+after every admission, settlement and refusal, and loaded at start. Limits
+then apply to the episode, not the process. An attempt that was in flight when
+a process died stays charged with unknown usage. Elapsed time counts provider
+time while some process was running, not the gaps between processes. The
+ledger is locked (`<path>.lock`, released by the kernel if the process dies),
+so a second rusty on the same ledger fails at startup. A ledger that can't be
+read is an error, never a fresh start. The ledger is the client's own count;
+a gateway in front of it remains the authority for what was billed.
 
 Memory's only model request, reflection after a checked goal (`--memory
 reflect` and `deep`), goes through the agent's client and this ledger with the
 role `memory`; the memory daemon makes no model calls. Other already running
 processes are outside this root's scope.
 
+With repeats, the report gives pass@k (a task counts when any attempt passed)
+next to pass^k (only when every attempt passed). Best-of-k picked with the
+hidden grader is not something a deployed agent can do.
+
 The evaluator now gives timeout, budget and infrastructure outcomes precedence
-over functional passing. A nonzero process exit cannot be `pass` either. The
+over functional passing. Each run gets its own budget ledger, so a killed
+process still records its provider waits. By a rule fixed before any run, a
+timeout that spent at least half its wall time waiting on provider retries is
+scored `infra` ("provider throttling"), not counted against the agent. The
+wait is kept in the row as `retry_wait_seconds`. A nonzero process exit cannot be `pass` either. The
 independent patch result stays in `functional_pass`, so a correct patch with a
 fatal provider failure remains visible without becoming a healthy success.
-Per-process budget snapshots are retained in eval rows, including multi-session
-runs; they are not summed into a fictitious shared cross-process allowance.
+Budget snapshots are retained in eval rows. In a multi-session run they share
+the run's ledger, so each session's snapshot is cumulative up to its exit.
 
 Run the deterministic runtime and scoring counterexamples before live work:
 
@@ -317,3 +438,64 @@ frozen artifacts, randomized order and a ledger preserving every attempt. First
 run small plumbing smokes and a deliberately tiny allowance that must stop with
 an open goal. Require five healthy observations per task/variant before claiming
 architectural benefits, with known and unknown usage reported separately.
+
+## Harness contract
+
+What a benchmark harness can rely on when it runs rusty unattended. The
+FullStack-Bench adapter is one such harness. Anything not listed here is
+display output and may change.
+
+**Invocation.** Pin every setting that has a saved or default value:
+
+```sh
+RUSTY_NO_DOTENV=1 RUSTY_HOME=<fresh dir> RUSTY_BUDGET_LEDGER=<episode file> \
+rusty --yolo --memory off --agents off --mode standard --model <id> \
+  --max-requests N --max-budget-tokens T --budget-secs S \
+  --stats --trajectory <path> \
+  --goal "<task>" --verify "<check>" --verify-timeout <secs>
+```
+
+- **Keys** come from the environment only. `RUSTY_NO_DOTENV=1` stops a stray
+  `.env` being read, and a fresh `RUSTY_HOME` keeps saved settings, sessions
+  and memory out of the run.
+- **Memory and delegation.** `--memory off` starts no memory daemon and reads
+  no lessons. `--agents off` runs one agent. Any other value is a different
+  experiment.
+- **`--verify`** is optional. Without it, the goal closes on the model's word
+  and exit status 2 can't happen.
+- **MCP.** Servers come from `.mcp.json` in the project, or from
+  `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
+  key and exits 1 if a server marked `required`, or one of its
+  `requiredTools`, is missing. A normal run with that config fails at startup
+  instead of starting without the tools.
+
+**Exit status.**
+
+| Code | Meaning |
+|---|---|
+| 0 | finished; with `--verify`, the check passed |
+| 2 | `--verify` was given and the goal did not close on a passing check |
+| 130 | interrupted |
+| 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
+
+**Outputs.**
+
+- **`--stats`** prints one JSON line on stderr at exit with these keys:
+  - `requests`, `prompt` and `completion` (successful replies);
+  - `model_budget` (the table above);
+  - `secs`, `interrupted`;
+  - `goal` (`done`, `blocked`, `open` or null);
+  - `execution_mode`, `memory_mode`, `tools_location`;
+  - `memory` (null when off).
+- **`--trajectory`** writes the conversation and the same `model_budget`.
+- Count requests against a gateway with `attempts`, and spending with
+  `charged_tokens` and `unknown_usage_requests`. Billing evidence comes from
+  the provider or gateway: `reported_cost_usd` is only what providers chose
+  to report.
+
+**Not claimed.**
+
+- exact tokenization, or a billed-cost cap;
+- a qualified live Daytona journey;
+- remote (HTTP/SSE) MCP transports, which are skipped;
+- that any memory level improves hard tasks.

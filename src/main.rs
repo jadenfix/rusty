@@ -137,6 +137,11 @@ struct Cli {
     #[arg(long)]
     capabilities: bool,
 
+    /// Start the project's MCP servers, print a JSON report and exit nonzero
+    /// if a required server or tool is missing
+    #[arg(long)]
+    mcp_check: bool,
+
     /// Project directory (defaults to the current directory)
     #[arg(short = 'C', long)]
     dir: Option<PathBuf>,
@@ -171,6 +176,12 @@ fn run() -> Result<i32> {
     if cli.capabilities {
         println!("{}", capabilities());
         return Ok(0);
+    }
+    if cli.mcp_check {
+        let (_, reports) = mcp::Mcp::connect(&cwd)?;
+        let ok = !reports.iter().any(mcp::Report::blocks);
+        println!("{}", serde_json::json!({ "ok": ok, "servers": reports }));
+        return Ok(if ok { 0 } else { 1 });
     }
 
     let mut settings = Settings::load();
@@ -209,13 +220,16 @@ fn run() -> Result<i32> {
         return Ok(if ok { 0 } else { 1 });
     }
     let mut client = Client::from_env()?;
-    if cli.max_requests.is_some() || cli.max_budget_tokens.is_some() || cli.budget_secs.is_some() {
+    let bounded = cli.max_requests.is_some() || cli.max_budget_tokens.is_some() || cli.budget_secs.is_some();
+    let ledger = std::env::var_os("RUSTY_BUDGET_LEDGER").filter(|p| !p.is_empty()).map(PathBuf::from);
+    if bounded || ledger.is_some() {
         let defaults = budget::Limits::default();
-        client = client.with_budget(budget::Limits {
+        let limits = bounded.then(|| budget::Limits {
             requests: cli.max_requests.unwrap_or(defaults.requests),
             tokens: cli.max_budget_tokens.unwrap_or(defaults.tokens),
             seconds: cli.budget_secs.unwrap_or(defaults.seconds),
         });
+        client = client.with_budget(limits, ledger.as_deref())?;
     }
     let client = Arc::new(client);
     if cli.list_models {
@@ -372,8 +386,10 @@ fn capabilities() -> serde_json::Value {
         "tools": ["local", "daytona"],
         "toolset": ["full", "shell"],
         "verify": {"supported": true, "timeout_secs": [1, 600]},
-        "mcp": {"transports": ["stdio"]},
-        "budget": ["max-requests", "max-budget-tokens", "budget-secs"],
+        "mcp": {"transports": ["stdio"], "check": true},
+        "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
+        // Records a harness may read from --stats and the trajectory.
+        "stats": ["model_budget", "completion", "safety", "goal"],
     })
 }
 
@@ -393,6 +409,8 @@ fn print_stats(agent: &Agent, started: Instant) {
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
+            "completion": agent.completion,
+            "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
