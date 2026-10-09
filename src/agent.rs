@@ -541,7 +541,7 @@ impl Agent {
                 "goal_done",
                 "Propose completion after all calls in this reply. A fixed user acceptance command, if set, must pass. Use blocked=true only when you need the user.",
                 json!({
-                    "evidence": {"type": "string", "description": "How you verified it, or what you need from the user"},
+                    "evidence": {"type": "string", "description": "For each requirement in the goal, the check you ran just now and what it showed; or what you need from the user"},
                     "blocked": {"type": "boolean"}
                 }),
                 &["evidence"],
@@ -623,9 +623,13 @@ impl Agent {
             if step == 0 {
                 self.memory.touch(&mem_ids);
             }
-            let mut messages = Vec::with_capacity(self.history.len() + 1);
+            let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(json!({"role": "system", "content": system}));
             messages.extend(self.history.iter().cloned());
+            // Last, so the cached prefix stays the same; never stored in history.
+            if let Some(status) = self.client.budget.status().filter(|_| !self.is_worker) {
+                messages.push(json!({"role": "user", "content": format!("{}{status}", context::NOTE)}));
+            }
 
             let started = Instant::now();
             let mut reply = match self.ask(&mut d, messages, self.tool_defs()) {
@@ -1439,8 +1443,9 @@ impl Agent {
                 });
                 format!(
                     "{}New goal: {obj}\n\nWork on this autonomously until it is done. Start with a plan (plan tool). \
-                     Verify as you go with builds, tests or by running the code. When the goal is achieved and \
-                     verified, call goal_done with the evidence. If you are blocked on something only the user can \
+                     Verify as you go with builds, tests or by running the code. Before goal_done, re-read the goal \
+                     and check every requirement it states against the real end state now, not your memory of \
+                     earlier steps. When all of them hold, call goal_done with the evidence for each. If you are blocked on something only the user can \
                      provide, call goal_done with blocked=true and say what you need.",
                     context::NOTE
                 )
