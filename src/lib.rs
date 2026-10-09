@@ -3,3 +3,4 @@
 pub mod advisor;
 pub mod cloud;
 pub mod privacy;
+pub mod recall;
