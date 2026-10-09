@@ -1539,6 +1539,28 @@ fn repeated_call_with_new_results_is_progress() {
 }
 
 #[test]
+fn a_repeated_read_with_the_same_result_is_not_sent_again() {
+    let s = Sandbox::new("collapse-reads");
+    std::fs::write(s.project.join("policy.json"), "{\"actions\": [\"queue:send\"]}\n").unwrap();
+    let read = || tool_reply("read_file", serde_json::json!({"path": "policy.json"}));
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--mode", "standard", "check the policy"],
+        vec![read(), read(), text_reply("done")],
+    );
+    let tools: Vec<String> = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0].contains("queue:send"), "{tools:?}");
+    assert!(tools[1].starts_with("unchanged:") && !tools[1].contains("queue:send"), "{tools:?}");
+}
+
+#[test]
 fn careful_goal_keeps_its_single_checker_budget_after_resume() {
     use serde_json::json;
     let s = Sandbox::new("resumed-checker");

@@ -775,6 +775,14 @@ impl Agent {
                             1
                         };
                         previous_call = Some((signature, out.clone()));
+                        // Re-sending an identical read costs context and invites
+                        // the same next step; a different observation breaks it.
+                        if repeats >= 2 && class == crate::permissions::Class::ReadOnly {
+                            out = "unchanged: you just made this exact call and it returned exactly the result \
+                                   shown above. Use that result; if you need something it doesn't show, ask a \
+                                   different question (another tool, resource or filter)."
+                                .to_string();
+                        }
                     }
                     if repeats == 3 {
                         self.escalate("the same call keeps repeating", &mut d);
