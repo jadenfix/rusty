@@ -50,7 +50,7 @@ pub fn load(paths: &[String]) -> Result<Vec<Value>> {
 
 /// At least one scored run, and every scored run passed.
 pub fn all_passed(rows: &[Value]) -> bool {
-    let scored: Vec<_> = rows.iter().filter(|r| verdict(r) != "infra").collect();
+    let scored: Vec<_> = rows.iter().filter(|r| scored(r)).collect();
     !scored.is_empty() && scored.iter().all(|r| verdict(r) == "pass")
 }
 
@@ -61,6 +61,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "timeout" => "⧗",
         "infra" => "⚠",
         "budget" => "⊘",
+        "leak" => "⊗",
         _ => "?",
     }
 }
@@ -83,6 +84,12 @@ fn key(r: &Value) -> String {
 
 fn verdict(r: &Value) -> &str {
     r["verdict"].as_str().unwrap_or("")
+}
+
+/// Infrastructure errors and runs that read the harness's records are not
+/// counted for or against anyone.
+fn scored(r: &Value) -> bool {
+    !matches!(verdict(r), "infra" | "leak")
 }
 
 fn num(r: &Value, key: &str) -> f64 {
@@ -122,7 +129,7 @@ pub fn report(rows: &[Value]) -> String {
     ];
     for m in &models {
         let mine: Vec<&Value> = rows.iter().filter(|r| &key(r) == m).collect();
-        let scored = mine.iter().filter(|r| verdict(r) != "infra").count();
+        let scored = mine.iter().filter(|r| scored(r)).count();
         let passed = mine.iter().filter(|r| verdict(r) == "pass").count();
         let tok: f64 = mine.iter().map(|r| num(r, "prompt") + num(r, "completion")).sum();
         let rate = if scored > 0 { format!("{:.0}%", 100.0 * passed as f64 / scored as f64) } else { "–".into() };
@@ -149,7 +156,7 @@ pub fn report(rows: &[Value]) -> String {
                     return String::new();
                 }
                 runs.sort_by_key(|r| rep(r));
-                let scored = runs.iter().filter(|r| verdict(r) != "infra").count();
+                let scored = runs.iter().filter(|r| scored(r)).count();
                 let passed = runs.iter().filter(|r| verdict(r) == "pass").count();
                 let marks: String = runs.iter().map(|r| mark(verdict(r))).collect();
                 format!("{passed}/{scored} {marks}")
@@ -171,11 +178,8 @@ pub fn report(rows: &[Value]) -> String {
         for m in &models {
             let (mut n, mut any, mut all) = (0, 0, 0);
             for t in &tasks {
-                let runs: Vec<&str> = rows
-                    .iter()
-                    .filter(|r| &key(r) == m && &text(r, "task") == t && verdict(r) != "infra")
-                    .map(verdict)
-                    .collect();
+                let runs: Vec<&str> =
+                    rows.iter().filter(|r| &key(r) == m && &text(r, "task") == t && scored(r)).map(verdict).collect();
                 if runs.is_empty() {
                     continue;
                 }
@@ -197,7 +201,7 @@ pub fn report(rows: &[Value]) -> String {
         lines.push("| model | claims proposed | accepted by runtime | accepted, graded fail | graded pass |".into());
         lines.push("|---|---|---|---|---|".into());
         for m in &models {
-            let mine: Vec<&Value> = rows.iter().filter(|r| &key(r) == m && verdict(r) != "infra").collect();
+            let mine: Vec<&Value> = rows.iter().filter(|r| &key(r) == m && scored(r)).collect();
             let sum = |f: &str| mine.iter().map(|r| claims(r, f)).sum::<u64>();
             let count = |f: &str| mine.iter().filter(|r| r[f] == true).count();
             lines.push(format!(
@@ -225,6 +229,17 @@ pub fn report(rows: &[Value]) -> String {
         lines.push(String::new());
         lines.push("Infrastructure errors (not scored):".into());
         lines.extend(causes.iter().map(|(why, n)| format!("- {n}× {why}")));
+    }
+
+    let mut leaks: Vec<&Value> = rows.iter().filter(|r| verdict(r) == "leak").collect();
+    if !leaks.is_empty() {
+        leaks.sort_by_key(|r| (key(r), text(r, "task"), rep(r)));
+        lines.push(String::new());
+        lines.push("Read the harness's records (not scored):".into());
+        for r in leaks {
+            let why = reason(r).unwrap_or_else(|| "leak".into());
+            lines.push(format!("- `{}` {} #{}: {}", key(r), text(r, "task"), rep(r), prefix(&why, 160)));
+        }
     }
 
     let mut misses: Vec<&Value> = rows.iter().filter(|r| matches!(verdict(r), "fail" | "timeout")).collect();
@@ -339,5 +354,16 @@ Misses:
     fn no_scored_runs_shows_a_dash() {
         let infra = r#"{"task": "t", "model": "m", "verdict": "infra", "secs": 1, "prompt": 0, "completion": 0}"#;
         assert!(report(&rows(infra)).contains("| `m` | 0/0 | – | 0 | 1 | 0k | 0.0 min |"));
+    }
+
+    #[test]
+    fn a_leaked_pass_counts_for_nobody() {
+        let jsonl = r#"{"task": "t", "model": "m", "rep": 1, "verdict": "leak", "secs": 1, "sessions": 2, "requests": 1, "prompt": 1, "completion": 1, "reason": ["read outside its working copy: rusty-eval-1-2-ab"], "functional_pass": true}
+{"task": "t", "model": "m", "rep": 2, "verdict": "fail", "secs": 1, "sessions": 2, "requests": 1, "prompt": 1, "completion": 1, "reason": []}"#;
+        let out = report(&rows(jsonl));
+        assert!(out.contains("| `m` | 0/1 | 0% |"), "{out}");
+        assert!(out.contains("| t | 0/1 ⊗✗ |"), "{out}");
+        assert!(out.contains("- `m` t #1: read outside its working copy: rusty-eval-1-2-ab"), "{out}");
+        assert!(!all_passed(&rows(jsonl)));
     }
 }

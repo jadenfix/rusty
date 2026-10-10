@@ -315,12 +315,15 @@ fn single_args<'a>(prompt: &'a str, check: Option<&'a str>) -> Vec<&'a str> {
 }
 
 /// Runs one rusty process with a hard time limit, appending to the home's
-/// stdout and stderr. Extra args pass through.
+/// stdout and stderr. Extra args pass through. Session `n` (from 1) writes its
+/// own trajectory, so a later session can't overwrite what an earlier one did.
+#[allow(clippy::too_many_arguments)]
 fn agent(
     cfg: &Config,
     work: &Path,
     home: &Path,
     run: &Run,
+    n: usize,
     env: &[String],
     args: &[&str],
     input: Option<String>,
@@ -330,7 +333,7 @@ fn agent(
     let mut cmd = Command::new(&cfg.bin);
     cmd.args(["--yolo", "--stats"])
         .arg("--trajectory")
-        .arg(home.join("trajectory.json"))
+        .arg(home.join(trajectory(n)))
         .args(args)
         .current_dir(work)
         .env("RUSTY_HOME", home)
@@ -384,6 +387,7 @@ fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> 
     validate(&sessions).with_context(|| format!("{}: turns.txt", task.name))?;
     let mut timed_out = false;
     let mut success = true;
+    let mut n = 0;
     for s in sessions {
         for cmd in &s.pre {
             setup(cfg, task, work, home, run, &s.env, cmd)?;
@@ -391,15 +395,16 @@ fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> 
         if s.lines.is_empty() {
             continue;
         }
+        n += 1;
         let exit = if s.goal {
             let mut args = vec!["--goal", s.lines[0].as_str()];
             if let Some(check) = &s.verify {
                 args.extend(["--verify", check.as_str()]);
             }
-            agent(cfg, work, home, run, &s.env, &args, None)?
+            agent(cfg, work, home, run, n, &s.env, &args, None)?
         } else {
             let input: String = s.lines.iter().map(|l| format!("{l}\n")).collect();
-            agent(cfg, work, home, run, &s.env, &[], Some(input))?
+            agent(cfg, work, home, run, n, &s.env, &[], Some(input))?
         };
         timed_out |= matches!(exit, Exit::TimedOut);
         success &= matches!(exit, Exit::Done(true));
@@ -503,7 +508,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
             bail!("{}: verify.txt must contain a nonempty acceptance command", task.name);
         }
         let args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
-        agent(cfg, work, home, run, &[], &args, None)?
+        agent(cfg, work, home, run, 1, &[], &args, None)?
     };
     let secs = start.elapsed().as_secs();
 
@@ -519,7 +524,15 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
         .unwrap_or(Value::Null);
     let waited = ledger["retry_wait_seconds"].as_f64().unwrap_or(0.0);
     let throttled = verdict == "timeout" && waited >= THROTTLED_SHARE * secs.max(1) as f64;
-    let verdict = if throttled { "infra" } else { verdict };
+    // A run that read the harness's records (its own home, where earlier
+    // sessions' transcripts and history live, or another run's directories)
+    // measured the harness, not the agent: it is not scored, whatever the check said.
+    let leak = outside_reads(home, work);
+    let verdict = match (&leak, throttled) {
+        (Some(_), _) => "leak",
+        (None, true) => "infra",
+        (None, false) => verdict,
+    };
 
     let cell = match run.memory {
         "" => model.replace('/', "_"),
@@ -527,8 +540,11 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     };
     let dest = cfg.logs.join(cell).join(format!("{}.{rep}", task.name));
     std::fs::create_dir_all(&dest)?;
-    for f in ["stdout", "stderr", "check", "run", "trajectory.json", "budget.json"] {
+    for f in ["stdout", "stderr", "check", "run", "budget.json"] {
         let _ = std::fs::copy(home.join(f), dest.join(f));
+    }
+    for f in trajectories(home) {
+        let _ = std::fs::copy(home.join(&f), dest.join(&f));
     }
 
     let stats: Vec<Value> = py_lines(&String::from_utf8_lossy(&stderr))
@@ -539,6 +555,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     let total = |k: &str| stats.iter().map(|r| r[k].as_i64().unwrap_or(0)).sum::<i64>();
     let (requests, prompt, completion) = (total("requests"), total("prompt"), total("completion"));
     let reason: Vec<String> = match verdict {
+        "leak" => leak.iter().map(|p| format!("read outside its working copy: {p}")).collect(),
         _ if throttled => vec![format!("provider throttling: {waited:.0}s of {secs}s spent waiting to retry")],
         "fail" => {
             let check = String::from_utf8_lossy(&std::fs::read(home.join("check")).unwrap_or_default()).into_owned();
@@ -761,6 +778,51 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Session `n`'s trajectory file; the first keeps the single-session name.
+fn trajectory(n: usize) -> String {
+    match n {
+        1 => "trajectory.json".into(),
+        n => format!("trajectory.{n}.json"),
+    }
+}
+
+/// The trajectory files the sessions left in `home`, in no particular order.
+/// A session that wrote none leaves a gap, not the end of the list.
+fn trajectories(home: &Path) -> Vec<String> {
+    let names = std::fs::read_dir(home).into_iter().flatten().flatten();
+    names
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|f| f.starts_with("trajectory.") && f.ends_with(".json"))
+        .collect()
+}
+
+/// The first path a tool call named outside the run's own working copy:
+/// another eval directory (this run's home among them) or `$RUSTY_HOME`.
+/// Only what the agent names is seen; a search of a parent directory that
+/// never names the path is not.
+fn outside_reads(home: &Path, work: &Path) -> Option<String> {
+    let own = work.file_name()?.to_string_lossy().into_owned();
+    for f in trajectories(home) {
+        let Ok(text) = std::fs::read_to_string(home.join(f)) else { continue };
+        let Ok(t) = serde_json::from_str::<Value>(&text) else { continue };
+        let calls = t["messages"].as_array().into_iter().flatten().flat_map(|m| {
+            m["tool_calls"].as_array().into_iter().flatten().filter_map(|c| c["function"]["arguments"].as_str())
+        });
+        for args in calls {
+            if args.contains("RUSTY_HOME") {
+                return Some("$RUSTY_HOME".into());
+            }
+            for (i, _) in args.match_indices("rusty-eval-") {
+                let name: String = args[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+                if name != own && name.len() > "rusty-eval-".len() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A fresh, empty directory under the system temp dir (like `mktemp -d`).
@@ -1075,5 +1137,31 @@ mod tests {
         assert_eq!(stamp(UNIX_EPOCH), "19700101-000000");
         assert_eq!(stamp(UNIX_EPOCH + Duration::from_secs(1_791_313_200)), "20261006-190000");
         assert_eq!(stamp(UNIX_EPOCH + Duration::from_secs(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn reading_the_harness_records_is_a_leak() {
+        let (work, home) = (temp_dir().unwrap(), temp_dir().unwrap());
+        let call = |args: &str| {
+            serde_json::json!({"messages": [{"role": "assistant", "tool_calls": [
+                {"function": {"name": "bash", "arguments": args}}]}]})
+            .to_string()
+        };
+        let own = work.join("stats.py").display().to_string();
+        let mine = serde_json::json!({ "command": format!("cat {own}") }).to_string();
+        std::fs::write(home.join(trajectory(1)), call(&mine)).unwrap();
+        assert_eq!(outside_reads(&home, &work), None, "its own working copy is fine");
+        // A later session reads an earlier one's transcript from the home.
+        // Session 2 wrote no trajectory; session 3 reads an earlier transcript.
+        let theirs = home.join("stdout").display().to_string();
+        let peek = serde_json::json!({ "command": format!("grep seed {theirs}") }).to_string();
+        std::fs::write(home.join(trajectory(3)), call(&peek)).unwrap();
+        let name = home.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(outside_reads(&home, &work), Some(name));
+        std::fs::write(home.join(trajectory(3)), call(r#"{"command":"ls $RUSTY_HOME"}"#)).unwrap();
+        assert_eq!(outside_reads(&home, &work).as_deref(), Some("$RUSTY_HOME"));
+        assert_eq!(trajectories(&home).len(), 2);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
