@@ -460,6 +460,13 @@ fatal provider failure remains visible without becoming a healthy success.
 Budget snapshots are retained in eval rows. In a multi-session run they share
 the run's ledger, so each session's snapshot is cumulative up to its exit.
 
+A run's home holds the harness's records as well as the agent's: earlier
+sessions' transcripts and Rusty's own session history. Each session keeps its
+own trajectory. A run whose tool calls name a path outside its working copy,
+such as its home, `$RUSTY_HOME` or another run's directory, is scored `leak`:
+reported apart and not counted, whatever the check said. Only named paths
+are seen, so a search of a parent directory that never names one is missed.
+
 Run the deterministic runtime and scoring counterexamples before live work:
 
 ```sh

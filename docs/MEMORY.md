@@ -116,7 +116,10 @@ memory tasks test different things:
 - `evals/multi/memory-only-fact` is the only one that can show memory
   helping. Session 1 reads a test seed from an onboarding note. The workspace
   is then reset to a fresh copy without the note, and only session 2's own
-  run of the suite is graded. Without memory it can't pass.
+  run of the suite is graded. Without memory it can't pass, except by
+  reading the harness's records: session 1's transcript or Rusty's own
+  session history in the run's home. The eval scores such a run `leak` and
+  doesn't count it.
 - `evals/multi/memory-handoff` grades whether a lesson was saved, so
   `--memory off` fails it by construction. Its second session can find the
   test command in the Makefile, so a pass shows the mechanism works, not
